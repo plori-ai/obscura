@@ -2076,6 +2076,7 @@ struct AnimationInstance {
     start_ms: f32,
     hold_time_ms: Option<f32>,
     was_paused: bool,
+    timing: AnimationTiming,
 }
 
 /// A normalized property keyframe supplied through the Web Animations API.
@@ -2301,7 +2302,7 @@ impl AnimationTimelineState {
         &mut self,
         node: obscura_dom::tree::NodeId,
         key: AnimationInstanceKey,
-        play_state: AnimationPlayState,
+        timing: AnimationTiming,
         sample: AnimationSample,
     ) -> AnimationSampleTime {
         if sample.mode == AnimationSampleMode::LocalOverride {
@@ -2322,7 +2323,7 @@ impl AnimationTimelineState {
                 } else {
                     0.0
                 });
-                let paused = play_state == AnimationPlayState::Paused;
+                let paused = timing.play_state == AnimationPlayState::Paused;
                 self.instances.insert(
                     node,
                     AnimationInstance {
@@ -2330,13 +2331,14 @@ impl AnimationTimelineState {
                         start_ms: if paused { document_time_ms } else { candidate },
                         hold_time_ms: paused.then_some(0.0),
                         was_paused: paused,
+                        timing,
                     },
                 );
                 self.instances.get_mut(&node).expect("inserted animation instance")
             }
         };
 
-        let paused = play_state == AnimationPlayState::Paused;
+        let paused = timing.play_state == AnimationPlayState::Paused;
         if paused && !instance.was_paused {
             let paused_at = transition_time_ms.unwrap_or(document_time_ms);
             instance.hold_time_ms = Some((paused_at - instance.start_ms).max(0.0));
@@ -2346,11 +2348,27 @@ impl AnimationTimelineState {
             instance.start_ms = resumed_at - held;
         }
         instance.was_paused = paused;
+        instance.timing = timing;
         AnimationSampleTime {
             milliseconds: instance
                 .hold_time_ms
                 .unwrap_or_else(|| (document_time_ms - instance.start_ms).max(0.0)),
         }
+    }
+
+    /// Animation instances whose names resolve to keyframes in the current style.
+    pub fn css_animation_instances(&self, now_ms: f32) -> Vec<(u32, String, f32, AnimationTiming)> {
+        self.instances.iter().map(|(node, instance)| (
+            node.raw(), instance.key.name.clone(),
+            instance.hold_time_ms.unwrap_or_else(|| (now_ms - instance.start_ms).max(0.0)),
+            instance.timing,
+        )).collect()
+    }
+
+    /// Discard CSS instances when no keyframes can match; WAAPI is independent.
+    pub fn clear_css_animations(&mut self) {
+        self.instances.clear();
+        self.display_suppressed.clear();
     }
 
     pub(crate) fn clear_animation(&mut self, node: obscura_dom::tree::NodeId, sample: AnimationSample) {
