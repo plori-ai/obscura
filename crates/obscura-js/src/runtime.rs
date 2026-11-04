@@ -17511,6 +17511,44 @@ mod tests {
     }
 
     #[test]
+    fn gpu_preferred_canvas_format_is_available_without_an_adapter() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const gpu = navigator.gpu;
+                const fn = gpu.getPreferredCanvasFormat;
+                let invalid;
+                try { fn.call({}); } catch (error) { invalid = error.name; }
+                navigator.gpu = {};
+                const retained = fn.call(gpu);
+                navigator.gpu = gpu;
+                return [fn.call(gpu), fn.call(gpu, 1), fn.name, fn.length, String(fn), invalid, retained];
+            })()
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "rgba8unorm", "rgba8unorm", "getPreferredCanvasFormat", 0,
+            "function getPreferredCanvasFormat() { [native code] }", "TypeError", "rgba8unorm",
+        ]));
+    }
+
+    #[test]
+    fn chrome_app_running_state_matches_chromium_for_web_pages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const fn = chrome.app.runningState;
+                let extra;
+                try { fn(1); } catch (error) { extra = [error.name, error.message]; }
+                return [fn(), fn.name, fn.length, String(fn), extra];
+            })()
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "cannot_run", "runningState", 0, "function runningState() { [native code] }",
+            ["TypeError", "Error in invocation of app.runningState(): "],
+        ]));
+    }
+
+    #[test]
     fn canvas_path_rect_does_not_paint_until_fill() {
         let mut rt = setup_runtime("<html><body><canvas width='10' height='10'></canvas></body></html>");
         let result = rt.evaluate(r#"

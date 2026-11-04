@@ -8463,7 +8463,15 @@ globalThis.navigator = {
 })();
 
 globalThis.chrome = {
-  app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
+  app: {
+    isInstalled: false,
+    runningState: _markNative(function runningState() {
+      if (arguments.length) throw new TypeError('Error in invocation of app.runningState(): ');
+      return 'cannot_run';
+    }),
+    InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" },
+    RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" },
+  },
   runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
@@ -16791,7 +16799,14 @@ navigator.keyboard = {
   lock() { return Promise.resolve(); },
   unlock() {},
 };
-navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
+const _gpu = {
+  requestAdapter() { return Promise.resolve(null); },
+  getPreferredCanvasFormat: _markNative(function getPreferredCanvasFormat() {
+    if (this !== _gpu) throw new TypeError('Illegal invocation');
+    return 'rgba8unorm';
+  }),
+};
+navigator.gpu = _gpu;
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
 globalThis.opener = null;
