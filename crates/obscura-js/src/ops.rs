@@ -78,6 +78,22 @@ pub fn next_subresource_interception_id() -> String {
     format!("subresource-{}", NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// A CDP Fetch request pattern. A missing resource type matches every type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdpRequestPattern {
+    pub url_pattern: String,
+    pub resource_type: Option<String>,
+}
+
+pub fn matches_cdp_request_patterns(patterns: Option<&[CdpRequestPattern]>, url: &str, resource_type: &str) -> bool {
+    let Some(patterns) = patterns else { return true; };
+    patterns.iter().any(|pattern| {
+        pattern.resource_type.as_deref().is_none_or(|kind| kind == resource_type
+            || (resource_type == "XHR" && kind == "Fetch"))
+            && url_matches_cdp_pattern(&pattern.url_pattern, url)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredNetworkResponseBody {
     pub body: String,
@@ -395,6 +411,7 @@ pub struct ObscuraState {
     /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
     /// sent to the interception channel; empty means every request.
     pub intercept_url_patterns: Vec<String>,
+    pub cdp_request_patterns: Option<std::sync::Arc<Vec<CdpRequestPattern>>>,
     pub intercept_page_id: String,
     /// Blob URL bytes and MIME types, shared by the page's realms.
     pub blob_urls: HashMap<String, (String, Vec<u8>)>,
@@ -673,6 +690,7 @@ impl ObscuraState {
             network_reporting_enabled: false,
             extra_http_headers: HashMap::new(),
             intercept_url_patterns: Vec::new(),
+            cdp_request_patterns: None,
             intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
@@ -4013,7 +4031,9 @@ async fn fetch_url_inner(
         // The CDP resolver map spans pages and navigations on a connection.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
+        let fetch_type = if resource_type_name == "Fetch" { "XHR" } else { resource_type_name };
+        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url)
+            && matches_cdp_request_patterns(gs.cdp_request_patterns.as_deref().map(Vec::as_slice), &url, fetch_type) {
             gs.intercept_tx.clone()
         } else {
             None
@@ -5188,6 +5208,24 @@ mod tests {
             assert_eq!(super::url_matches_cdp_pattern(pattern, url), expected,
                 "pattern {pattern:?}, URL {url:?}");
         }
+    }
+
+    #[test]
+    fn cdp_request_patterns_match_url_and_resource_type_together() {
+        use super::{CdpRequestPattern, matches_cdp_request_patterns};
+        let patterns = [
+            CdpRequestPattern { url_pattern: "*/asset-?".into(), resource_type: Some("Image".into()) },
+            CdpRequestPattern { url_pattern: r"*/literal\*".into(), resource_type: Some("Script".into()) },
+        ];
+        assert!(matches_cdp_request_patterns(Some(&patterns), "https://x/asset-a", "Image"));
+        assert!(!matches_cdp_request_patterns(Some(&patterns), "https://x/asset-a", "Script"));
+        assert!(!matches_cdp_request_patterns(Some(&patterns), "https://x/asset-aa", "Image"));
+        assert!(matches_cdp_request_patterns(Some(&patterns), "https://x/literal*", "Script"));
+        assert!(!matches_cdp_request_patterns(Some(&patterns), "https://x/literalx", "Script"));
+        assert!(matches_cdp_request_patterns(None, "https://x/anything", "Document"));
+        assert!(!matches_cdp_request_patterns(Some(&[]), "https://x/anything", "Document"));
+        let fetch = [CdpRequestPattern { url_pattern: "*".into(), resource_type: Some("Fetch".into()) }];
+        assert!(matches_cdp_request_patterns(Some(&fetch), "https://x/data", "XHR"));
     }
 
     // #967 — a redirect must not forward the caller's credentials to a
@@ -8779,7 +8817,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         let blocked = gs.blocked_urls.iter().any(|pattern| {
             pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
         });
-        let interception = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &selected_url) {
+        let interception = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &selected_url)
+            && matches_cdp_request_patterns(gs.cdp_request_patterns.as_deref().map(Vec::as_slice), &selected_url, "Image") {
             gs.intercept_tx.clone().map(|tx| (tx, gs.intercept_page_id.clone()))
         } else { None };
         (

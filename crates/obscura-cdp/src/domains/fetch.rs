@@ -33,6 +33,7 @@ pub enum FetchResolution {
 pub struct FetchInterceptState {
     pub enabled: bool,
     pub patterns: Vec<String>,
+    pub cdp_request_patterns: Option<std::sync::Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
     pub sessions_by_page: HashMap<String, String>,
     pub paused: HashMap<String, PausedRequest>,
     request_counter: u64,
@@ -43,6 +44,7 @@ impl FetchInterceptState {
         FetchInterceptState {
             enabled: false,
             patterns: Vec::new(),
+            cdp_request_patterns: None,
             sessions_by_page: HashMap::new(),
             paused: HashMap::new(),
             request_counter: 0,
@@ -63,6 +65,17 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
+            if let Some(patterns) = params.get("patterns").and_then(Value::as_array) {
+                for pattern in patterns {
+                    if let Some(kind) = pattern.get("resourceType").and_then(Value::as_str) {
+                        if !matches!(kind, "Document" | "Stylesheet" | "Image" | "Media" | "Font" | "Script"
+                            | "TextTrack" | "XHR" | "Fetch" | "Prefetch" | "EventSource" | "WebSocket"
+                            | "Manifest" | "SignedExchange" | "Ping" | "CSPViolationReport" | "Preflight" | "FedCM" | "Other") {
+                            return Err(format!("Unknown resource type in fetch filter: '{kind}'"));
+                        }
+                    }
+                }
+            }
             if params.get("patterns").and_then(Value::as_array).is_some_and(|patterns|
                 patterns.iter().any(|pattern| pattern.get("requestStage").and_then(Value::as_str) == Some("Response"))) {
                 return Err("Fetch response-stage interception is not implemented".into());
@@ -72,17 +85,26 @@ pub async fn handle(
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|p| {
+                        .map(|p| {
                             p.get("urlPattern")
                                 .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
+                                .unwrap_or("*").to_string()
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| vec!["*".to_string()]);
 
+            let cdp_patterns = std::sync::Arc::new(params.get("patterns").and_then(Value::as_array)
+                .map(|arr| arr.iter().map(|p| obscura_js::ops::CdpRequestPattern {
+                    url_pattern: p.get("urlPattern").and_then(Value::as_str).unwrap_or("*").to_string(),
+                    resource_type: p.get("resourceType").and_then(Value::as_str).map(str::to_string),
+                }).collect::<Vec<_>>()).unwrap_or_else(|| vec![obscura_js::ops::CdpRequestPattern {
+                    url_pattern: "*".into(), resource_type: None,
+                }]));
+
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.clone();
+            ctx.fetch_intercept.cdp_request_patterns = Some(cdp_patterns.clone());
             if let Some((session, page)) = session_id.as_ref()
                 .and_then(|session| ctx.sessions.get(session).map(|page| (session, page)))
             {
@@ -91,6 +113,7 @@ pub async fn handle(
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns = patterns.clone();
+                page.cdp_request_patterns = Some(cdp_patterns);
                 if let Some(tx) = tx_clone {
                     page.set_intercept_tx(tx);
                 }
@@ -111,8 +134,10 @@ pub async fn handle(
             }
             ctx.fetch_intercept.enabled = false;
             ctx.fetch_intercept.patterns.clear();
+            ctx.fetch_intercept.cdp_request_patterns = None;
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns.clear();
+                page.cdp_request_patterns = None;
                 page.enable_intercept(false);
             }
             let paused: Vec<_> = ctx.fetch_intercept.paused.drain().collect();
@@ -251,6 +276,17 @@ mod tests {
     use crate::dispatch::CdpContext;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn enable_preserves_resource_type_and_default_url_pattern() {
+        let mut ctx = CdpContext::new();
+        handle("enable", &json!({"patterns": [{"resourceType": "Image"}]}), &mut ctx, &None).await.unwrap();
+        let patterns = ctx.fetch_intercept.cdp_request_patterns.as_deref().unwrap();
+        assert_eq!(patterns[0].url_pattern, "*");
+        assert_eq!(patterns[0].resource_type.as_deref(), Some("Image"));
+        assert!(obscura_js::ops::matches_cdp_request_patterns(Some(patterns), "https://x/a", "Image"));
+        assert!(!obscura_js::ops::matches_cdp_request_patterns(Some(patterns), "https://x/a", "Script"));
+    }
 
     fn pause(ctx: &mut CdpContext, id: &str) -> tokio::sync::oneshot::Receiver<FetchResolution> {
         let (tx, rx) = tokio::sync::oneshot::channel();

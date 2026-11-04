@@ -276,7 +276,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                 #[cfg(not(feature = "stealth"))]
                 let stealth: Option<std::sync::Arc<()>> = None;
                 let interception = if state.intercept_enabled {
-                    state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone()))
+                    state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
                 } else { None };
                 Ok((client, stealth, state.callbacks.clone(), interception))
             })(),
@@ -345,8 +345,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let mut changed_method = None;
                     let mut changed_headers = None;
                     let mut changed_body = None;
-                    if let Some((tx, page_id, patterns)) = interception {
-                        if crate::ops::should_intercept_url(true, &patterns, &url) {
+                    if let Some((tx, page_id, patterns, cdp_patterns)) = interception {
+                        if crate::ops::should_intercept_url(true, &patterns, &url)
+                            && crate::ops::matches_cdp_request_patterns(cdp_patterns.as_deref().map(Vec::as_slice), &url, "Script") {
                             crate::ops::validate_fetch_url(&requested, client.allow_private_network).map_err(io_err)?;
                             let (resolver, resolution) = tokio::sync::oneshot::channel();
                             if tx.send(crate::ops::InterceptedRequest { request_id: request_id.clone(), page_id,

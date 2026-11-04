@@ -1551,6 +1551,10 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().intercept_url_patterns = patterns;
     }
 
+    pub fn set_cdp_request_patterns(&self, patterns: Option<std::sync::Arc<Vec<crate::ops::CdpRequestPattern>>>) {
+        self.state.borrow_mut().cdp_request_patterns = patterns;
+    }
+
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
     /// loads honour them like the page's own subresource fetches do.
     #[cfg(feature = "render")]
@@ -2357,7 +2361,7 @@ impl ObscuraJsRuntime {
         let initiator = initiator.expect("checked above");
         let callbacks = state.callbacks.clone();
         let interception = if state.intercept_enabled {
-            state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone()))
+            state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
         } else { None };
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
@@ -2415,9 +2419,10 @@ impl ObscuraJsRuntime {
                     let mut changed_method = None;
                     let mut changed_body = None;
                     let mut changed_headers = None;
-                    if let Some((intercept_tx, page_id, patterns)) = interception {
+                    if let Some((intercept_tx, page_id, patterns, cdp_patterns)) = interception {
                         if matches!(parsed.scheme(), "http" | "https")
-                            && crate::ops::should_intercept_url(true, &patterns, &raw) {
+                            && crate::ops::should_intercept_url(true, &patterns, &raw)
+                            && crate::ops::matches_cdp_request_patterns(cdp_patterns.as_deref().map(Vec::as_slice), &raw, if is_font { "Font" } else { "Image" }) {
                             let allow_private = http_client.as_ref().is_some_and(|client| client.allow_private_network);
                             if crate::ops::validate_fetch_url(&parsed, allow_private).is_err() {
                                 return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,

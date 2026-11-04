@@ -19,6 +19,7 @@ struct NativeInterception {
     tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
     page_id: String,
     patterns: Vec<String>,
+    cdp_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
     headers: std::collections::HashMap<String, String>,
 }
 
@@ -31,7 +32,8 @@ impl NativeInterception {
     ) -> Result<Option<(Response, String)>, String> {
         use obscura_js::ops::{InterceptedRequest, InterceptResolution};
         if !matches!(url.scheme(), "http" | "https") || (!self.patterns.is_empty()
-            && !self.patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
+            && !self.patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str())))
+            || !obscura_js::ops::matches_cdp_request_patterns(self.cdp_patterns.as_deref().map(Vec::as_slice), url.as_str(), kind) {
             return Ok(None);
         }
         obscura_js::ops::validate_fetch_url(url, client.allow_private_network)?;
@@ -392,6 +394,7 @@ pub struct Page {
     pub cdp_extra_headers: std::collections::HashMap<String, String>,
     pub cdp_full_extra_headers: std::collections::HashMap<String, String>,
     pub intercept_block_patterns: Vec<String>,
+    pub cdp_request_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
@@ -1218,6 +1221,7 @@ impl Page {
             cdp_extra_headers: std::collections::HashMap::new(),
             cdp_full_extra_headers: std::collections::HashMap::new(),
             intercept_block_patterns: Vec::new(),
+            cdp_request_patterns: None,
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
@@ -1876,7 +1880,8 @@ impl Page {
     async fn intercept_navigation(&self, url: &Url, method: &str, body: &str) -> Result<Option<Response>, PageError> {
         use obscura_js::ops::{InterceptedRequest, InterceptResolution};
         if !self.intercept_enabled || !matches!(url.scheme(), "http" | "https")
-            || (!self.intercept_block_patterns.is_empty() && !self.intercept_block_patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
+            || (!self.intercept_block_patterns.is_empty() && !self.intercept_block_patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str())))
+            || !obscura_js::ops::matches_cdp_request_patterns(self.cdp_request_patterns.as_deref().map(Vec::as_slice), url.as_str(), "Document") {
             return Ok(None);
         }
         let Some(tx) = &self.intercept_tx else { return Ok(None); };
@@ -2061,6 +2066,7 @@ impl Page {
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
         rt.set_intercept_url_patterns(self.intercept_block_patterns.clone());
+        rt.set_cdp_request_patterns(self.cdp_request_patterns.clone());
         #[cfg(feature = "render")]
         rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
@@ -2181,7 +2187,7 @@ impl Page {
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), headers: self.cdp_extra_headers.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
@@ -2629,7 +2635,7 @@ impl Page {
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), headers: self.cdp_extra_headers.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
@@ -5334,6 +5340,7 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
             js.set_intercept_url_patterns(self.intercept_block_patterns.clone());
+            js.set_cdp_request_patterns(self.cdp_request_patterns.clone());
             // `Fetch.enable` assigns the patterns right before this call;
             // the renderer's loads follow the same interception policy.
             #[cfg(feature = "render")]
@@ -5464,7 +5471,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], headers: Default::default() };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, headers: Default::default() };
         let (result, (), wire) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
                 interception.fetch(&original, request, "Script", &client,
@@ -5509,7 +5516,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], headers: Default::default() };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, headers: Default::default() };
         let (result, ()) = tokio::join!(
             interception.fetch(&original, request, "Script", &client,
                 #[cfg(feature = "stealth")] None, &callbacks),
