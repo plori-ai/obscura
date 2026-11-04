@@ -169,7 +169,7 @@ let _cssAnimationHasRules = false;
 let _cssAnimationCheckRules = true;
 let _cssAnimationRefreshPending = false;
 let _cssAnimationGeneration = 0;
-const _cssAnimationInstances = new Map();
+let _cssAnimationInstances = null;
 
 const _dom = (cmd, a1, a2) => {
   let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
@@ -12154,12 +12154,14 @@ function _scheduleCssAnimationRefresh(checkRules = false) {
   });
 }
 function _cssAnimationMutation(cmd, a1, a2) {
+  if (!_cssAnimationHasRules && (cmd === 'set_attribute' || cmd === 'remove_attribute')
+      && !/^(?:rel|href|media|disabled)(?:\0|$)/i.test(String(a2 || ''))) return;
   const mayContainSheet = (node, descendants) => {
     if (!node) return false;
     if (node.nodeType === 3) node = node.parentNode;
     if (!node) return false;
     if (node.localName === 'style' || node.localName === 'link') return true;
-    return descendants && !!(_domParse('query_selector_all_scoped', node._nid,
+    return descendants && node.hasChildNodes() && !!(_domParse('query_selector_all_scoped', node._nid,
       'style,link[rel~="stylesheet"]') || []).length;
   };
   const sheetChanged = ((cmd === 'set_inner_html' || cmd === 'set_inner_html_context'
@@ -12188,7 +12190,9 @@ function _refreshCssAnimations() {
   catch (_) { return; }
   if (check) _cssAnimationHasRules = rows !== null;
   rows ||= [];
-  const live = new Map(rows.map(row => [row[0], row[1]]));
+  if (!rows.length && !_cssAnimationInstances?.size) return;
+  _cssAnimationInstances ||= new Map();
+  const live = new Map(rows.map(row => [row[0] + ':' + row[7], row[1]]));
   for (const [id, instance] of _cssAnimationInstances) {
     if (live.get(id) === instance.name) continue;
     if (instance.timer !== undefined) _cancelScheduled(instance.timer);
@@ -12199,13 +12203,14 @@ function _refreshCssAnimations() {
     }
     _cssAnimationInstances.delete(id);
   }
-  for (const [id, name, local, duration, delay, count, paused] of rows) {
-    let instance = _cssAnimationInstances.get(id);
+  for (const [id, name, local, duration, delay, count, paused, index] of rows) {
+    const key = id + ':' + index;
+    let instance = _cssAnimationInstances.get(key);
     if (!instance) {
       const target = _wrapEl(id);
       if (!target) continue;
       instance = { name, target, started: false, ended: false, iteration: 0 };
-      _cssAnimationInstances.set(id, instance);
+      _cssAnimationInstances.set(key, instance);
     }
     if (instance.timer !== undefined) { _cancelScheduled(instance.timer); instance.timer = undefined; }
     if (instance.ended) continue;
@@ -18957,10 +18962,12 @@ globalThis.__obscura_init_frames = function() {
 
 globalThis.__obscura_init = (function() {
   _cssAnimationGeneration++;
-  for (const instance of _cssAnimationInstances.values()) {
-    if (instance.timer !== undefined) _cancelScheduled(instance.timer);
+  if (_cssAnimationInstances) {
+    for (const instance of _cssAnimationInstances.values()) {
+      if (instance.timer !== undefined) _cancelScheduled(instance.timer);
+    }
+    _cssAnimationInstances = null;
   }
-  _cssAnimationInstances.clear();
   _cssAnimationWatching = false;
   _cssAnimationHasRules = false;
   _cssAnimationCheckRules = true;
@@ -18995,7 +19002,7 @@ globalThis.__obscura_init = (function() {
     // Track animations even when no listener was present at their start;
     // listeners installed later must not receive a replayed start event.
     _eventTargetAdd(document, 'DOMContentLoaded', _watchCssAnimations);
-    if (+_dom('query_selector', '[onanimationstart],[onanimationend],[onanimationiteration],[onanimationcancel]') > 0) {
+    if (_dom('has_animation_handler') === 'true') {
       _watchCssAnimations();
     }
   }

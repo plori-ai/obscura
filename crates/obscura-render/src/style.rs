@@ -832,6 +832,9 @@ fn unitless_math_tokens<'i, 't>(
 }
 
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
+    if name.starts_with("animation") {
+        apply_animation_lists(style, name, value);
+    }
     match name {
         "direction" => {
             match value.trim().to_ascii_lowercase().as_str() {
@@ -3206,6 +3209,48 @@ fn supports_transform_value(value: &str) -> bool {
         return true;
     }
     parse_transform_ops(value).is_some()
+}
+
+// Keep each longhand list independently: CSS repeats shorter lists to match
+// animation-name, and later declarations may replace only one list.
+fn apply_animation_lists(style: &mut LayoutStyle, name: &str, value: &str) {
+    if !matches!(name, "animation" | "animation-name" | "animation-duration" | "animation-delay"
+        | "animation-iteration-count" | "animation-direction" | "animation-fill-mode" | "animation-play-state") {
+        return;
+    }
+    let parts = if value.contains(',') { split_top_level(value, ',') } else { vec![value] };
+    if name == "animation" && parts.len() == 1 {
+        style.animation_lists = None;
+        return;
+    }
+    if parts.len() == 1 && style.animation_lists.is_none() { return; }
+    let mut lists = style.animation_lists.take()
+        .unwrap_or_else(|| Box::new(crate::AnimationLists::from_style(style)));
+    let values: Vec<_> = parts.iter().map(|part| {
+        let mut entry = LayoutStyle::default();
+        apply_value(&mut entry, name, part.trim());
+        (entry.animation_name, entry.animation_timing)
+    }).collect();
+    match name {
+        "animation" => {
+            lists.names = values.iter().map(|(name, _)| name.clone()).collect();
+            lists.durations = values.iter().map(|(_, t)| t.duration_ms).collect();
+            lists.delays = values.iter().map(|(_, t)| t.delay_ms).collect();
+            lists.iterations = values.iter().map(|(_, t)| t.iteration_count).collect();
+            lists.directions = values.iter().map(|(_, t)| t.direction).collect();
+            lists.fills = values.iter().map(|(_, t)| t.fill_mode).collect();
+            lists.states = values.iter().map(|(_, t)| t.play_state).collect();
+        }
+        "animation-name" => lists.names = values.iter().map(|(name, _)| name.clone()).collect(),
+        "animation-duration" => lists.durations = values.iter().map(|(_, t)| t.duration_ms).collect(),
+        "animation-delay" => lists.delays = values.iter().map(|(_, t)| t.delay_ms).collect(),
+        "animation-iteration-count" => lists.iterations = values.iter().map(|(_, t)| t.iteration_count).collect(),
+        "animation-direction" => lists.directions = values.iter().map(|(_, t)| t.direction).collect(),
+        "animation-fill-mode" => lists.fills = values.iter().map(|(_, t)| t.fill_mode).collect(),
+        "animation-play-state" => lists.states = values.iter().map(|(_, t)| t.play_state).collect(),
+        _ => {}
+    }
+    style.animation_lists = Some(lists);
 }
 
 fn apply_animation_shorthand(style: &mut LayoutStyle, value: &str) {

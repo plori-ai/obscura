@@ -2539,6 +2539,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 }
             }
         }
+        "has_animation_handler" => dom.descendants(dom.document()).into_iter().any(|id| {
+            dom.with_node(id, |node| ["onanimationstart", "onanimationend",
+                "onanimationiteration", "onanimationcancel"].iter()
+                .any(|name| node.get_attribute(name).is_some())).unwrap_or(false)
+        }).to_string(),
         "query_selector" => dom
             .query_selector(&arg1)
             .ok()
@@ -9296,10 +9301,10 @@ fn css_animation_snapshot(state: &OpState, frame_id: u32, check_rules: bool) -> 
     let now = (gs.animation_timeline_origin.elapsed().as_secs_f64() * 1_000.0)
         .min(f64::from(f32::MAX)) as f32;
     let instances = gs.animation_timeline.css_animation_instances(now);
-    let values: Vec<_> = instances.into_iter().map(|(id, name, local, timing)| {
+    let values: Vec<_> = instances.into_iter().map(|(id, index, name, local, timing)| {
         serde_json::json!([id, name, local, timing.duration_ms, timing.delay_ms,
             if timing.iteration_count.is_finite() { Some(timing.iteration_count) } else { None },
-            timing.play_state == obscura_render::AnimationPlayState::Paused])
+            timing.play_state == obscura_render::AnimationPlayState::Paused, index])
     }).collect();
     serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
 }

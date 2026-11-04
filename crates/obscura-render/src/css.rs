@@ -4189,7 +4189,7 @@ impl Stylesheet {
                 .any(|&(_, _, i)| self.rules[i].important_flags.has_animation);
         style.animation_has_render_effect = false;
         style.animation_effect_impact = crate::AnimationEffectImpact::None;
-        if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
+        if !self.keyframes.is_empty() && (style.animation_name.is_some() || style.animation_lists.is_some() || important_has_animation)
         {
             let mut animation_style = style.clone();
             // The winning display declaration participates in animation
@@ -4209,37 +4209,31 @@ impl Stylesheet {
             crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             if ancestor_display_none || animation_style.display == crate::Display::None {
                 animation_timeline.suppress_css_animation(nid, animation_sample);
-            } else if let Some(name) = animation_style.animation_name.as_deref() {
-                if let Some(keyframes) = self.keyframes.get(name) {
-                    style.animation_has_render_effect = !keyframes.tracks.is_empty();
-                    style.animation_effect_impact = keyframes
-                        .tracks
-                        .keys()
-                        .copied()
-                        .map(AnimatedProperty::effect_impact)
-                        .max()
-                        .unwrap_or_default();
-                    let local_sample = animation_timeline.sample_for(
-                        nid,
-                        crate::AnimationInstanceKey {
-                            name: name.to_string(),
-                        },
-                        animation_style.animation_timing,
-                        animation_sample,
-                    );
-                    style.animation_local_time_ms = local_sample.milliseconds;
-                    sample_animation_properties(
-                        keyframes,
-                        style,
-                        &animation_style.animation_timing,
-                        local_sample,
-                        props,
-                    );
-                } else {
-                    animation_timeline.clear_animation(nid, animation_sample);
-                }
             } else {
-                animation_timeline.clear_animation(nid, animation_sample);
+                let entries: Vec<(Option<&str>, crate::AnimationTiming)> =
+                    if let Some(lists) = animation_style.animation_lists.as_ref() {
+                        lists.names.iter().enumerate().map(|(index, name)|
+                            (name.as_deref(), lists.timing(index))).collect()
+                    } else {
+                        vec![(animation_style.animation_name.as_deref(), animation_style.animation_timing)]
+                    };
+                let names: Vec<_> = entries.iter().map(|(name, _)|
+                    name.filter(|name| self.keyframes.contains_key(*name))).collect();
+                animation_timeline.retain_css_animation_indices(nid, &names, animation_sample);
+                for (index, ((_, timing), name)) in entries.iter().zip(names).enumerate() {
+                    let Some(name) = name else { continue; };
+                    let Some(keyframes) = self.keyframes.get(name) else { continue; };
+                    style.animation_has_render_effect |= !keyframes.tracks.is_empty();
+                    style.animation_effect_impact = style.animation_effect_impact.max(keyframes
+                        .tracks.keys().copied().map(AnimatedProperty::effect_impact)
+                        .max().unwrap_or_default());
+                    let local_sample = animation_timeline.sample_for(
+                        nid, index, crate::AnimationInstanceKey { name: name.to_string() },
+                        *timing, animation_sample,
+                    );
+                    if index == 0 { style.animation_local_time_ms = local_sample.milliseconds; }
+                    sample_animation_properties(keyframes, style, timing, local_sample, props);
+                }
             }
         } else {
             animation_timeline.clear_animation(nid, animation_sample);

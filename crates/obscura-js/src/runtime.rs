@@ -26079,6 +26079,109 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_lists_dispatch_each_name_and_timing() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes a { from { opacity: 0 } to { opacity: 1 } }
+            @keyframes b { from { opacity: 1 } to { opacity: 0 } }
+        </style><div id="box"></div>"#);
+        rt.execute_script("animation-list-events", r#"
+            globalThis.events = [];
+            for (const type of ['animationstart', 'animationiteration', 'animationend']) {
+                document.addEventListener(type, e => events.push([e.type, e.animationName, e.elapsedTime]));
+            }
+            document.getElementById('box').style.animation = 'a 40ms 2, b 100ms 20ms';
+        "#).unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", "a", 0], ["animationstart", "b", 0],
+            ["animationiteration", "a", 0.04], ["animationend", "a", 0.08],
+            ["animationend", "b", 0.1]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_lists_cancel_replaced_slot_only() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes a { from { opacity: 0 } to { opacity: 1 } }
+            @keyframes b { from { opacity: 1 } to { opacity: 0 } }
+            @keyframes c { from { opacity: 0 } to { opacity: 1 } }
+        </style><div id="box"></div>"#);
+        rt.execute_script("animation-list-replacement", r#"
+            globalThis.events = [];
+            for (const type of ['animationstart', 'animationend', 'animationcancel'])
+                document.addEventListener(type, e => events.push([e.type, e.animationName]));
+            globalThis.box = document.getElementById('box');
+            box.style.animation = 'a 150ms, b 150ms';
+            setTimeout(() => { box.style.animationName = 'a, c'; }, 30);
+        "#).unwrap();
+        rt.run_event_loop_bounded(300).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", "a"], ["animationstart", "b"],
+            ["animationcancel", "b"], ["animationstart", "c"],
+            ["animationend", "a"], ["animationend", "c"]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_list_reordering_keeps_existing_instances() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes a { from { opacity: 0 } to { opacity: 1 } }
+            @keyframes b { from { opacity: 1 } to { opacity: 0 } }
+        </style><div id="box"></div>"#);
+        rt.execute_script("animation-list-reorder", r#"
+            globalThis.events = [];
+            for (const type of ['animationstart', 'animationend', 'animationcancel'])
+                document.addEventListener(type, e => events.push([e.type, e.animationName]));
+            const box = document.getElementById('box');
+            box.style.animation = 'a 120ms, b 120ms';
+            setTimeout(() => { box.style.animationName = 'b, a'; }, 30);
+        "#).unwrap();
+        rt.run_event_loop_bounded(220).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", "a"], ["animationstart", "b"],
+            ["animationend", "a"], ["animationend", "b"]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_list_allows_repeated_names() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes a { from { opacity: 0 } to { opacity: 1 } }
+        </style><div id="box"></div>"#);
+        rt.execute_script("animation-list-duplicates", r#"
+            globalThis.events = [];
+            document.addEventListener('animationend', e => events.push([e.animationName, e.elapsedTime]));
+            document.getElementById('box').style.animation = 'a 30ms, a 70ms';
+        "#).unwrap();
+        rt.run_event_loop_bounded(150).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([["a", 0.03], ["a", 0.07]]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_longhand_lists_repeat_shorter_values() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes a { from { opacity: 0 } to { opacity: 1 } }
+            @keyframes b { from { opacity: 1 } to { opacity: 0 } }
+        </style><div id="box"></div>"#);
+        rt.execute_script("animation-list-longhands", r#"
+            globalThis.events = [];
+            document.addEventListener('animationend', e => events.push([e.animationName, e.elapsedTime]));
+            const style = document.getElementById('box').style;
+            style.animationDuration = '30ms, 70ms';
+            style.animationIterationCount = '2';
+            style.animationName = 'a, missing, b';
+        "#).unwrap();
+        rt.run_event_loop_bounded(220).await.unwrap();
+        assert_eq!(rt.evaluate("events.sort((a,b) => a[0].localeCompare(b[0]))").unwrap(),
+            serde_json::json!([["a", 0.06], ["b", 0.06]]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn css_animation_zero_duration_and_missing_keyframes() {
         let mut rt = setup_runtime(r#"<style>
             @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
@@ -26215,6 +26318,44 @@ mod tests {
         "#).unwrap();
         rt.run_event_loop_bounded(20).await.unwrap();
         assert!(rt.state.borrow().prepared_render.is_none());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_keyframes_without_declaration_stay_lazy() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            .box { color: red }
+        </style><div id="box"></div>"#);
+        rt.execute_script("listener", r#"
+            globalThis.events = [];
+            document.addEventListener('animationend', e => events.push(e.animationName));
+        "#).unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert!(rt.state.borrow().prepared_render.is_none());
+        assert_eq!(rt.state.borrow().stylesheet_cache.retained_source_bytes(), 0);
+        rt.execute_script("start", "document.getElementById('box').style.animation = 'fade 20ms'").unwrap();
+        rt.run_event_loop_bounded(60).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!(["fade"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_unmatched_simple_class_stays_unparsed_until_matching() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            .running { animation: fade 20ms; }
+        </style><div id="box"></div>"#);
+        rt.execute_script("listener", r#"
+            globalThis.events = [];
+            document.addEventListener('animationend', e => events.push(e.animationName));
+        "#).unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert!(rt.state.borrow().prepared_render.is_none());
+        assert_eq!(rt.state.borrow().stylesheet_cache.retained_source_bytes(), 0);
+        rt.execute_script("match", "document.getElementById('box').className = 'running'").unwrap();
+        rt.run_event_loop_bounded(60).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!(["fade"]));
     }
 
     #[cfg(feature = "render")]
