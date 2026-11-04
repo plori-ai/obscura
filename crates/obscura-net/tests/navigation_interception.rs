@@ -71,3 +71,36 @@ async fn navigation_interception_redirects_preserve_method_and_body() {
 async fn navigation_interception_redirects_preserve_method_and_body_in_stealth() {
     tokio::time::timeout(std::time::Duration::from_secs(10),redirects_preserve_method_and_body(true)).await.unwrap();
 }
+
+#[cfg(feature = "stealth")]
+#[tokio::test]
+async fn stealth_navigation_preserves_chrome_header_order() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (head, _) = request(&mut socket).await;
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        head
+    });
+    let jar = Arc::new(CookieJar::new());
+    jar.set_cookie("test=value; Path=/", &url);
+    obscura_net::StealthHttpClient::with_proxy(jar, None, true)
+        .fetch_navigation_request(&url, "GET", None,
+            Some([("referer".into(), "https://example.com/".into())].into()), None).await.unwrap();
+    let head = fixture.await.unwrap();
+    let names: Vec<_> = head.lines().skip(1).filter_map(|line| line.split_once(':').map(|(name, _)| name)).collect();
+    for pair in [
+        ("sec-ch-ua-platform", "Upgrade-Insecure-Requests"),
+        ("Upgrade-Insecure-Requests", "User-Agent"),
+        ("User-Agent", "Accept"), ("Accept", "Sec-Fetch-Site"),
+        ("Sec-Fetch-Site", "Sec-Fetch-Mode"), ("Sec-Fetch-Mode", "Sec-Fetch-User"),
+        ("Sec-Fetch-User", "Sec-Fetch-Dest"), ("Sec-Fetch-Dest", "Referer"),
+        ("Referer", "Accept-Encoding"),
+        ("Accept-Language", "Cookie"), ("Cookie", "priority"),
+    ] {
+        let first = names.iter().position(|name| *name == pair.0).unwrap();
+        let second = names.iter().position(|name| *name == pair.1).unwrap();
+        assert!(first < second, "unexpected header order: {head}");
+    }
+}

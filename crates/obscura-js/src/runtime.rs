@@ -5926,6 +5926,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn high_entropy_client_hints_only_include_requested_values() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("client-hints", r#"
+            Promise.all([
+                navigator.userAgentData.getHighEntropyValues([]),
+                navigator.userAgentData.getHighEntropyValues(['architecture', 'unknown']),
+                navigator.userAgentData.getHighEntropyValues(['bitness', 'fullVersionList'])
+            ]).then(values => { globalThis.__hintKeys = values.map(value => Object.keys(value).sort()); });
+        "#).unwrap();
+        rt.run_event_loop().await.unwrap();
+        assert_eq!(rt.evaluate("__hintKeys").unwrap(), serde_json::json!([
+            ["brands", "mobile", "platform"],
+            ["architecture", "brands", "mobile", "platform"],
+            ["bitness", "brands", "fullVersionList", "mobile", "platform"]
+        ]));
+    }
+
+    #[tokio::test]
     async fn microtask_exception_reports_error_without_discarding_queued_work() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.evaluate(r#"(() => {

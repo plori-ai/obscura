@@ -375,6 +375,19 @@ impl StealthHttpClient {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.request(method.clone(), current_url.as_str());
 
+            if request.mode == RequestMode::Navigate {
+                // Preserve Chrome's navigation header order and HTTP/1 casing.
+                // Headers absent from a particular request are simply skipped.
+                let mut order = wreq::header::OrigHeaderMap::new();
+                for name in ["Host", "Connection", "sec-ch-ua", "sec-ch-ua-mobile",
+                    "sec-ch-ua-platform", "Upgrade-Insecure-Requests", "User-Agent",
+                    "Accept", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-User",
+                    "Sec-Fetch-Dest", "Referer", "Accept-Encoding", "Accept-Language", "Cookie", "priority"] {
+                    order.insert(name);
+                }
+                req = req.orig_headers(order);
+            }
+
             req = req
                 .header("accept", request.accept())
                 .header("sec-fetch-site", request_fetch_site(&request, &current_url))
