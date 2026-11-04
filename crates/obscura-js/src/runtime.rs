@@ -2432,7 +2432,7 @@ impl ObscuraJsRuntime {
                             let (resolver, resolution) = tokio::sync::oneshot::channel();
                             if intercept_tx.send(crate::ops::InterceptedRequest {
                                 request_id: id.clone(), page_id, url: raw.clone(), method: "GET".into(),
-                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), resolver,
+                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), auth_challenge: None, resolver,
                             }).is_ok() {
                                 request_id = Some(id);
                                 match resolution.await {

@@ -114,6 +114,7 @@ pub async fn handle(
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns = patterns.clone();
                 page.cdp_request_patterns = Some(cdp_patterns);
+                page.handle_auth_requests = params.get("handleAuthRequests").and_then(Value::as_bool).unwrap_or(false);
                 if let Some(tx) = tx_clone {
                     page.set_intercept_tx(tx);
                 }
@@ -138,6 +139,7 @@ pub async fn handle(
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns.clear();
                 page.cdp_request_patterns = None;
+                page.handle_auth_requests = false;
                 page.enable_intercept(false);
             }
             let paused: Vec<_> = ctx.fetch_intercept.paused.drain().collect();

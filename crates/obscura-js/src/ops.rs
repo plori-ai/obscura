@@ -70,7 +70,16 @@ pub struct InterceptedRequest {
     pub method: String,
     pub headers: HashMap<String, String>,
     pub resource_type: String,
+    pub auth_challenge: Option<AuthenticationChallenge>,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthenticationChallenge {
+    pub source: String,
+    pub origin: String,
+    pub scheme: String,
+    pub realm: String,
 }
 
 pub fn next_subresource_interception_id() -> String {
@@ -4116,6 +4125,7 @@ async fn fetch_url_inner(
             method: method.clone(),
             headers: custom_headers.clone(),
             resource_type: resource_type_name.to_string(),
+            auth_challenge: None,
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
@@ -8898,7 +8908,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 let (resolver, resolution) = tokio::sync::oneshot::channel();
                 if tx.send(InterceptedRequest { request_id: request_id.clone(), page_id,
                     url: selected_url.clone(), method: "GET".into(), headers: HashMap::new(),
-                    resource_type: "Image".into(), resolver }).is_ok() {
+                    resource_type: "Image".into(), auth_challenge: None, resolver }).is_ok() {
                     intercepted_id = Some(request_id);
                     match resolution.await {
                         Ok(InterceptResolution::Continue { url, method, headers, body }) => {

@@ -41,7 +41,7 @@ impl NativeInterception {
         let (resolver, resolution) = tokio::sync::oneshot::channel();
         if self.tx.send(InterceptedRequest { request_id: id.clone(), page_id: self.page_id.clone(),
             url: url.to_string(), method: "GET".into(), headers: self.headers.clone(),
-            resource_type: kind.into(), resolver }).is_err() { return Ok(None); }
+            resource_type: kind.into(), auth_challenge: None, resolver }).is_err() { return Ok(None); }
         let response = match resolution.await.map_err(|_| "interception cancelled".to_string())? {
             InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
                 obscura_net::client::validate_intercepted_response(&request, url, &headers).map_err(|e| e.to_string())?;
@@ -390,6 +390,7 @@ pub struct Page {
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
+    pub handle_auth_requests: bool,
     pub network_reporting_enabled: bool,
     pub cdp_extra_headers: std::collections::HashMap<String, String>,
     pub cdp_full_extra_headers: std::collections::HashMap<String, String>,
@@ -1217,6 +1218,7 @@ impl Page {
             response_body_order: std::collections::VecDeque::new(),
             network_event_counter: 0,
             intercept_enabled: false,
+            handle_auth_requests: false,
             network_reporting_enabled: false,
             cdp_extra_headers: std::collections::HashMap::new(),
             cdp_full_extra_headers: std::collections::HashMap::new(),
@@ -1889,7 +1891,7 @@ impl Page {
         let (resolver, resolution) = tokio::sync::oneshot::channel();
         let request = InterceptedRequest {request_id: format!("{}.{}", self.id, self.network_event_counter + 1),
             page_id: self.id.clone(), url: url.to_string(), method: method.into(), headers: request_headers.clone(),
-            resource_type: "Document".into(), resolver};
+            resource_type: "Document".into(), auth_challenge: None, resolver};
         if tx.send(request).is_err() { return Ok(None); }
         let response = match resolution.await {
             Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
@@ -1959,6 +1961,45 @@ impl Page {
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))
             .await
+    }
+
+    /// Allow CDP to answer an HTTP Basic challenge on a top-level navigation.
+    /// The credential is scoped to this retry and never stored on the client.
+    async fn authenticate_navigation(&self, response: Response, method: &str, body: &str) -> Result<Response, PageError> {
+        use obscura_js::ops::{AuthenticationChallenge, InterceptedRequest, InterceptResolution};
+        if !self.handle_auth_requests || response.status != 401 { return Ok(response); }
+        let Some(tx) = &self.intercept_tx else { return Ok(response); };
+        let Some(challenge) = response.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.as_str()) else { return Ok(response); };
+        let Some((scheme, parameters)) = challenge.split_once(' ') else { return Ok(response); };
+        if !scheme.eq_ignore_ascii_case("basic") { return Ok(response); }
+        let realm = parameters.split(',').filter_map(|part| part.trim().split_once('='))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("realm"))
+            .map(|(_, value)| value.trim().trim_matches('"').to_string()).unwrap_or_default();
+        let target = response.url.clone();
+        let headers = self.http_client.extra_headers.read().await.clone();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let intercepted = InterceptedRequest {
+            request_id: format!("{}.{}", self.id, self.network_event_counter + 1), page_id: self.id.clone(),
+            url: target.to_string(), method: method.into(), headers: headers.clone(), resource_type: "Document".into(),
+            auth_challenge: Some(AuthenticationChallenge { source: "Server".into(),
+                origin: target.origin().ascii_serialization(), scheme: "basic".into(), realm }), resolver,
+        };
+        if tx.send(intercepted).is_err() { return Ok(response); }
+        let Ok(InterceptResolution::Continue { headers: Some(credentials), .. }) = resolution.await else { return Ok(response); };
+        let Some(authorization) = credentials.iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.clone()) else { return Ok(response); };
+        let mut headers = headers;
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+        headers.insert("Authorization".into(), authorization);
+        let body = (!body.is_empty()).then(|| body.as_bytes().to_vec());
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            return client.fetch_navigation_request(&target, method, body, Some(headers), Some(&self.callbacks)).await
+                .map_err(|error| PageError::NetworkError(error.to_string()));
+        }
+        self.http_client.fetch_navigation_request(&target, method, body, Some(headers), Some(&self.callbacks)).await
+            .map_err(|error| PageError::NetworkError(error.to_string()))
     }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
@@ -3730,6 +3771,7 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        let response = self.authenticate_navigation(response, method, body).await?;
         self.navigation_timing.record("responseEnd");
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
@@ -5589,6 +5631,61 @@ mod tests {
         assert_eq!(page.title,"continued");
         assert_eq!(page.url_string(),"http://127.0.0.1:9/original","a network rewrite does not rewrite the document URL");
         assert!(page.http_client.extra_headers.read().await.is_empty(),"per-request headers cannot leak to another page");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basic_navigation_challenge_retries_with_scoped_credentials() {
+        assert_basic_navigation_challenge_retries_with_scoped_credentials(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn basic_navigation_challenge_retries_with_scoped_credentials_in_stealth() {
+        assert_basic_navigation_challenge_retries_with_scoped_credentials(true).await;
+    }
+
+    async fn assert_basic_navigation_challenge_retries_with_scoped_credentials(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/auth", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                if attempt == 0 {
+                    assert!(!headers.contains("authorization:"));
+                    socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(headers.contains("authorization: basic dxnlcjpwyxnz"));
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<title>hello</title>").await.unwrap();
+                }
+            }
+        });
+        let context = Arc::new(BrowserContext::with_storage_and_network("auth-navigation".into(), None, stealth, None, None, true));
+        let mut page = Page::new("auth-navigation".into(), context);
+        let mut requests = page.enable_interception();
+        page.cdp_request_patterns = Some(Arc::new(Vec::new()));
+        page.handle_auth_requests = true;
+        let (result, ()) = tokio::join!(page.navigate(&url), async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+            let challenge = request.auth_challenge.as_ref().expect("authentication challenge");
+            assert_eq!(challenge.scheme, "basic");
+            assert_eq!(challenge.realm, "fixture");
+            request.resolver.send(InterceptResolution::Continue { url: None, method: None,
+                headers: Some([("Authorization".into(), "Basic dXNlcjpwYXNz".into())].into()), body: None }).unwrap();
+        });
+        result.unwrap();
+        server.await.unwrap();
+        assert_eq!(page.title, "hello");
+        assert!(page.http_client.extra_headers.read().await.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

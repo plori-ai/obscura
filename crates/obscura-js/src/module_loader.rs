@@ -352,7 +352,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                             let (resolver, resolution) = tokio::sync::oneshot::channel();
                             if tx.send(crate::ops::InterceptedRequest { request_id: request_id.clone(), page_id,
                                 url: url.clone(), method: "GET".into(), headers: Default::default(),
-                                resource_type: "Script".into(), resolver }).is_ok() {
+                                resource_type: "Script".into(), auth_challenge: None, resolver }).is_ok() {
                                 intercepted = true;
                                 if let Some(event) = network_guard.as_mut().and_then(|guard| guard.event.as_mut()) {
                                     event.intercepted = true;
