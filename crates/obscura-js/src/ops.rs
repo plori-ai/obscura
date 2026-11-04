@@ -7876,6 +7876,16 @@ fn op_blob_url_revoke(state: &mut OpState, #[string] url: String) {
     }));
 }
 
+#[op2]
+#[serde]
+fn op_svg_path_metrics(#[string] data: &str, distance: f64) -> Vec<f64> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::svg_path::metrics(data, distance).map_or_else(Vec::new, |(total, point)| {
+            vec![total as f32 as f64, point.x as f32 as f64, point.y as f32 as f64]
+        })
+    })).unwrap_or_default()
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -7896,6 +7906,7 @@ pub fn build_extension() -> Extension {
         op_fetch_url(),
         op_blob_url_register(),
         op_blob_url_revoke(),
+        op_svg_path_metrics(),
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
         op_fetch_body(),

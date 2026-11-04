@@ -14792,7 +14792,19 @@ class SVGTextPositioningElement extends SVGTextContentElement {}
 class SVGGradientElement extends SVGElement {}
 class SVGAnimationElement extends SVGElement {}
 class SVGComponentTransferFunctionElement extends SVGElement {}
-class SVGPathElement extends SVGGeometryElement {}
+class SVGPathElement extends SVGGeometryElement {
+  getTotalLength() {
+    return __obscuraCore.ops.op_svg_path_metrics(this.getAttribute('d') || '', 0)[0] || 0;
+  }
+  getPointAtLength(distance) {
+    if (arguments.length === 0) throw new TypeError("getPointAtLength requires a distance");
+    const value = Math.fround(Number(distance));
+    if (!Number.isFinite(value)) throw new TypeError("The distance must be finite");
+    const result = __obscuraCore.ops.op_svg_path_metrics(this.getAttribute('d') || '', value);
+    if (!result.length) throw new DOMException("The element's path is empty.", "InvalidStateError");
+    return new DOMPoint(result[1], result[2]);
+  }
+}
 class SVGRectElement extends SVGGeometryElement {}
 class SVGCircleElement extends SVGGeometryElement {}
 class SVGEllipseElement extends SVGGeometryElement {}

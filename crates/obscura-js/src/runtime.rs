@@ -18281,6 +18281,22 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn svg_path_length_and_points_expose_geometry_and_errors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt.evaluate(r#"(() => {
+            const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            p.setAttribute('d', 'M10 20 h80 v30 h-80 z');
+            const at = n => { const q = p.getPointAtLength(n); return [q.x, q.y, q instanceof DOMPoint]; };
+            const result = [p.getTotalLength(), at(-1), at(120), at(999)];
+            p.setAttribute('d', '');
+            try { p.getPointAtLength(0); } catch (e) { result.push(e.name); }
+            try { p.getPointAtLength(Infinity); } catch (e) { result.push(e.name); }
+            return result;
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!([220, [10, 20, true], [80, 50, true], [10, 20, true], "InvalidStateError", "TypeError"]));
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn inline_important_priority_is_used_by_the_author_cascade() {
