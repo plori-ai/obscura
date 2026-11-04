@@ -17522,8 +17522,15 @@ URL.createObjectURL = function(blob) {
       let text = '';
       try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
       globalThis.__blobStore[id] = text;
+      __obscuraCore.ops.op_blob_url_register(id, String(blob.type || ''), blob._bytes);
     } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+      globalThis.__blobStore[id] = '';
+      blob.text().then(text => {
+        if (Object.prototype.hasOwnProperty.call(globalThis.__blobStore, id)) {
+          globalThis.__blobStore[id] = text;
+          __obscuraCore.ops.op_blob_url_register(id, String(blob.type || ''), new TextEncoder().encode(text));
+        }
+      });
     } else {
       globalThis.__blobStore[id] = '';
     }
@@ -17531,6 +17538,7 @@ URL.createObjectURL = function(blob) {
   }
 };
 URL.revokeObjectURL = function(url) {
+  __obscuraCore.ops.op_blob_url_revoke(String(url));
   delete globalThis.__blobStore[url];
 };
 

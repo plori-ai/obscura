@@ -393,6 +393,8 @@ pub struct ObscuraState {
     /// sent to the interception channel; empty means every request.
     pub intercept_url_patterns: Vec<String>,
     pub intercept_page_id: String,
+    /// Blob URL bytes and MIME types, shared by the page's realms.
+    pub blob_urls: HashMap<String, (String, Vec<u8>)>,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
@@ -663,6 +665,7 @@ impl ObscuraState {
             session_history: SessionHistory::default(),
             pending_history_traversal: None,
             intercept_tx: None,
+            blob_urls: HashMap::new(),
             intercept_enabled: false,
             intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
@@ -7853,6 +7856,26 @@ fn op_frame_preload_scripts(state: &OpState) -> String {
     })
 }
 
+#[op2(fast)]
+fn op_blob_url_register(state: &mut OpState, #[string] url: String, #[string] mime: String, #[buffer] bytes: &[u8]) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = state.borrow::<SharedState>().clone();
+        let registered = if let Ok(mut state) = shared.try_borrow_mut() {
+            state.blob_urls.insert(url, (mime, bytes.to_vec()));
+            true
+        } else { false };
+        registered
+    })).unwrap_or(false)
+}
+
+#[op2(fast)]
+fn op_blob_url_revoke(state: &mut OpState, #[string] url: String) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = state.borrow::<SharedState>().clone();
+        if let Ok(mut state) = shared.try_borrow_mut() { state.blob_urls.remove(&url); };
+    }));
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -7871,6 +7894,8 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_report_browser_exception(),
         op_fetch_url(),
+        op_blob_url_register(),
+        op_blob_url_revoke(),
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
         op_fetch_body(),

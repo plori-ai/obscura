@@ -23629,6 +23629,33 @@ mod tests {
         assert!(rt.take_js_network_events().iter().any(|event| event.intercepted && event.resource_type == "Script"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_and_blob_modules_support_imports_and_mime_checks() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.test/page");
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.test/page");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.run_page_init();
+        rt.load_inline_module("import { n } from 'data:text/javascript,export%20const%20n%3D7'; globalThis.staticDataResult = n;",
+            "https://example.test/main.js", 5_000).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.staticDataResult").unwrap(), serde_json::json!(7.0));
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const percent = (await import('data:text/javascript,export%20default%2042')).default;
+            const base64 = (await import('data:application/javascript;base64,ZXhwb3J0IGRlZmF1bHQgNDM=')).default;
+            let plainRejected = false; try { await import('data:text/plain,export%20default%2045'); } catch (_) { plainRejected = true; }
+            const url = URL.createObjectURL(new Blob(['export default 47'], {type:'text/javascript'}));
+            const blob = (await import(url)).default;
+            const revoked = URL.createObjectURL(new Blob(['export default 49'], {type:'text/javascript'}));
+            URL.revokeObjectURL(revoked);
+            let revokedRejected = false; try { await import(revoked); } catch (_) { revokedRejected = true; }
+            const bad = URL.createObjectURL(new Blob(['export default 48'], {type:'text/plain'}));
+            let blobTypeRejected = false; try { await import(bad); } catch (_) { blobTypeRejected = true; }
+            return [percent, base64, plainRejected, blob, revokedRejected, blobTypeRejected];
+        }"#, None, &[], true, true).await.unwrap();
+        assert!(!result.thrown, "{:?}", result.description);
+        assert_eq!(result.value.unwrap(), serde_json::json!([42, 43, true, 47, true, true]));
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn renderer_image_and_font_use_intercepted_binary_responses() {

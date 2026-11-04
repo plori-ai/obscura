@@ -154,6 +154,39 @@ fn io_err(msg: String) -> ModuleLoaderError {
     JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
+fn javascript_mime(mime: &data_url::mime::Mime) -> bool {
+    matches!((mime.type_.as_str(), mime.subtype.as_str()),
+        ("application", "ecmascript" | "javascript" | "x-ecmascript" | "x-javascript") |
+        ("text", "ecmascript" | "javascript" | "javascript1.0" | "javascript1.1" |
+            "javascript1.2" | "javascript1.3" | "javascript1.4" | "javascript1.5" |
+            "jscript" | "livescript" | "x-ecmascript" | "x-javascript"))
+}
+
+fn local_module_source(url: &str, state: Option<&Weak<RefCell<ObscuraState>>>) -> Result<Vec<u8>, String> {
+    const MAX_MODULE_BYTES: usize = 32 * 1024 * 1024;
+    if url.starts_with("data:") {
+        let data = data_url::DataUrl::process(url).map_err(|e| format!("Invalid data module URL: {e:?}"))?;
+        if !javascript_mime(data.mime_type()) { return Err("Module URL does not have a JavaScript MIME type".into()); }
+        let mut bytes = Vec::new();
+        data.decode(|chunk| {
+            if bytes.len().saturating_add(chunk.len()) > MAX_MODULE_BYTES { return Err(()); }
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        }).map_err(|_| "Invalid or oversized data module".to_string())?;
+        Ok(bytes)
+    } else {
+        let mut key = ModuleSpecifier::parse(url).map_err(|e| e.to_string())?;
+        key.set_fragment(None);
+        let state = state.and_then(Weak::upgrade).ok_or("Blob URL has no owning page")?;
+        let state = state.try_borrow().map_err(|_| "Blob URL store is busy")?;
+        let (mime, bytes) = state.blob_urls.get(key.as_str()).ok_or("Blob URL not found or revoked")?;
+        let mime = mime.parse::<data_url::mime::Mime>().map_err(|_| "Invalid blob MIME type")?;
+        if !javascript_mime(&mime) { return Err("Blob URL does not have a JavaScript MIME type".into()); }
+        if bytes.len() > MAX_MODULE_BYTES { return Err("Blob module is too large".into()); }
+        Ok(bytes.clone())
+    }
+}
+
 impl ModuleLoader for ObscuraModuleLoader {
     fn resolve(
         &self,
@@ -217,6 +250,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // Keeping the guard inside the future makes cancellation/navigation
         // decrement the count through Drop as well as success and failure.
         let is_dyn_import = options.is_dynamic_import;
+        let javascript_requested = matches!(options.requested_module_type, deno_core::RequestedModuleType::None);
         let activity_guard = is_dyn_import.then(|| activity.begin());
         let page_state = self.page_state.clone();
         let page_network = match self.page_state.as_ref() {
@@ -269,6 +303,17 @@ impl ModuleLoader for ObscuraModuleLoader {
                 url,
                 proxy_url.as_deref().unwrap_or("direct")
             );
+
+            if url.starts_with("data:") || url.starts_with("blob:") {
+                if !javascript_requested { return Err(io_err("Unsupported local module type".into())); }
+                let requested = ModuleSpecifier::parse(&url).map_err(|e| io_err(e.to_string()))?;
+                let body = local_module_source(&url, page_state.as_ref()).map_err(io_err)?;
+                let code = String::from_utf8_lossy(&body).into_owned();
+                return Ok(ModuleSource::new_with_redirect(
+                    deno_core::ModuleType::JavaScript, ModuleSourceCode::String(code.into()),
+                    &requested, &requested, None,
+                ));
+            }
 
             match page_network {
                 Ok((client, stealth, callbacks, interception)) => {
@@ -430,5 +475,20 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Err(error) => Err(io_err(error)),
             }
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_modules_decode_and_require_javascript_mime() {
+        assert_eq!(local_module_source("data:text/javascript,export%20default%2042", None).unwrap(), b"export default 42");
+        assert_eq!(local_module_source("data:application/javascript;base64,ZXhwb3J0IGRlZmF1bHQgNDM=", None).unwrap(), b"export default 43");
+        assert!(local_module_source("data:text/javascript1.5,export%20default%2044", None).is_ok());
+        assert!(local_module_source("data:text/plain,export%20default%2045", None).is_err());
+        assert!(local_module_source("data:,export%20default%2046", None).is_err());
+        assert!(local_module_source("data:text/javascript;base64,%%%", None).is_err());
     }
 }
