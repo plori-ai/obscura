@@ -23516,6 +23516,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn xhr_loading_state_requires_response_bytes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const original = __obscura_test_ops.op_fetch_url;
+                __obscura_test_ops.op_fetch_url = (url) => JSON.stringify({
+                    status: 200, url, headers: { 'x-fixture': 'yes' },
+                    body: url.endsWith('/text') ? 'x' : '',
+                    bodyBase64: url.endsWith('/binary') ? 'AA==' : undefined,
+                });
+                try {
+                    const request = (path, type) => new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        const states = [];
+                        xhr.open('GET', path);
+                        xhr.responseType = type;
+                        xhr.addEventListener('readystatechange', () => states.push(xhr.readyState));
+                        xhr.onload = () => resolve([states, xhr.status, xhr.getResponseHeader('x-fixture')]);
+                        xhr.onerror = reject;
+                        xhr.send();
+                    });
+                    return [await request('/empty', ''), await request('/text', ''),
+                            await request('/binary', 'arraybuffer')];
+                } finally { __obscura_test_ops.op_fetch_url = original; }
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([
+            [[2, 4], 200, "yes"], [[2, 3, 4], 200, "yes"], [[2, 3, 4], 200, "yes"]
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn xhr_response_url_reports_the_final_redirect_url() {
         let mut rt = redirect_chain_runtime(2);
         let result = rt
