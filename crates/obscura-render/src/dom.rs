@@ -5339,6 +5339,31 @@ fn layout_dom_once(
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
     let mut engine =
         crate::inline::TextEngine::new_with_web_fonts_and_emoji(fonts, needs_emoji_font);
+    #[cfg(feature = "paint")]
+    {
+        let mut fallback_candidates = HashSet::new();
+        // Text in a shadow root is absent from DOM descendants but does
+        // contribute to the flattened tree that layout and painting use.
+        let rendered = tree.has_shadow_roots().then(|| rendered_descendants(tree, tree.document()));
+        for id in rendered.as_ref().unwrap_or(&descendants) {
+            tree.with_node(*id, |node| {
+                let obscura_dom::tree::NodeData::Text { contents } = &node.data else { return };
+                if contents.is_ascii() { return; }
+                let mut ancestor = rendered_parent(tree, *id);
+                while let Some(parent) = ancestor {
+                    if styles.get(&parent).is_some_and(|style| style.display == crate::Display::None) { return; }
+                    ancestor = rendered_parent(tree, parent);
+                }
+                crate::inline::collect_fallback_candidates(contents, &mut fallback_candidates);
+            });
+        }
+        for style in styles.values().filter(|style| style.display != crate::Display::None) {
+            for content in [style.before_content.as_deref(), style.after_content.as_deref()].into_iter().flatten() {
+                crate::inline::collect_fallback_candidates(content, &mut fallback_candidates);
+            }
+        }
+        engine.ensure_system_fallback(fallback_candidates);
+    }
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first

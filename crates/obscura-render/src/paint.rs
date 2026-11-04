@@ -7578,7 +7578,14 @@ pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) 
         if c.is_control() {
             continue;
         }
-        width += scaled_font.h_advance(font.glyph_id(c));
+        let glyph = font.glyph_id(c);
+        width += if glyph.0 == 0 {
+            crate::inline::system_outline_font(c)
+                .map(|fallback| fallback.as_scaled(scale).h_advance(fallback.glyph_id(c)))
+                .unwrap_or_else(|| scaled_font.h_advance(glyph))
+        } else {
+            scaled_font.h_advance(glyph)
+        };
     }
     if is_bold {
         width += text.chars().filter(|c| !c.is_control()).count() as f32;
@@ -7631,9 +7638,14 @@ fn draw_text(
             continue;
         }
         let glyph_id = font.glyph_id(c);
-        let id = glyph_id;
-        let glyph = glyph_id.with_scale_and_position(scale, caret);
-        if let Some(outlined) = font.outline_glyph(glyph) {
+        let fallback = (glyph_id.0 == 0).then(|| crate::inline::system_outline_font(c)).flatten();
+        let (outlined, advance) = if let Some(fallback) = fallback.as_ref() {
+            let id = fallback.glyph_id(c);
+            (fallback.outline_glyph(id.with_scale_and_position(scale, caret)), fallback.as_scaled(scale).h_advance(id))
+        } else {
+            (font.outline_glyph(glyph_id.with_scale_and_position(scale, caret)), scaled_font.h_advance(glyph_id))
+        };
+        if let Some(outlined) = outlined {
             let bounds = outlined.px_bounds();
             outlined.draw(|gx, gy, c| {
                 let px = (bounds.min.x + gx as f32) as i32;
@@ -7701,12 +7713,12 @@ fn draw_text(
             // is wider than what draw_text actually advances through, and
             // the difference shows up as a visible gap after every word once
             // each word is its own independently-positioned box.
-            caret.x += scaled_font.h_advance(id)
+            caret.x += advance
                 + if is_bold { raster_scale } else { 0.0 }
                 + letter_spacing * raster_scale
                 + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         } else {
-            caret.x += scaled_font.h_advance(id)
+            caret.x += advance
                 + if is_bold { raster_scale } else { 0.0 }
                 + letter_spacing * raster_scale
                 + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };

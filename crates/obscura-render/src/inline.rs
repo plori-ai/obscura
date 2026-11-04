@@ -13,7 +13,7 @@
 //! OS, so layout remains deterministic unless the operator supplies fonts.
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
@@ -230,6 +230,121 @@ static FONT_DIRECTORIES: OnceLock<Vec<PathBuf>> = OnceLock::new();
 static BASE_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
 static EMOJI_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
 static WEB_FONT_DATABASES: OnceLock<Mutex<VecDeque<Arc<CachedWebFontSet>>>> = OnceLock::new();
+static SYSTEM_FONT_DATABASE: OnceLock<cosmic_text::fontdb::Database> = OnceLock::new();
+static SYSTEM_OUTLINE_FONTS: OnceLock<Mutex<HashMap<cosmic_text::fontdb::ID, Arc<ab_glyph::FontVec>>>> = OnceLock::new();
+static SYSTEM_GLYPH_FONTS: OnceLock<Mutex<HashMap<char, Option<cosmic_text::fontdb::ID>>>> = OnceLock::new();
+
+// Private-use characters only have meaning in the author's chosen fonts.
+// Chromium does not ask system fallback to substitute an unrelated PUA glyph.
+fn is_private_use(ch: char) -> bool {
+    matches!(ch, '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}')
+}
+
+fn system_font_database() -> &'static cosmic_text::fontdb::Database {
+    SYSTEM_FONT_DATABASE.get_or_init(|| {
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_system_fonts();
+        db
+    })
+}
+
+fn face_covers(db: &cosmic_text::fontdb::Database, id: cosmic_text::fontdb::ID, ch: char) -> bool {
+    db.with_face_data(id, |data, index| cosmic_text::ttf_parser::Face::parse(data, index).ok()
+        .and_then(|font| font.glyph_index(ch)).is_some_and(|glyph| glyph.0 != 0)).unwrap_or(false)
+}
+
+/// Ask the host fontconfig for its preferred face when available. Bound the
+/// child lifetime so an inaccessible font configuration cannot hang a page.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fontconfig_match(ch: char) -> Option<(PathBuf, u32)> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("fc-match")
+        .args(["-f", "%{file}|%{index}", &format!("sans:charset={:x}", ch as u32)])
+        .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Err(_) => { let _ = child.kill(); let _ = child.wait(); return None; }
+            Ok(None) if started.elapsed() < std::time::Duration::from_millis(250) => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Ok(None) => { let _ = child.kill(); let _ = child.wait(); return None; }
+        }
+    }
+    let mut output = String::new();
+    child.stdout.take()?.read_to_string(&mut output).ok()?;
+    let (path, index) = output.trim().rsplit_once('|')?;
+    Some((PathBuf::from(path), index.parse().ok()?))
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn fontconfig_match(_ch: char) -> Option<(PathBuf, u32)> { None }
+
+fn system_font_id(ch: char) -> Option<cosmic_text::fontdb::ID> {
+    let db = system_font_database();
+    let matches = SYSTEM_GLYPH_FONTS.get_or_init(Default::default);
+    if let Some(id) = matches.lock().unwrap_or_else(|p| p.into_inner()).get(&ch).copied() { return id; }
+    let preferred = fontconfig_match(ch).and_then(|(path, index)| db.faces().find_map(|face| {
+        let same_path = match &face.source {
+            cosmic_text::fontdb::Source::File(file) | cosmic_text::fontdb::Source::SharedFile(file, _) => file == &path,
+            _ => false,
+        };
+        (same_path && face.index == index && face_covers(db, face.id, ch)).then_some(face.id)
+    }));
+    let id = preferred.or_else(|| db.faces().find_map(|face| face_covers(db, face.id, ch).then_some(face.id)));
+    let mut matches = matches.lock().unwrap_or_else(|p| p.into_inner());
+    if matches.len() >= 4096 { matches.clear(); }
+    matches.insert(ch, id);
+    id
+}
+
+/// The direct-text fallback is used by native controls and legacy word
+/// leaves. Cache both the face lookup and owned outline data on first use.
+pub(crate) fn system_outline_font(ch: char) -> Option<Arc<ab_glyph::FontVec>> {
+    use ab_glyph::Font as _;
+    if ch.is_control() || ch.is_whitespace() || is_private_use(ch) || matches!(ch, '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{fe00}'..='\u{fe0f}'
+        | '\u{e0100}'..='\u{e01ef}') { return None; }
+    let fonts = SYSTEM_OUTLINE_FONTS.get_or_init(Default::default);
+    let mut fonts = fonts.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(font) = fonts.values().find(|font| font.glyph_id(ch).0 != 0) {
+        return Some(Arc::clone(font));
+    }
+    let db = system_font_database();
+    let id = system_font_id(ch)?;
+    if let Some(font) = fonts.get(&id) { return Some(Arc::clone(font)); }
+    let font = db.with_face_data(id, |data, index| {
+        ab_glyph::FontVec::try_from_vec_and_index(data.to_vec(), index).ok().map(Arc::new)
+    }).flatten()?;
+    fonts.insert(id, Arc::clone(&font));
+    Some(font)
+}
+
+/// Candidate characters for system fallback. Formatting controls and
+/// variation selectors affect shaping but do not require their own glyph.
+pub(crate) fn collect_fallback_candidates(text: &str, candidates: &mut HashSet<char>) {
+    if text.is_ascii() { return; }
+    candidates.extend(text.chars().filter(|ch| {
+        !ch.is_ascii() && !ch.is_control() && !ch.is_whitespace() && !is_private_use(*ch)
+            && !matches!(*ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}' | '\u{fe00}'..='\u{fe0f}'
+                | '\u{e0100}'..='\u{e01ef}')
+    }));
+}
+
+fn remove_supported_characters(db: &cosmic_text::fontdb::Database, missing: &mut HashSet<char>) {
+    for face in db.faces() {
+        if missing.is_empty() { break; }
+        db.with_face_data(face.id, |data, index| {
+            if let Ok(font) = cosmic_text::ttf_parser::Face::parse(data, index) {
+                missing.retain(|ch| font.glyph_index(*ch).is_none_or(|glyph| glyph.0 == 0));
+            }
+        });
+    }
+}
 
 #[cfg(test)]
 static BASE_FONT_DATABASE_BUILDS: AtomicUsize = AtomicUsize::new(0);
@@ -882,6 +997,7 @@ struct MarkerPlacement {
 /// [`crate::DomLayout`] so paint can rasterize the shaped glyphs.
 pub struct TextEngine {
     font_system: FontSystem,
+    system_fallback_ids: HashSet<cosmic_text::fontdb::ID>,
     loaded_families: HashMap<String, LoadedFamily>,
     swash: SwashCache,
     variable_swash: VariableSwashCache,
@@ -1291,6 +1407,7 @@ impl Default for TextEngine {
 
 fn paint_text_shadows(
     font_system: &mut FontSystem,
+    system_fallback_ids: &HashSet<cosmic_text::fontdb::ID>,
     swash: &mut SwashCache,
     variable_swash: &mut VariableSwashCache,
     item: &InlineItem,
@@ -1366,6 +1483,9 @@ fn paint_text_shadows(
                     let glyph_color = glyph.color_opt.unwrap_or(Color::rgba(0, 0, 0, 255));
                     let color = shadow.color.unwrap_or([glyph_color.r(), glyph_color.g(), glyph_color.b(), glyph_color.a()]);
                     if color[3] == 0 { continue; }
+                    let synthetic_bold = system_fallback_ids.contains(&glyph.font_id)
+                        && !glyph.font_is_variable && glyph.font_weight_axis_opt.unwrap_or(400.0) >= 600.0
+                        && font_system.db().face(glyph.font_id).is_some_and(|face| face.weight.0 < 600);
                     let pixels = layer.pixels_mut();
                     let mut draw = |x: i32, y: i32, coverage: Color| {
                         let px = i64::from(origin.0 as i32) + i64::from(physical.x) + i64::from(x) - i64::from(left);
@@ -1389,10 +1509,14 @@ fn paint_text_shadows(
                         glyph.font_optical_size_opt, glyph.font_italic_axis, explicit,
                     )).flatten();
                     let base = Color::rgba(color[0], color[1], color[2], 255);
+                    let mut draw_with_weight = |x, y, color| {
+                        draw(x, y, color);
+                        if synthetic_bold { draw(x + raster_scale.ceil().max(1.0) as i32, y, color); }
+                    };
                     if let Some(variations) = variations {
-                        variable_swash.with_pixels(font_system, physical.cache_key, variations, base, &mut draw);
+                        variable_swash.with_pixels(font_system, physical.cache_key, variations, base, &mut draw_with_weight);
                     } else {
-                        swash.with_pixels(font_system, physical.cache_key, base, &mut draw);
+                        swash.with_pixels(font_system, physical.cache_key, base, &mut draw_with_weight);
                     }
                 }
             }
@@ -1405,6 +1529,38 @@ fn paint_text_shadows(
 }
 
 impl TextEngine {
+    /// Add system faces only when the bundled and page-provided faces cannot
+    /// cover the page's actual text. The shared database holds file-backed
+    /// metadata, so font files are mapped by the shaper only when selected.
+    pub(crate) fn ensure_system_fallback(&mut self, mut candidates: HashSet<char>) {
+        if candidates.is_empty() { return; }
+        remove_supported_characters(self.font_system.db(), &mut candidates);
+        if candidates.is_empty() { return; }
+        let system = system_font_database();
+        if system.faces().next().is_none() { return; }
+        let mut db = self.font_system.db().clone();
+        let mut known_ids: HashSet<_> = db.faces().map(|face| face.id).collect();
+        // Add only faces needed by this page, in the host's preferred order.
+        // Limit attempts for a page containing many unsupported code points.
+        for _ in 0..128 {
+            let Some(ch) = candidates.iter().min().copied() else { break };
+            let Some(id) = system_font_id(ch) else { candidates.remove(&ch); continue };
+            let Some(face) = system.face(id) else { candidates.remove(&ch); continue };
+            db.push_face_info(face.clone());
+            if let Some(new_id) = db.faces().map(|face| face.id).find(|id| !known_ids.contains(id)) {
+                known_ids.insert(new_id);
+                self.system_fallback_ids.insert(new_id);
+            }
+            system.with_face_data(id, |data, index| {
+                if let Ok(font) = cosmic_text::ttf_parser::Face::parse(data, index) {
+                    candidates.retain(|candidate| font.glyph_index(*candidate).is_none_or(|glyph| glyph.0 == 0));
+                }
+            });
+            candidates.remove(&ch);
+        }
+        self.font_system = FontSystem::new_with_locale_and_db(self.font_system.locale().to_owned(), db);
+    }
+
     pub fn new() -> Self {
         Self::new_with_fonts(&[])
     }
@@ -1453,6 +1609,7 @@ impl TextEngine {
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         TextEngine {
             font_system,
+            system_fallback_ids: HashSet::new(),
             loaded_families,
             swash: SwashCache::new(),
             variable_swash: VariableSwashCache::new(),
@@ -3846,6 +4003,7 @@ impl TextEngine {
     ) {
         let TextEngine {
             font_system,
+            system_fallback_ids,
             swash,
             variable_swash,
             items,
@@ -3890,7 +4048,7 @@ impl TextEngine {
             .unwrap_or_default();
 
         if !item.shadow_ranges.is_empty() {
-            paint_text_shadows(font_system, swash, variable_swash, item, pixmap,
+            paint_text_shadows(font_system, system_fallback_ids, swash, variable_swash, item, pixmap,
                 (ox, oy), clip, clip_mask, raster_scale, &line_source_starts);
         }
 
@@ -4040,6 +4198,9 @@ impl TextEngine {
                     );
                 let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);
                 let glyph_color = glyph.color_opt.unwrap_or(default);
+                let synthetic_bold = system_fallback_ids.contains(&glyph.font_id)
+                    && !glyph.font_is_variable && glyph.font_weight_axis_opt.unwrap_or(400.0) >= 600.0
+                    && font_system.db().face(glyph.font_id).is_some_and(|face| face.weight.0 < 600);
                 let fill_index = metadata_fill(glyph.metadata);
                 if print_economy && fill_index.is_some() {
                     continue;
@@ -4133,20 +4294,24 @@ impl TextEngine {
                         )
                     })
                     .flatten();
+                let mut draw_with_weight = |x, y, color| {
+                    draw_pixel(x, y, color);
+                    if synthetic_bold { draw_pixel(x + raster_scale.ceil().max(1.0) as i32, y, color); }
+                };
                 if let Some(variations) = effective_variations {
                     variable_swash.with_pixels(
                         font_system,
                         physical.cache_key,
                         variations,
                         glyph_color,
-                        &mut draw_pixel,
+                        &mut draw_with_weight,
                     );
                 } else {
                     swash.with_pixels(
                         font_system,
                         physical.cache_key,
                         glyph_color,
-                        &mut draw_pixel,
+                        &mut draw_with_weight,
                     );
                 }
             }
@@ -5781,6 +5946,81 @@ gamma</div>"#,
         // A single-color list samples to that color everywhere.
         let flat = (0.0f32, vec![([7, 8, 9, 255], None)]);
         assert_eq!(sample_gradient(&flat, 3.0, 3.0, 20.0, 20.0), [7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn private_use_does_not_trigger_system_fallback() {
+        let mut candidates = HashSet::new();
+        collect_fallback_candidates("\u{e000}\u{f8ff}\u{f0000}\u{ffffd}\u{100000}\u{10fffd}", &mut candidates);
+        assert!(candidates.is_empty());
+        assert!(system_outline_font('\u{f007}').is_none());
+        assert!(SYSTEM_FONT_DATABASE.get().is_none());
+    }
+
+    #[test]
+    fn system_fallback_is_lazy_and_uses_missing_glyph_faces() {
+        let mut engine = TextEngine::new_with_web_fonts_and_emoji(&[], false);
+        let mut ascii = HashSet::new();
+        collect_fallback_candidates("Plain text", &mut ascii);
+        engine.ensure_system_fallback(ascii);
+        assert!(SYSTEM_FONT_DATABASE.get().is_none());
+
+        let mut fallback = cosmic_text::fontdb::Database::new();
+        fallback.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R)));
+        assert!(SYSTEM_FONT_DATABASE.set(fallback).is_ok());
+        let mut candidates = HashSet::new();
+        collect_fallback_candidates("🚀", &mut candidates);
+        engine.ensure_system_fallback(candidates);
+        assert!(engine.font_system.db().faces().any(|face| face.families.iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Noto Color Emoji"))));
+        let tree = obscura_dom::parse_html("<p id='copy'>🚀</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let style = LayoutStyle { display: Display::Block, font_size: Some(32.0), ..Default::default() };
+        let item = engine.try_build(&tree, copy, &HashMap::from([(copy, style)])).unwrap();
+        engine.finalize(item, (0.0, 0.0), 100.0, None);
+        assert!(engine.items[item].buffer.layout_runs().flat_map(|run| run.glyphs.iter())
+            .any(|glyph| glyph.glyph_id != 0));
+    }
+
+    #[test]
+    fn installed_cjk_face_supplies_missing_han_glyphs_when_available() {
+        use ab_glyph::Font as _;
+        let system = SYSTEM_FONT_DATABASE.get_or_init(|| {
+            let mut db = cosmic_text::fontdb::Database::new();
+            db.load_system_fonts();
+            db
+        });
+        let mut missing = HashSet::from(['你', '好']);
+        remove_supported_characters(system, &mut missing);
+        if !missing.is_empty() { return; }
+        let mut engine = TextEngine::new_with_web_fonts_and_emoji(&[], false);
+        engine.ensure_system_fallback(HashSet::from(['你', '好']));
+        let tree = obscura_dom::parse_html("<p id='copy'>你好</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let style = LayoutStyle { display: Display::Block, font_size: Some(32.0), ..Default::default() };
+        let item = engine.try_build(&tree, copy, &HashMap::from([(copy, style)])).unwrap();
+        engine.finalize(item, (0.0, 0.0), 100.0, None);
+        let glyphs: Vec<_> = engine.items[item].buffer.layout_runs()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.glyph_id)).collect();
+        assert_eq!(glyphs.len(), 2);
+        assert!(glyphs.into_iter().all(|glyph| glyph != 0));
+        let laid = crate::dom::layout_dom(&tree, (100.0, 80.0));
+        let item = laid.ifc_items[&copy];
+        assert!(laid.text_engine.items[item].buffer.layout_runs()
+            .flat_map(|run| run.glyphs.iter()).all(|glyph| glyph.glyph_id != 0));
+        assert_ne!(system_outline_font('你').unwrap().glyph_id('你').0, 0);
+
+        let tree = obscura_dom::parse_html("<x-card id='host'></x-card><p id='shadow-copy'>你好</p>");
+        let host = tree.get_element_by_id("host").unwrap();
+        let copy = tree.get_element_by_id("shadow-copy").unwrap();
+        let root = tree.attach_shadow_root(host, obscura_dom::tree::ShadowRootMode::Open).unwrap();
+        tree.append_child(root, copy);
+        let laid = crate::dom::layout_dom(&tree, (100.0, 80.0));
+        let item = laid.ifc_items[&copy];
+        let glyphs: Vec<_> = laid.text_engine.items[item].buffer.layout_runs()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.glyph_id)).collect();
+        assert_eq!(glyphs.len(), 2);
+        assert!(glyphs.into_iter().all(|glyph| glyph != 0), "shadow-root text needs system fallback");
     }
 
     #[test]
