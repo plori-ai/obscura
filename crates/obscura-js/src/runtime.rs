@@ -17510,6 +17510,198 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_connection_offer_and_ice_events() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("peer-offer", r#"
+            globalThis.rtcResult = { events: [] };
+            (async () => {
+                const pc = new RTCPeerConnection({ iceServers: [] });
+                for (const type of ['signalingstatechange', 'icegatheringstatechange', 'icecandidate']) {
+                    pc.addEventListener(type, event => {
+                        if (type === 'icecandidate') rtcResult.iceEvent = [event.isTrusted, event instanceof RTCPeerConnectionIceEvent];
+                        rtcResult.events.push(type === 'icecandidate' ? [type, event.candidate?.candidate ?? null] : [type, pc.iceGatheringState]);
+                    });
+                }
+                const channel = pc.createDataChannel('data');
+                const offer = await pc.createOffer();
+                rtcResult.before = [pc.localDescription, pc.pendingLocalDescription, channel.readyState];
+                rtcResult.offer = offer.sdp;
+                await pc.setLocalDescription(offer);
+                rtcResult.after = [pc.signalingState, pc.localDescription.type, pc.pendingLocalDescription.type];
+                globalThis.rtcPeer = pc;
+            })().catch(error => { rtcResult.error = String(error); });
+        "#).unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        let diagnostic = rt.evaluate("rtcResult").unwrap();
+        assert!(diagnostic.get("error").is_none(), "{diagnostic}");
+        let result = rt.evaluate(r#"
+            (() => {
+                const sdp = rtcResult.offer || '';
+                const events = rtcResult.events;
+                const candidates = events.filter(e => e[0] === 'icecandidate');
+                const result = [rtcResult.error || null, rtcResult.before, rtcResult.after,
+                    /a=group:BUNDLE 0\r\n/.test(sdp),
+                    /m=application 9 UDP\/DTLS\/SCTP webrtc-datachannel\r\n/.test(sdp),
+                    /a=ice-ufrag:[A-Za-z0-9+/]{4}\r\n/.test(sdp),
+                    /a=ice-pwd:[A-Za-z0-9+/]{24}\r\n/.test(sdp),
+                    /a=fingerprint:sha-256 (?:[A-F0-9]{2}:){31}[A-F0-9]{2}\r\n/.test(sdp),
+                    sdp.includes('a=sctp-port:5000\r\n'), sdp.includes('a=max-message-size:262144\r\n'),
+                    rtcPeer.iceGatheringState,
+                    candidates.length, /\.local \d+ typ host/.test(candidates[0]?.[1] || ''), candidates.at(-1)?.[1],
+                    rtcPeer.localDescription.sdp.includes('a=candidate:'), rtcResult.iceEvent];
+                rtcPeer.close();
+                result.push(rtcPeer.signalingState, rtcPeer.connectionState, rtcPeer.iceConnectionState);
+                return result;
+            })()
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            null, [null, null, "connecting"], ["have-local-offer", "offer", "offer"],
+            true, true, true, true, true, true, true, "complete", 2, true, null, true, [true, true],
+            "closed", "closed", "closed",
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_connection_implicit_offer_and_transceivers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("peer-implicit", r#"
+            globalThis.rtcImplicit = null;
+            (async () => {
+                const pc = new RTCPeerConnection();
+                pc.addTransceiver('audio', { direction: 'recvonly' });
+                pc.createDataChannel('data');
+                await pc.setLocalDescription();
+                rtcImplicit = [pc.signalingState, pc.localDescription.sdp.includes('m=audio '),
+                    pc.localDescription.sdp.includes('a=recvonly\r\n'),
+                    pc.localDescription.sdp.includes('m=application '),
+                    pc.localDescription.sdp.includes('a=group:BUNDLE 0 1\r\n')];
+                pc.close();
+            })().catch(error => { rtcImplicit = String(error); });
+        "#).unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(rt.evaluate("rtcImplicit").unwrap(), serde_json::json!(["have-local-offer", true, true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_connection_negotiation_is_coalesced_and_closed_channels_reject_sends() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("peer-negotiation", r#"
+            globalThis.rtcNegotiation = { events: 0 };
+            const pc = new RTCPeerConnection();
+            pc.onnegotiationneeded = () => rtcNegotiation.events++;
+            const a = pc.createDataChannel('a');
+            a.onclose = () => rtcNegotiation.closed = true;
+            pc.createDataChannel('b');
+            globalThis.rtcCloseCheck = () => {
+                pc.close();
+                let error = null;
+                try { a.send('x'); } catch (e) { error = e.name; }
+                return [rtcNegotiation.events, a.readyState, pc.signalingState, error];
+            };
+            globalThis.rtcClosedCheck = () => [a.readyState, rtcNegotiation.closed];
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("rtcCloseCheck()").unwrap(), serde_json::json!([1, "connecting", "closed", "InvalidStateError"]));
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("rtcClosedCheck()").unwrap(), serde_json::json!(["closed", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_connection_legacy_receive_options_add_transceivers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("peer-receive-options", r#"
+            globalThis.rtcReceive = null;
+            (async () => {
+                const pc = new RTCPeerConnection();
+                pc.createDataChannel('data');
+                const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+                rtcReceive = [offer.sdp.match(/^m=[^ ]+/gm),
+                    pc.getTransceivers().map(t => [t.receiver.track.kind, t.direction]),
+                    offer.sdp.includes('a=group:BUNDLE 0 1 2\r\n')];
+                pc.close();
+            })().catch(error => { rtcReceive = String(error); });
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("rtcReceive").unwrap(), serde_json::json!([
+            ["m=audio", "m=video", "m=application"], [["audio", "recvonly"], ["video", "recvonly"]], true,
+        ]));
+    }
+
+    #[test]
+    fn gpu_preferred_canvas_format_is_available_without_an_adapter() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const gpu = navigator.gpu;
+                const fn = gpu.getPreferredCanvasFormat;
+                let invalid;
+                try { fn.call({}); } catch (error) { invalid = error.name; }
+                navigator.gpu = {};
+                const retained = fn.call(gpu);
+                navigator.gpu = gpu;
+                return [fn.call(gpu), fn.call(gpu, 1), fn.name, fn.length, String(fn), invalid, retained];
+            })()
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "bgra8unorm", "bgra8unorm", "getPreferredCanvasFormat", 0,
+            "function getPreferredCanvasFormat() { [native code] }", "TypeError", "bgra8unorm",
+        ]));
+        for (platform, expected) in [("Windows", "bgra8unorm"), ("macOS", "bgra8unorm"),
+                                     ("Linux", "rgba8unorm"), ("Android", "rgba8unorm")] {
+            rt.set_platform("", platform, "");
+            assert_eq!(rt.evaluate("navigator.gpu.getPreferredCanvasFormat()").unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn chrome_app_running_state_matches_chromium_for_web_pages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const fn = chrome.app.runningState;
+                let extra;
+                try { fn(1); } catch (error) { extra = [error.name, error.message]; }
+                return [fn(), fn.name, fn.length, String(fn), extra];
+            })()
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "cannot_run", "runningState", 0, "function runningState() { [native code] }",
+            ["TypeError", "Error in invocation of app.runningState(): "],
+        ]));
+    }
+
+    #[test]
+    fn canvas_path_rect_does_not_paint_until_fill() {
+        let mut rt = setup_runtime("<html><body><canvas width='10' height='10'></canvas></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const ctx = document.querySelector('canvas').getContext('2d');
+                ctx.beginPath();
+                ctx.rect(Infinity, 0, 1, 1);
+                ctx.stroke();
+                ctx.rect(0, 0, 10, 10);
+                ctx.clip();
+                const before = Array.from(ctx.getImageData(2, 2, 1, 1).data);
+                ctx.beginPath();
+                ctx.rect(1, 1, 4, 4);
+                ctx.rect(7, 1, 2, 2);
+                ctx.fillStyle = '#ff0000';
+                ctx.fill();
+                const filled = [Array.from(ctx.getImageData(2, 2, 1, 1).data),
+                    Array.from(ctx.getImageData(6, 2, 1, 1).data),
+                    Array.from(ctx.getImageData(8, 2, 1, 1).data)];
+                ctx.fillStyle = '#0000ff';
+                ctx.fill();
+                return [before, filled, Array.from(ctx.getImageData(2, 2, 1, 1).data)];
+            })()
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [0, 0, 0, 0], [[255, 0, 0, 255], [0, 0, 0, 0], [255, 0, 0, 255]],
+            [0, 0, 255, 255],
+        ]));
+    }
+
     #[test]
     fn unavailable_webgl_context_does_not_claim_success() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");

@@ -2110,6 +2110,7 @@ dependencies = [
  "obscura-render",
  "pbkdf2",
  "psl",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
