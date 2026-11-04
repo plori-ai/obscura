@@ -149,7 +149,7 @@ let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
-  "set_attribute", "remove_attribute",
+  "set_attribute", "remove_attribute", "set_attribute_ns", "remove_attribute_ns",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable", "document_write", "document_write_close",
 ]);
@@ -164,6 +164,12 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 // makes `iframe.contentDocument.title` read the frame's document rather than
 // the caller's. Set by __obscura_init; 0 is the page.
 let _realmFrameId = 0;
+let _cssAnimationWatching = false;
+let _cssAnimationHasRules = false;
+let _cssAnimationCheckRules = true;
+let _cssAnimationRefreshPending = false;
+let _cssAnimationGeneration = 0;
+const _cssAnimationInstances = new Map();
 
 const _dom = (cmd, a1, a2) => {
   let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
@@ -177,6 +183,12 @@ const _dom = (cmd, a1, a2) => {
   }
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
     _domMutationEpoch++;
+    if (!_cssAnimationWatching && (cmd === 'set_attribute' || cmd === 'set_inner_html'
+        || cmd === 'set_inner_html_context' || cmd === 'set_fragment_html_executable'
+        || cmd === 'document_write') && /\bonanimation(?:start|end|iteration|cancel)\b/i.test(String(a2 || a1 || ''))) {
+      _watchCssAnimations();
+    }
+    if (_cssAnimationWatching) _cssAnimationMutation(cmd, a1, a2);
     // Resize observation is tied to rendering-invalidating DOM work. The
     // hook is installed later in bootstrap, before page script can run.
     if (typeof globalThis.__obscura_recompute_resizes === "function") {
@@ -389,7 +401,7 @@ function _decodeDataScriptUrl(url) {
 // native per-document state so it survives wrapper churn, fragment parsing,
 // moves, and cloneNode().
 globalThis.__markParserScripts = function(nids) {
-  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid);
+  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid, _realmFrameId);
 };
 async function __fetchDynClassicScript(task) {
   let body;
@@ -700,6 +712,7 @@ async function _loadLinkedStylesheet(c) {
       c._nid, loaded.css, loaded.responseUrl, loaded.originClean,
       globalThis.__obscura_frameId || 0
     );
+    _scheduleCssAnimationRefresh(true);
     _registerLinkedStylesheet(c, loaded.responseUrl);
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
@@ -1965,6 +1978,10 @@ function _eventTargetAdd(target, type, callback, options) {
   const isFunction = typeof callback === "function";
   if (!isFunction && typeof callback.handleEvent !== "function") return;
   type = String(type);
+  if (type === 'animationstart' || type === 'animationend'
+      || type === 'animationiteration' || type === 'animationcancel') {
+    _watchCssAnimations();
+  }
   const capture = _eventCapture(options);
   const signal = options && typeof options === "object" ? options.signal : null;
   if (signal && signal.aborted) return;
@@ -2207,7 +2224,7 @@ let _scriptingEnabled = true;
 let _sandboxOpaqueOrigin = false;
 function __prepareInsertedScript(script) {
   if (!_scriptingEnabled) return;
-  if (!__obscuraCore.ops.op_script_try_start(script._nid)) return;
+  if (!__obscuraCore.ops.op_script_try_start(script._nid, _realmFrameId)) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
   const isImportMap = scriptType === 'importmap';
@@ -10075,6 +10092,7 @@ globalThis.__obscura_recompute_media_queries = () => {
   // Media/viewport changes also invalidate live computed-style snapshots.
   // Keep the epoch in this private scope, not in host-injected page script.
   _domMutationEpoch++;
+  _scheduleCssAnimationRefresh(true);
   for (const ref of _mediaQueries) {
     const query = ref.deref();
     if (!query) { _mediaQueries.delete(ref); continue; }
@@ -10662,6 +10680,7 @@ class CSSStyleSheet extends StyleSheet {
     // A rule change restyles like a DOM mutation: computed-style snapshots
     // taken before it must not be reused.
     _domMutationEpoch++;
+    _scheduleCssAnimationRefresh(true);
     const state = _cssStyleSheetPrivate.get(this);
     if (state?.linked && this._ownerNode) {
       // ponytail: linked imports retain the existing whole-sheet write path;
@@ -11882,6 +11901,7 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
 globalThis.__obscura_setHovered = function(el) {
   if (typeof __obscuraCore.ops.op_set_hovered === 'function') {
     __obscuraCore.ops.op_set_hovered(el?._nid | 0, 0);
+    if (_cssAnimationHasRules) _scheduleCssAnimationRefresh();
   }
 };
 
@@ -12065,8 +12085,163 @@ globalThis.PointerEvent = class extends MouseEvent {
     this.isPrimary=!!o.isPrimary;
   }
 };
-globalThis.AnimationEvent = class extends Event {};
-globalThis.TransitionEvent = class extends Event {};
+const _animationEventFields = new WeakMap();
+const _transitionEventFields = new WeakMap();
+globalThis.AnimationEvent = class extends Event {
+  constructor(type, options = {}) {
+    if (arguments.length < 1) throw new TypeError('AnimationEvent requires an event type');
+    options = options ?? {};
+    super(type, options);
+    const elapsedTime = Number(options.elapsedTime === undefined ? 0 : options.elapsedTime);
+    if (!Number.isFinite(elapsedTime)) throw new TypeError('elapsedTime must be finite');
+    _animationEventFields.set(this, {
+      animationName: String(options.animationName === undefined ? '' : options.animationName),
+      elapsedTime,
+      pseudoElement: String(options.pseudoElement === undefined ? '' : options.pseudoElement),
+    });
+  }
+  get animationName() { return _animationEventFields.get(this).animationName; }
+  get elapsedTime() { return _animationEventFields.get(this).elapsedTime; }
+  get pseudoElement() { return _animationEventFields.get(this).pseudoElement; }
+};
+const _nativeAnimationEvent = globalThis.AnimationEvent;
+globalThis.TransitionEvent = class extends Event {
+  constructor(type, options = {}) {
+    if (arguments.length < 1) throw new TypeError('TransitionEvent requires an event type');
+    options = options ?? {};
+    super(type, options);
+    const elapsedTime = Number(options.elapsedTime === undefined ? 0 : options.elapsedTime);
+    if (!Number.isFinite(elapsedTime)) throw new TypeError('elapsedTime must be finite');
+    _transitionEventFields.set(this, {
+      propertyName: String(options.propertyName === undefined ? '' : options.propertyName),
+      elapsedTime,
+      pseudoElement: String(options.pseudoElement === undefined ? '' : options.pseudoElement),
+    });
+  }
+  get propertyName() { return _transitionEventFields.get(this).propertyName; }
+  get elapsedTime() { return _transitionEventFields.get(this).elapsedTime; }
+  get pseudoElement() { return _transitionEventFields.get(this).pseudoElement; }
+};
+const _cssAnimationHandlers = new WeakMap();
+for (const name of ['animationstart', 'animationend', 'animationiteration', 'animationcancel']) {
+  Object.defineProperty(Element.prototype, 'on' + name, {
+    configurable: true, enumerable: true,
+    get() { return _cssAnimationHandlers.get(this)?.[name] || null; },
+    set(value) {
+      let handlers = _cssAnimationHandlers.get(this);
+      if (!handlers) _cssAnimationHandlers.set(this, handlers = Object.create(null));
+      handlers[name] = typeof value === 'function' ? value : null;
+      if (handlers[name]) _watchCssAnimations();
+    },
+  });
+}
+
+// CSS animation events are driven by style invalidations and the next timing
+// boundary, rather than a document-wide animation-frame poll.
+function _watchCssAnimations() {
+  if (_cssAnimationWatching || typeof __obscuraCore.ops.op_css_animation_snapshot !== 'function') return;
+  _cssAnimationWatching = true;
+  _scheduleCssAnimationRefresh(true);
+}
+function _scheduleCssAnimationRefresh(checkRules = false) {
+  if (!_cssAnimationWatching) return;
+  _cssAnimationCheckRules ||= checkRules;
+  if (_cssAnimationRefreshPending) return;
+  _cssAnimationRefreshPending = true;
+  const generation = _cssAnimationGeneration;
+  queueMicrotask(() => {
+    if (generation === _cssAnimationGeneration) _refreshCssAnimations();
+  });
+}
+function _cssAnimationMutation(cmd, a1, a2) {
+  const mayContainSheet = (node, descendants) => {
+    if (!node) return false;
+    if (node.nodeType === 3) node = node.parentNode;
+    if (!node) return false;
+    if (node.localName === 'style' || node.localName === 'link') return true;
+    return descendants && !!(_domParse('query_selector_all_scoped', node._nid,
+      'style,link[rel~="stylesheet"]') || []).length;
+  };
+  const sheetChanged = ((cmd === 'set_inner_html' || cmd === 'set_inner_html_context'
+      || cmd === 'set_fragment_html_executable' || cmd === 'document_write')
+      && /<(?:style|link)\b/i.test(String(a2 || a1 || '')))
+      || (cmd === 'append_child' && mayContainSheet(_cache.get(+a2), true))
+      || (cmd === 'insert_before' && mayContainSheet(_cache.get(+a1), true))
+      || (cmd !== 'append_child' && cmd !== 'insert_before'
+          && mayContainSheet(_cache.get(+a1), false));
+  if (_cssAnimationHasRules || sheetChanged) _scheduleCssAnimationRefresh(sheetChanged);
+}
+function _cssAnimationEvent(instance, type, elapsed) {
+  const event = new _nativeAnimationEvent(type, {
+    bubbles: true, animationName: instance.name, elapsedTime: elapsed / 1000,
+  });
+  _trustedEvents.add(event);
+  _domEventDispatch(instance.target, event);
+}
+function _refreshCssAnimations() {
+  _cssAnimationRefreshPending = false;
+  if (!_cssAnimationWatching) return;
+  const check = _cssAnimationCheckRules;
+  _cssAnimationCheckRules = false;
+  let rows;
+  try { rows = JSON.parse(__obscuraCore.ops.op_css_animation_snapshot(_realmFrameId, check)); }
+  catch (_) { return; }
+  if (check) _cssAnimationHasRules = rows !== null;
+  rows ||= [];
+  const live = new Map(rows.map(row => [row[0], row[1]]));
+  for (const [id, instance] of _cssAnimationInstances) {
+    if (live.get(id) === instance.name) continue;
+    if (instance.timer !== undefined) _cancelScheduled(instance.timer);
+    if (!instance.ended) {
+      const elapsed = Math.max(0, instance.local - instance.delay
+        + (instance.paused ? 0 : Math.max(0, performance.now() - instance.observedAt)));
+      _cssAnimationEvent(instance, 'animationcancel', Math.min(elapsed, instance.total));
+    }
+    _cssAnimationInstances.delete(id);
+  }
+  for (const [id, name, local, duration, delay, count, paused] of rows) {
+    let instance = _cssAnimationInstances.get(id);
+    if (!instance) {
+      const target = _wrapEl(id);
+      if (!target) continue;
+      instance = { name, target, started: false, ended: false, iteration: 0 };
+      _cssAnimationInstances.set(id, instance);
+    }
+    if (instance.timer !== undefined) { _cancelScheduled(instance.timer); instance.timer = undefined; }
+    if (instance.ended) continue;
+    const active = Math.max(0, local - delay);
+    const total = count === null ? Infinity : Math.max(0, duration * count);
+    Object.assign(instance, { local, delay, total, paused, observedAt: performance.now() });
+    if (local >= delay && !instance.started) {
+      instance.started = true;
+      _cssAnimationEvent(instance, 'animationstart', Math.min(Math.max(0, -delay), total));
+    }
+    if (instance.started && duration > 0 && count !== null) {
+      const boundary = Math.min(Math.floor(active / duration), Math.max(0, Math.ceil(count) - 1));
+      let delivered = 0;
+      while (instance.iteration < boundary && delivered++ < 100) {
+        instance.iteration++;
+        _cssAnimationEvent(instance, 'animationiteration', instance.iteration * duration);
+      }
+      instance.iteration = boundary;
+    }
+    if (instance.started && active >= total) {
+      instance.ended = true;
+      _cssAnimationEvent(instance, 'animationend', total);
+    } else if (!paused) {
+      let wait = instance.started ? total - active : delay - local;
+      if (instance.started && duration > 0 && count !== null) {
+        // Iterations are observed at rendering opportunities, not by a tight
+        // timer loop for sub-millisecond durations. Start/end remain punctual.
+        const iterationWait = (instance.iteration + 1) * duration - active;
+        if (iterationWait < wait) wait = Math.min(wait, Math.max(16, iterationWait));
+      }
+      if (Number.isFinite(wait)) {
+        instance.timer = _scheduleAfter(Math.max(0, wait), () => _scheduleCssAnimationRefresh());
+      }
+    }
+  }
+}
 globalThis.UIEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0; }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
@@ -18779,6 +18954,15 @@ globalThis.__obscura_init_frames = function() {
 };
 
 globalThis.__obscura_init = (function() {
+  _cssAnimationGeneration++;
+  for (const instance of _cssAnimationInstances.values()) {
+    if (instance.timer !== undefined) _cancelScheduled(instance.timer);
+  }
+  _cssAnimationInstances.clear();
+  _cssAnimationWatching = false;
+  _cssAnimationHasRules = false;
+  _cssAnimationCheckRules = true;
+  _cssAnimationRefreshPending = false;
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _scriptingEnabled = _domParse('scripting_enabled') !== false;
@@ -18805,6 +18989,14 @@ globalThis.__obscura_init = (function() {
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
   _cache.set(documentNid, document);
+  if (typeof __obscuraCore.ops.op_css_animation_snapshot === 'function') {
+    // Track animations even when no listener was present at their start;
+    // listeners installed later must not receive a replayed start event.
+    _eventTargetAdd(document, 'DOMContentLoaded', _watchCssAnimations);
+    if (+_dom('query_selector', '[onanimationstart],[onanimationend],[onanimationiteration],[onanimationcancel]') > 0) {
+      _watchCssAnimations();
+    }
+  }
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);

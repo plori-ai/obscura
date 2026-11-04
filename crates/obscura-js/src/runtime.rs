@@ -25983,6 +25983,247 @@ mod tests {
         assert_eq!(result, serde_json::json!(["menu", "true"]));
     }
 
+    #[test]
+    fn css_lifecycle_event_constructors_expose_fields() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.evaluate(r#"
+            const animation = new AnimationEvent('animationend', {
+                bubbles: true, animationName: 'fade', elapsedTime: 0.25,
+            });
+            const transition = new TransitionEvent('transitionend', {
+                propertyName: 'opacity', elapsedTime: 0.5, pseudoElement: '::before',
+            });
+            const defaults = new AnimationEvent('animationstart');
+            return [animation instanceof Event, animation.bubbles, animation.animationName,
+                animation.elapsedTime, animation.pseudoElement, transition.propertyName,
+                transition.elapsedTime, transition.pseudoElement, defaults.animationName,
+                defaults.elapsedTime, defaults.pseudoElement];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true, true, "fade", 0.25, "", "opacity", 0.5, "::before", "", 0, ""
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_events_follow_computed_timing() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            .running { animation: fade 30ms 10ms 2; }
+        </style><div id="box"></div>"#);
+        rt.execute_script("events", r#"
+            globalThis.events = [];
+            const box = document.getElementById('box');
+            for (const type of ['animationstart', 'animationiteration', 'animationend']) {
+                document.addEventListener(type, e => events.push([e.type, e.animationName,
+                    e.elapsedTime, e.pseudoElement, e.bubbles, e.target === box, e.isTrusted]));
+            }
+            box.className = 'running';
+        "#).unwrap();
+        rt.run_event_loop_bounded(160).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", "fade", 0, "", true, true, true],
+            ["animationiteration", "fade", 0.03, "", true, true, true],
+            ["animationend", "fade", 0.06, "", true, true, true]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_zero_duration_and_missing_keyframes() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+        </style><div id="box"></div><div id="missing"></div>"#);
+        rt.execute_script("events", r#"
+            globalThis.events = [];
+            for (const type of ['animationstart', 'animationend']) {
+                document.addEventListener(type, e => events.push([e.type, e.animationName, e.elapsedTime]));
+            }
+            document.getElementById('box').style.animation = 'fade 0s';
+            document.getElementById('missing').style.animation = 'unknown 0s';
+        "#).unwrap();
+        rt.run_event_loop_bounded(30).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", "fade", 0], ["animationend", "fade", 0]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_pause_resume_and_cancel_on_hide() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            .running { animation: fade 100ms; animation-play-state: paused; }
+        </style><div id="box"></div>"#);
+        rt.execute_script("events", r#"
+            globalThis.events = [];
+            globalThis.box = document.getElementById('box');
+            for (const type of ['animationstart', 'animationend', 'animationcancel']) {
+                box.addEventListener(type, e => events.push(e.type));
+            }
+            box.className = 'running';
+        "#).unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!(["animationstart"]));
+        rt.execute_script("resume", "box.style.animationPlayState = 'running'").unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        rt.execute_script("hide", "box.style.display = 'none'").unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!(["animationstart", "animationcancel"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_replacement_removal_and_infinite_count() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes first { from { opacity: 0 } to { opacity: 1 } }
+            @keyframes second { from { opacity: 1 } to { opacity: 0 } }
+        </style><div id="box"></div>"#);
+        rt.execute_script("events", r#"
+            globalThis.events = [];
+            globalThis.box = document.getElementById('box');
+            for (const type of ['animationstart', 'animationend', 'animationcancel']) {
+                box.addEventListener(type, e => events.push([e.type, e.animationName]));
+            }
+            box.style.animation = 'first 1s';
+        "#).unwrap();
+        rt.run_event_loop_bounded(15).await.unwrap();
+        rt.execute_script("replace", "box.style.animation = 'second 10ms infinite'").unwrap();
+        rt.run_event_loop_bounded(50).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", "first"], ["animationcancel", "first"], ["animationstart", "second"]
+        ]));
+        rt.execute_script("remove", "box.remove()").unwrap();
+        rt.run_event_loop_bounded(15).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", "first"], ["animationcancel", "first"],
+            ["animationstart", "second"], ["animationcancel", "second"]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_negative_delay_and_dynamic_stylesheet() {
+        let mut rt = setup_runtime("<div id=box></div>");
+        rt.execute_script("events", r#"
+            globalThis.events = [];
+            const box = document.getElementById('box');
+            box.addEventListener('animationstart', e => events.push([e.type, e.elapsedTime]));
+            box.addEventListener('animationend', e => events.push([e.type, e.elapsedTime]));
+            const style = document.createElement('style');
+            style.textContent = '@keyframes fade { from {opacity:0} to {opacity:1} }';
+            document.head.appendChild(style);
+            box.style.animation = 'fade 50ms -20ms';
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([
+            ["animationstart", 0.02], ["animationend", 0.05]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_paused_then_resumed_finishes() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            .running { animation: fade 40ms; animation-play-state: paused; }
+        </style><div id="box"></div>"#);
+        rt.execute_script("events", r#"
+            globalThis.events = [];
+            globalThis.box = document.getElementById('box');
+            box.onanimationend = e => events.push([e.type, e.animationName]);
+            box.className = 'running';
+        "#).unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        rt.execute_script("resume", "box.style.animationPlayState = 'running'").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!([["animationend", "fade"]]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_initial_inline_handler_fires() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            #box { animation: fade 20ms; }
+        </style><div id="box" onanimationend="window.ended = event.animationName"></div>"#);
+        rt.run_event_loop_bounded(60).await.unwrap();
+        assert_eq!(rt.evaluate("window.ended").unwrap(), serde_json::json!("fade"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_listener_without_keyframes_does_not_prepare_layout() {
+        let mut rt = setup_runtime("<style>.box { color: red }</style><div></div>");
+        rt.execute_script("listener", r#"
+            document.addEventListener('animationend', () => {});
+            const box = document.createElement('div');
+            box.className = 'box';
+            document.body.appendChild(box);
+        "#).unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert!(rt.state.borrow().prepared_render.is_none());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_unmatched_rule_skips_layout_until_matching() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            .parent .running { animation: fade 20ms; }
+        </style><div class="parent"><div id="box"></div></div>"#);
+        rt.execute_script("listener", r#"
+            globalThis.events = [];
+            document.addEventListener('animationend', e => events.push(e.animationName));
+        "#).unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        assert!(rt.state.borrow().prepared_render.is_none());
+        rt.execute_script("match", "document.getElementById('box').className = 'running'").unwrap();
+        rt.run_event_loop_bounded(60).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!(["fade"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_timer_does_not_survive_document_replacement() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+        </style><div id="box"></div>"#);
+        rt.execute_script("start", r#"
+            globalThis.oldAnimationEnded = false;
+            const box = document.getElementById('box');
+            box.addEventListener('animationend', () => oldAnimationEnded = true);
+            box.style.animation = 'fade 60ms';
+        "#).unwrap();
+        rt.run_event_loop_bounded(10).await.unwrap();
+        rt.set_dom(parse_html("<html><body>new document</body></html>"));
+        rt.run_page_init();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("oldAnimationEnded").unwrap(), serde_json::json!(false));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn css_animation_late_listener_does_not_replay_start() {
+        let mut rt = setup_runtime(r#"<style>
+            @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+            #box { width: 10px; height: 10px; animation: fade 120ms; }
+        </style><div id="box"></div>"#);
+        rt.execute_script("content-loaded", "document.dispatchEvent(new Event('DOMContentLoaded'))").unwrap();
+        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.execute_script("late-listener", r#"
+            globalThis.events = [];
+            for (const type of ['animationstart', 'animationend']) {
+                document.addEventListener(type, e => events.push(e.type));
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(160).await.unwrap();
+        assert_eq!(rt.evaluate("events").unwrap(), serde_json::json!(["animationend"]));
+    }
+
     /// Framework schedulers commonly subclass EventTarget for their own
     /// lifecycle events. These targets have no backing DOM node, but must
     /// still deliver callbacks (including object, once, and signal listeners).

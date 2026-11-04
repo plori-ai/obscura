@@ -1677,6 +1677,7 @@ struct DeclarationStreamFlags {
     has_var: bool,
     has_color_scheme: bool,
     has_animation: bool,
+    may_name_animation: bool,
     has_transform: bool,
     has_opacity: bool,
 }
@@ -1703,6 +1704,11 @@ fn declaration_stream_flags(css: &str) -> DeclarationStreamFlags {
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("animation-"))
         {
             flags.has_animation = true;
+        }
+        if (name.eq_ignore_ascii_case("animation") || name.eq_ignore_ascii_case("animation-name"))
+            && !value.trim().eq_ignore_ascii_case("none")
+        {
+            flags.may_name_animation = true;
         }
         if name.eq_ignore_ascii_case("transform") || name.eq_ignore_ascii_case("all") {
             flags.has_transform = true;
@@ -2577,6 +2583,81 @@ impl StylesheetCache {
 }
 
 impl Stylesheet {
+    /// Conservative selector preflight before lifecycle tracking forces layout.
+    /// A match only means a declaration could affect animation; the full
+    /// cascade remains responsible for names, media, and display eligibility.
+    pub(crate) fn may_animate_elements(&self, tree: &DomTree) -> bool {
+        let has_candidates = self.rules.iter().any(|rule| {
+            rule.normal_flags.may_name_animation || rule.important_flags.may_name_animation
+        });
+        let inline_may_animate = |node: NodeId| tree.with_node(node, |node| {
+            if !node.is_element() { return false; }
+            node.get_attribute("style").is_some_and(|style| {
+                declaration_stream_flags(style).may_name_animation
+            })
+        }).unwrap_or(false);
+        if !has_candidates {
+            return tree.descendants(tree.document()).into_iter().any(inline_may_animate);
+        }
+        let mut matcher = tree.matcher();
+        let mut stack = vec![(tree.document(), false)];
+        let mut remaining = tree.len();
+        while let Some((node, leaving)) = stack.pop() {
+            if leaving {
+                matcher.pop_ancestor();
+                continue;
+            }
+            // The DOM rejects cycles, but a damaged tree must not trap a
+            // worker inside this native preflight. A valid tree cannot visit
+            // more live nodes than the document owns; fail open at the cap.
+            if remaining == 0 { return true; }
+            remaining -= 1;
+            if inline_may_animate(node) {
+                return true;
+            }
+            if self.candidate_slot_count != 0 {
+                matcher.begin_candidate_collection(self.candidate_slot_count);
+            }
+            let mut consider = |bucket: Option<&Vec<usize>>| {
+                bucket.is_some_and(|indices| indices.iter().any(|&index| {
+                    let rule = &self.rules[index];
+                    (rule.normal_flags.may_name_animation || rule.important_flags.may_name_animation)
+                        && (rule.candidate_slot == NO_CANDIDATE_SLOT
+                            || matcher.mark_candidate(rule.candidate_slot as usize))
+                        && matcher.matches(tree, node, &rule.sel)
+                }))
+            };
+            let mut matched = false;
+            if let Some(element) = tree.borrow_node(node) {
+                if let Some(data) = element.as_element() {
+                    matched |= consider(self.by_local.get(data.local.as_ref()));
+                    if let Some(id) = element.get_attribute("id") {
+                        matched |= consider(self.by_id.get(id));
+                    }
+                    if let Some(classes) = element.get_attribute("class") {
+                        for class in classes.split_whitespace() {
+                            matched |= consider(self.by_class.get(class));
+                        }
+                    }
+                    if !self.by_attribute.is_empty() {
+                        if let Some(attributes) = element.attrs() {
+                            for attribute in attributes {
+                                matched |= consider(self.by_attribute.get(attribute.name.local.as_ref()));
+                            }
+                        }
+                    }
+                }
+            }
+            if is_root_element(tree, node) { matched |= consider(Some(&self.by_root)); }
+            matched |= consider(Some(&self.universal));
+            if matched { return true; }
+            matcher.push_ancestor(tree, node);
+            stack.push((node, true));
+            stack.extend(tree.children(node).into_iter().rev().map(|child| (child, false)));
+        }
+        false
+    }
+
     /// Dependency metadata for conservative incremental-style invalidation.
     /// Building this map does not itself enable incremental cascade skipping.
     pub fn invalidation_map(&self) -> &InvalidationMap {
@@ -4143,7 +4224,7 @@ impl Stylesheet {
                         crate::AnimationInstanceKey {
                             name: name.to_string(),
                         },
-                        animation_style.animation_timing.play_state,
+                        animation_style.animation_timing,
                         animation_sample,
                     );
                     style.animation_local_time_ms = local_sample.milliseconds;

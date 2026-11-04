@@ -1860,8 +1860,8 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
 }
 
 #[op2(fast)]
-fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_mark_started(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1877,8 +1877,8 @@ fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
 /// Atomically claim an executable script.  A false result means the node was
 /// created inert by an HTML-string API or has already been prepared once.
 #[op2(fast)]
-fn op_script_try_start(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -7889,6 +7889,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_css_animation_snapshot());
         ops.push(op_check_visibility());
         ops.push(op_set_hovered());
         ops.push(op_css_supports());
@@ -9212,6 +9213,55 @@ fn op_computed_style(
         object.insert(name, serde_json::Value::String(value));
     }
     serde_json::json!([true, object]).to_string()
+}
+
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_css_animation_snapshot(state: &OpState, frame_id: u32, check_rules: bool) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        css_animation_snapshot(state, frame_id, check_rules)
+    })).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[cfg(feature = "render")]
+fn css_animation_snapshot(state: &OpState, frame_id: u32, check_rules: bool) -> String {
+    let shared = frame_state(state, frame_id);
+    let mut gs = shared.borrow_mut();
+    if check_rules && !gs.dom.as_ref().is_some_and(|dom| {
+        obscura_render::dom::document_may_have_keyframes(dom, gs.viewport, gs.render_media)
+    }) {
+        gs.animation_timeline.clear_css_animations();
+        return "null".to_string();
+    }
+    let viewport = gs.viewport;
+    let media = gs.render_media;
+    let may_start = {
+        let ObscuraState { dom, stylesheet_cache, .. } = &mut *gs;
+        dom.as_ref().is_some_and(|dom| obscura_render::dom::document_may_start_css_animation(
+            dom, viewport, media, stylesheet_cache,
+        ))
+    };
+    if !may_start {
+        gs.animation_timeline.clear_css_animations();
+        return "[]".to_string();
+    }
+    sample_live_document_animations(&mut gs);
+    if ensure_prepared_render(&mut gs).is_none() {
+        return "[]".to_string();
+    }
+    // Style resolution itself may take long enough to cross a timing boundary.
+    // Schedule from the live clock after it completes, not the frozen style
+    // sample from the start of this task.
+    let now = (gs.animation_timeline_origin.elapsed().as_secs_f64() * 1_000.0)
+        .min(f64::from(f32::MAX)) as f32;
+    let instances = gs.animation_timeline.css_animation_instances(now);
+    let values: Vec<_> = instances.into_iter().map(|(id, name, local, timing)| {
+        serde_json::json!([id, name, local, timing.duration_ms, timing.delay_ms,
+            if timing.iteration_count.is_finite() { Some(timing.iteration_count) } else { None },
+            timing.play_state == obscura_render::AnimationPlayState::Paused])
+    }).collect();
+    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
 }
 
 #[cfg(feature = "render")]

@@ -885,6 +885,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dynamically_inserted_frame_script_uses_frame_document() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/", "<html><head></head><body></body></html>",
+        ).expect("frame realm");
+        frame.execute_script(&mut parent, r#"
+            const script = document.createElement('script');
+            script.textContent = 'window.dynamicScriptRuns = (window.dynamicScriptRuns || 0) + 1';
+            document.head.appendChild(script);
+            document.body.appendChild(script);
+        "#).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "window.dynamicScriptRuns").unwrap().as_i64(), Some(1));
+    }
+
     /// The capability the frame realm exists for: scripts that arrived with the
     /// frame's document run, in order, against the frame's own DOM.
     #[test]

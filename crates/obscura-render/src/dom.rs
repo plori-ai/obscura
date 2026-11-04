@@ -4779,6 +4779,47 @@ pub fn accessibility_styles_without_layout(
     Some(result)
 }
 
+/// Cheap negative check used before scheduling CSS animation lifecycle work.
+/// False positives are harmless: the ordinary cascade checks keyframe names.
+pub fn document_may_have_keyframes(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+) -> bool {
+    fn contains_rule(source: &str) -> bool {
+        let source = source.to_ascii_lowercase();
+        source.contains("@keyframes") || source.contains("@-webkit-keyframes")
+    }
+    document_stylesheet_sources(tree, viewport, media_type).iter().any(|s| contains_rule(s))
+        || collect_shadow_stylesheet_sources(tree, viewport, media_type)
+            .values().flatten().any(|s| contains_rule(s))
+}
+
+/// Check potentially matching animation declarations without building layout.
+pub fn document_may_start_css_animation(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+    cache: &mut crate::css::StylesheetCache,
+) -> bool {
+    // Shadow sheets have separate scopes and selectors. Only defer to the
+    // complete cascade when their sources or inline styles could animate.
+    for (root, sources) in collect_shadow_stylesheet_sources(tree, viewport, media_type) {
+        if sources.iter().any(|source| source.to_ascii_lowercase().contains("animation"))
+            || tree.descendants(root).into_iter().any(|node| {
+                tree.with_node(node, |node| node.get_attribute("style").is_some_and(|style| {
+                    style.to_ascii_lowercase().contains("animation")
+                })).unwrap_or(false)
+            })
+        {
+            return true;
+        }
+    }
+    let sources = document_stylesheet_sources(tree, viewport, media_type);
+    let (sheet, _) = cache.get_or_parse(tree, &sources, viewport, media_type);
+    sheet.may_animate_elements(tree)
+}
+
 fn document_stylesheet_sources(
     tree: &DomTree,
     viewport: (f32, f32),
