@@ -84,10 +84,14 @@ pub fn select_profile() -> &'static BrowserProfile {
             return &PROFILES[idx];
         }
     }
-    if env_enabled("OBSCURA_ROTATE_PROFILE") {
+    if rotate_profile_enabled() {
         return random_profile();
     }
     &PROFILES[0]
+}
+
+pub(crate) fn rotate_profile_enabled() -> bool {
+    env_enabled("OBSCURA_ROTATE_PROFILE")
 }
 
 fn env_enabled(key: &str) -> bool {
