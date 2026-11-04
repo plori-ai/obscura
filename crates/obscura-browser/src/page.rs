@@ -2106,6 +2106,7 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_handle_auth_requests(self.handle_auth_requests);
         rt.set_intercept_url_patterns(self.intercept_block_patterns.clone());
         rt.set_cdp_request_patterns(self.cdp_request_patterns.clone());
         #[cfg(feature = "render")]
@@ -5364,6 +5365,11 @@ impl Page {
     pub fn set_network_reporting_enabled(&mut self, enabled: bool) {
         self.network_reporting_enabled = enabled;
         if let Some(js) = &self.js { js.set_network_reporting_enabled(enabled); }
+    }
+
+    pub fn set_handle_auth_requests(&mut self, enabled: bool) {
+        self.handle_auth_requests = enabled;
+        if let Some(js) = &self.js { js.set_handle_auth_requests(enabled); }
     }
 
     pub fn set_cdp_extra_headers(&mut self, headers: std::collections::HashMap<String, String>) {

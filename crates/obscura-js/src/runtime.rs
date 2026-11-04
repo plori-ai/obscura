@@ -1555,6 +1555,10 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cdp_request_patterns = patterns;
     }
 
+    pub fn set_handle_auth_requests(&self, enabled: bool) {
+        self.state.borrow_mut().handle_auth_requests = enabled;
+    }
+
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
     /// loads honour them like the page's own subresource fetches do.
     #[cfg(feature = "render")]
@@ -23636,6 +23640,58 @@ mod tests {
         let user_agent = events.last().unwrap().request_headers.get("user-agent").unwrap().to_ascii_lowercase();
         assert!(wire.contains(&format!("user-agent: {user_agent}")));
     }
+
+    async fn assert_fetch_basic_auth_challenge(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_page_id("auth-fetch");
+        rt.set_handle_auth_requests(true);
+        let load = rt.call_function_on_for_cdp("async () => (await fetch('/auth')).text()", None, &[], true, true);
+        let serve = async {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let wire = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                if attempt == 0 {
+                    assert!(!wire.contains("authorization:"));
+                    socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"fetch\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(wire.contains("authorization: basic dxnlcjpwyxnz"));
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                }
+            }
+        };
+        let answer = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.resource_type, "Fetch");
+            assert_eq!(request.auth_challenge.unwrap().realm, "fetch");
+            request.resolver.send(crate::ops::InterceptResolution::Continue { url: None, method: None,
+                headers: Some([("Authorization".into(), "Basic dXNlcjpwYXNz".into())].into()), body: None }).unwrap();
+        };
+        let (result, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(load, serve, answer)
+        }).await.expect("fetch authentication completes");
+        assert_eq!(result.unwrap().value.unwrap(), "ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_basic_auth_challenge_retries() { assert_fetch_basic_auth_challenge(false).await; }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_basic_auth_challenge_retries() { assert_fetch_basic_auth_challenge(true).await; }
 
     #[tokio::test(flavor = "current_thread")]
     async fn subscribed_fetch_network_event_retains_explicit_request_headers() {

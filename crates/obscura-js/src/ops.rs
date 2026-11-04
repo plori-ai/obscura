@@ -82,6 +82,31 @@ pub struct AuthenticationChallenge {
     pub realm: String,
 }
 
+#[derive(Clone)]
+struct BasicAuthHandler {
+    tx: tokio::sync::mpsc::UnboundedSender<InterceptedRequest>,
+    page_id: String,
+    request_id: String,
+    resource_type: String,
+}
+
+impl BasicAuthHandler {
+    async fn credentials(&self, url: &str, method: &str, headers: &HashMap<String, String>, challenge: &str) -> Option<String> {
+        let (scheme, parameters) = challenge.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("basic") { return None; }
+        let realm = parameters.split(',').filter_map(|part| part.trim().split_once('='))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("realm"))
+            .map(|(_, value)| value.trim().trim_matches('"').to_string()).unwrap_or_default();
+        let origin = url::Url::parse(url).ok()?.origin().ascii_serialization();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        self.tx.send(InterceptedRequest { request_id: self.request_id.clone(), page_id: self.page_id.clone(),
+            url: url.to_string(), method: method.to_string(), headers: headers.clone(), resource_type: self.resource_type.clone(),
+            auth_challenge: Some(AuthenticationChallenge { source: "Server".into(), origin, scheme: "basic".into(), realm }), resolver }).ok()?;
+        let InterceptResolution::Continue { headers: Some(headers), .. } = resolution.await.ok()? else { return None; };
+        headers.into_iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, value)| value)
+    }
+}
+
 pub fn next_subresource_interception_id() -> String {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     format!("subresource-{}", NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -415,6 +440,7 @@ pub struct ObscuraState {
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_enabled: bool,
+    pub handle_auth_requests: bool,
     pub network_reporting_enabled: bool,
     pub extra_http_headers: HashMap<String, String>,
     /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
@@ -696,6 +722,7 @@ impl ObscuraState {
             intercept_tx: None,
             blob_urls: HashMap::new(),
             intercept_enabled: false,
+            handle_auth_requests: false,
             network_reporting_enabled: false,
             extra_http_headers: HashMap::new(),
             intercept_url_patterns: Vec::new(),
@@ -4001,7 +4028,7 @@ async fn fetch_url_inner(
     );
 
     let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client,
-        network_reporting_enabled, extra_http_headers, reported_stealth_ua) = {
+        network_reporting_enabled, extra_http_headers, reported_stealth_ua, auth_handler) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -4040,6 +4067,10 @@ async fn fetch_url_inner(
         // The CDP resolver map spans pages and navigations on a connection.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let auth_handler = if gs.handle_auth_requests {
+            gs.intercept_tx.clone().map(|tx| BasicAuthHandler { tx, page_id: gs.intercept_page_id.clone(),
+                request_id: request_id.clone(), resource_type: resource_type_name.to_string() })
+        } else { None };
         let fetch_type = if resource_type_name == "Fetch" { "XHR" } else { resource_type_name };
         let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url)
             && matches_cdp_request_patterns(gs.cdp_request_patterns.as_deref().map(Vec::as_slice), &url, fetch_type) {
@@ -4066,6 +4097,7 @@ async fn fetch_url_inner(
             gs.network_reporting_enabled,
             if gs.extra_http_headers.is_empty() { None } else { Some(gs.extra_http_headers.clone()) },
             reported_stealth_ua,
+            auth_handler,
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -4408,6 +4440,7 @@ async fn fetch_url_inner(
                 network_guard,
                 resource_type,
                 replace_extra_headers,
+                auth_handler,
             )
             .await;
         }
@@ -4435,6 +4468,7 @@ async fn fetch_url_inner(
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
+    let mut attempted_auth = false;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
     let response = loop {
         let mut req = client
@@ -4510,6 +4544,17 @@ async fn fetch_url_inner(
             }
         }
 
+        if resp.status().as_u16() == 401 && credentials_allowed && !attempted_auth {
+            if let (Some(handler), Some(challenge)) = (&auth_handler,
+                resp.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok())) {
+                attempted_auth = true;
+                if let Some(authorization) = handler.credentials(&current_url, current_method.as_str(), &current_headers, challenge).await {
+                    current_headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                    current_headers.insert("Authorization".into(), authorization);
+                    continue;
+                }
+            }
+        }
         if !resp.status().is_redirection() {
             break resp;
         }
@@ -4602,6 +4647,7 @@ async fn fetch_url_inner(
 
         redirected_from.push(base);
         current_url = next_url.to_string();
+        attempted_auth = false;
     };
 
     let redirected = redirects_followed > 0;
@@ -4739,6 +4785,7 @@ async fn stealth_fetch_all(
     network_guard: FetchNetworkGuard,
     resource_type: ResourceType,
     replace_extra_headers: bool,
+    auth_handler: Option<BasicAuthHandler>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -4751,6 +4798,7 @@ async fn stealth_fetch_all(
     let mut crossed_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
+    let mut attempted_auth = false;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
 
     let response = loop {
@@ -4799,6 +4847,16 @@ async fn stealth_fetch_all(
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
+        if r.status == 401 && credentials_allowed && !attempted_auth {
+            if let (Some(handler), Some(challenge)) = (&auth_handler, r.headers.get("www-authenticate")) {
+                attempted_auth = true;
+                if let Some(authorization) = handler.credentials(&current_url, &current_method, &current_headers, challenge).await {
+                    current_headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                    current_headers.insert("Authorization".into(), authorization);
+                    continue;
+                }
+            }
+        }
         if !(300..400).contains(&r.status) {
             break r;
         }
@@ -4864,6 +4922,7 @@ async fn stealth_fetch_all(
         sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
+        attempted_auth = false;
     };
 
     let status = response.status;
