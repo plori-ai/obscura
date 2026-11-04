@@ -1757,14 +1757,52 @@ const _CSS_PROPERTY_NAMES = [
   "whiteSpace","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","zIndex","zoom",
 ];
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
+const _stylePropertyKey = (s) => {
+  if (s.startsWith("--")) return s;
+  const lower = s.toLowerCase();
+  return s.includes("-") || _CSS_PROP_SET.has(lower) ? lower : _cssCamelToKebab(s);
+};
 
 // Parse a `style` attribute string (`"color: red; margin: 5px"`) into the given
 // dashed-key store, replacing its contents in place.
-function _parseCssInto(props, text) {
+function _cssPriority(value) {
+  const match = /!(?:\s|\/\*[\s\S]*?\*\/)*important(?:\s|\/\*[\s\S]*?\*\/)*$/i.exec(value);
+  if (!match) return [value, false];
+  let quote = "", escaped = false, comment = false, depth = 0;
+  for (let i = 0; i < match.index; i++) {
+    const ch = value[i], next = value[i + 1];
+    if (comment) { if (ch === "*" && next === "/") { comment = false; i++; } continue; }
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (quote) { if (ch === quote) quote = ""; continue; }
+    if (ch === "/" && next === "*") { comment = true; i++; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    if (ch === ")" || ch === "]" || ch === "}") depth = Math.max(0, depth - 1);
+  }
+  if (quote || comment || depth || escaped) return [value, false];
+  return [value.slice(0, match.index).trimEnd(), true];
+}
+function _parseCssInto(props, text, priorities) {
   for (const k in props) delete props[k];
+  for (const k in priorities) delete priorities[k];
   if (text) _splitCssDeclarations(text).forEach((p) => {
     const i = p.indexOf(":");
-    if (i > 0) { const k = p.slice(0, i).trim(); const v = p.slice(i + 1).trim(); if (k && v) props[_cssCamelToKebab(k)] = v; }
+    if (i > 0) {
+      const name = p.slice(0, i).trim();
+      let value = p.slice(i + 1).trim(), important = false;
+      if (value.includes("!")) [value, important] = _cssPriority(value);
+      if (!name || !value) return;
+      const k = _stylePropertyKey(name);
+      const keep = priorities[k] && !important;
+      const previous = props[k];
+      delete props[k];
+      props[k] = keep ? previous : value;
+      if (!keep) {
+        if (important) priorities[k] = true;
+        else delete priorities[k];
+      }
+    }
   });
 }
 // Declaration values routinely contain semicolons in quoted `content`, data
@@ -1805,9 +1843,9 @@ function _splitCssDeclarations(value) {
   push(text.length);
   return declarations;
 }
-function _serializeCss(props) {
+function _serializeCss(props, priorities) {
   const e = Object.entries(props);
-  return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
+  return e.length ? e.map(([k, v]) => `${k}: ${v}${priorities[k] ? " !important" : ""}`).join("; ") + ";" : "";
 }
 
 const _styleDefineProperty = Object.defineProperty;
@@ -1817,6 +1855,7 @@ class CSSStyleDeclaration {
   constructor(owner, onChange) {
     // Non-enumerable so they never leak through the proxy's own-key traps.
     _styleDefineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_priorities", { value: {}, writable: true, enumerable: false, configurable: true });
     // The owner Element, if any. A live declaration reflects that element's
     // `style` content attribute in both directions; an owner-less declaration
     // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
@@ -1832,11 +1871,11 @@ class CSSStyleDeclaration {
   // repeated style reads do not cross the JS/Rust op boundary.
   _pull() {
     if (this._loaded) return;
-    _parseCssInto(this._props, this._owner.getAttribute("style"));
+    _parseCssInto(this._props, this._owner.getAttribute("style"), this._priorities);
     this._loaded = true;
   }
   _replaceFromAttribute(text) {
-    _parseCssInto(this._props, text);
+    _parseCssInto(this._props, text, this._priorities);
     this._loaded = true;
   }
   // Serialize `_props` back onto the owner's `style` attribute after a mutation,
@@ -1845,7 +1884,7 @@ class CSSStyleDeclaration {
   _push() {
     const o = this._owner;
     if (o) {
-      const text = _serializeCss(this._props);
+      const text = _serializeCss(this._props, this._priorities);
       if (text) o.setAttribute("style", text);
       else o.removeAttribute("style");
     } else if (this._onChange) {
@@ -1859,34 +1898,42 @@ class CSSStyleDeclaration {
   // changed. Rewriting it on a no-op set queued a mutation record, so a
   // MutationObserver that re-applies the same style re-triggered itself
   // forever (a page pinning body `top: 0` spun at 100% CPU).
-  setProperty(name, value) {
+  setProperty(name, value, priority = "") {
     this._pull();
-    const k = _cssCamelToKebab(String(name));
+    const k = _stylePropertyKey(String(name));
     const old = this._props[k];
     if (value === "" || value == null) {
       if (old === undefined) return;
       delete this._props[k];
+      delete this._priorities[k];
     } else {
       value = String(value);
-      if (old === value) return;
+      priority = priority == null ? "" : String(priority).toLowerCase();
+      if (priority !== "" && priority !== "important") return;
+      if (value.includes("!") && _cssPriority(value)[1]) return;
+      const important = priority === "important";
+      if (old === value && !!this._priorities[k] === important) return;
       this._props[k] = value;
+      if (important) this._priorities[k] = true;
+      else delete this._priorities[k];
     }
     this._push();
   }
   removeProperty(name) {
     this._pull();
-    const k = _cssCamelToKebab(String(name));
+    const k = _stylePropertyKey(String(name));
     const old = this._props[k];
     if (old === undefined) return "";
     delete this._props[k];
+    delete this._priorities[k];
     this._push();
     return old;
   }
-  getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
-  getPropertyPriority() { return ""; }
-  get cssText() { this._pull(); return _serializeCss(this._props); }
+  getPropertyValue(name) { this._pull(); return this._props[_stylePropertyKey(String(name))] || ""; }
+  getPropertyPriority(name) { this._pull(); return this._priorities[_stylePropertyKey(String(name))] ? "important" : ""; }
+  get cssText() { this._pull(); return _serializeCss(this._props, this._priorities); }
   set cssText(v) {
-    _parseCssInto(this._props, v);
+    _parseCssInto(this._props, v, this._priorities);
     this._push();
   }
   get length() { this._pull(); return Object.keys(this._props).length; }
@@ -1912,7 +1959,7 @@ const _styleProxyHandler = {
     if (typeof p !== "string") return Reflect.has(t, p);
     if (p in Object.getPrototypeOf(t)) return true;
     t._pull();
-    if (_cssCamelToKebab(p) in t._props) return true;
+    if (_stylePropertyKey(p) in t._props) return true;
     if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
     return /^\d+$/.test(p) && +p < t.length;
   },
@@ -1922,7 +1969,7 @@ const _styleProxyHandler = {
     const n = t.length;
     for (let i = 0; i < n; i++) keys.push(String(i));
     const names = new Set(_CSS_PROPERTY_NAMES);
-    for (const k of Object.keys(t._props)) names.add(_cssKebabToCamel(k));
+    for (const k of Object.keys(t._props)) names.add(k.startsWith("--") ? k : _cssKebabToCamel(k));
     for (const name of names) keys.push(name);
     return keys;
   },
@@ -1930,7 +1977,7 @@ const _styleProxyHandler = {
     if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
     t._pull();
     if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
-    if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
+    if (_stylePropertyKey(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
       return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
     }
     return undefined;
@@ -10375,7 +10422,7 @@ class CSSStyleRule extends CSSRule {
     super("", CSSRule.STYLE_RULE);
     this._selectorText = String(selectorText || "").trim();
     const declaration = new CSSStyleDeclaration(null, () => this._changed());
-    _parseCssInto(declaration._props, declarations);
+    _parseCssInto(declaration._props, declarations, declaration._priorities);
     declaration._loaded = true;
     this._style = _styleProxy(declaration);
   }
@@ -14775,7 +14822,19 @@ class SVGTextPositioningElement extends SVGTextContentElement {}
 class SVGGradientElement extends SVGElement {}
 class SVGAnimationElement extends SVGElement {}
 class SVGComponentTransferFunctionElement extends SVGElement {}
-class SVGPathElement extends SVGGeometryElement {}
+class SVGPathElement extends SVGGeometryElement {
+  getTotalLength() {
+    return __obscuraCore.ops.op_svg_path_metrics(this.getAttribute('d') || '', 0)[0] || 0;
+  }
+  getPointAtLength(distance) {
+    if (arguments.length === 0) throw new TypeError("getPointAtLength requires a distance");
+    const value = Math.fround(Number(distance));
+    if (!Number.isFinite(value)) throw new TypeError("The distance must be finite");
+    const result = __obscuraCore.ops.op_svg_path_metrics(this.getAttribute('d') || '', value);
+    if (!result.length) throw new DOMException("The element's path is empty.", "InvalidStateError");
+    return new DOMPoint(result[1], result[2]);
+  }
+}
 class SVGRectElement extends SVGGeometryElement {}
 class SVGCircleElement extends SVGGeometryElement {}
 class SVGEllipseElement extends SVGGeometryElement {}
@@ -17508,8 +17567,15 @@ URL.createObjectURL = function(blob) {
       let text = '';
       try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
       globalThis.__blobStore[id] = text;
+      __obscuraCore.ops.op_blob_url_register(id, String(blob.type || ''), blob._bytes);
     } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+      globalThis.__blobStore[id] = '';
+      blob.text().then(text => {
+        if (Object.prototype.hasOwnProperty.call(globalThis.__blobStore, id)) {
+          globalThis.__blobStore[id] = text;
+          __obscuraCore.ops.op_blob_url_register(id, String(blob.type || ''), new TextEncoder().encode(text));
+        }
+      });
     } else {
       globalThis.__blobStore[id] = '';
     }
@@ -17517,6 +17583,7 @@ URL.createObjectURL = function(blob) {
   }
 };
 URL.revokeObjectURL = function(url) {
+  __obscuraCore.ops.op_blob_url_revoke(String(url));
   delete globalThis.__blobStore[url];
 };
 

@@ -2443,6 +2443,19 @@ mod tests {
     use clap::Parser;
     use obscura_dom::parse_html;
 
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn stealth_build_forwards_cdp_extra_headers_to_stealth_transport() {
+        let mut ctx = obscura_cdp::dispatch::CdpContext::new_with_options(None, true);
+        let page_id = ctx.create_page();
+        let session = Some("cli-stealth-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        obscura_cdp::domains::network::handle("setExtraHTTPHeaders",
+            &serde_json::json!({"headers": {"x-fixture": "requested"}}), &mut ctx, &session).await.unwrap();
+        let page = ctx.get_page(&page_id).unwrap();
+        assert_eq!(page.stealth_client.as_ref().unwrap().extra_headers.read().await.get("x-fixture").unwrap(), "requested");
+    }
+
     // Issue #117 — `--dump original` short-circuits the browser stack and
     // streams the raw response body verbatim, including for binary payloads.
     //

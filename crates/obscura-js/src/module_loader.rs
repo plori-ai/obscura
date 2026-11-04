@@ -154,6 +154,39 @@ fn io_err(msg: String) -> ModuleLoaderError {
     JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
+fn javascript_mime(mime: &data_url::mime::Mime) -> bool {
+    matches!((mime.type_.as_str(), mime.subtype.as_str()),
+        ("application", "ecmascript" | "javascript" | "x-ecmascript" | "x-javascript") |
+        ("text", "ecmascript" | "javascript" | "javascript1.0" | "javascript1.1" |
+            "javascript1.2" | "javascript1.3" | "javascript1.4" | "javascript1.5" |
+            "jscript" | "livescript" | "x-ecmascript" | "x-javascript"))
+}
+
+fn local_module_source(url: &str, state: Option<&Weak<RefCell<ObscuraState>>>) -> Result<Vec<u8>, String> {
+    const MAX_MODULE_BYTES: usize = 32 * 1024 * 1024;
+    if url.starts_with("data:") {
+        let data = data_url::DataUrl::process(url).map_err(|e| format!("Invalid data module URL: {e:?}"))?;
+        if !javascript_mime(data.mime_type()) { return Err("Module URL does not have a JavaScript MIME type".into()); }
+        let mut bytes = Vec::new();
+        data.decode(|chunk| {
+            if bytes.len().saturating_add(chunk.len()) > MAX_MODULE_BYTES { return Err(()); }
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        }).map_err(|_| "Invalid or oversized data module".to_string())?;
+        Ok(bytes)
+    } else {
+        let mut key = ModuleSpecifier::parse(url).map_err(|e| e.to_string())?;
+        key.set_fragment(None);
+        let state = state.and_then(Weak::upgrade).ok_or("Blob URL has no owning page")?;
+        let state = state.try_borrow().map_err(|_| "Blob URL store is busy")?;
+        let (mime, bytes) = state.blob_urls.get(key.as_str()).ok_or("Blob URL not found or revoked")?;
+        let mime = mime.parse::<data_url::mime::Mime>().map_err(|_| "Invalid blob MIME type")?;
+        if !javascript_mime(&mime) { return Err("Blob URL does not have a JavaScript MIME type".into()); }
+        if bytes.len() > MAX_MODULE_BYTES { return Err("Blob module is too large".into()); }
+        Ok(bytes.clone())
+    }
+}
+
 impl ModuleLoader for ObscuraModuleLoader {
     fn resolve(
         &self,
@@ -173,6 +206,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         let base = if referrer.is_empty()
             || referrer.starts_with('<')
             || referrer == "about:blank"
+            || referrer == "undefined"
         {
             &self.base_url
         } else {
@@ -216,6 +250,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // Keeping the guard inside the future makes cancellation/navigation
         // decrement the count through Drop as well as success and failure.
         let is_dyn_import = options.is_dynamic_import;
+        let javascript_requested = matches!(options.requested_module_type, deno_core::RequestedModuleType::None);
         let activity_guard = is_dyn_import.then(|| activity.begin());
         let page_state = self.page_state.clone();
         let page_network = match self.page_state.as_ref() {
@@ -240,7 +275,10 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let stealth = state.stealth_client.clone();
                 #[cfg(not(feature = "stealth"))]
                 let stealth: Option<std::sync::Arc<()>> = None;
-                Ok((client, stealth, state.callbacks.clone()))
+                let interception = if state.intercept_enabled {
+                    state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone()))
+                } else { None };
+                Ok((client, stealth, state.callbacks.clone(), interception))
             })(),
             None => self
                 .standalone_client
@@ -250,7 +288,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None)
+                    (client, stealth, None, None)
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
@@ -266,8 +304,19 @@ impl ModuleLoader for ObscuraModuleLoader {
                 proxy_url.as_deref().unwrap_or("direct")
             );
 
+            if url.starts_with("data:") || url.starts_with("blob:") {
+                if !javascript_requested { return Err(io_err("Unsupported local module type".into())); }
+                let requested = ModuleSpecifier::parse(&url).map_err(|e| io_err(e.to_string()))?;
+                let body = local_module_source(&url, page_state.as_ref()).map_err(io_err)?;
+                let code = String::from_utf8_lossy(&body).into_owned();
+                return Ok(ModuleSource::new_with_redirect(
+                    deno_core::ModuleType::JavaScript, ModuleSourceCode::String(code.into()),
+                    &requested, &requested, None,
+                ));
+            }
+
             match page_network {
-                Ok((client, stealth, callbacks)) => {
+                Ok((client, stealth, callbacks, interception)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
@@ -282,6 +331,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                         event: Some(JsNetworkEvent {
                             request_id: request_id.clone(), intercepted: false,
                             url: url.clone(), method: "GET".to_string(),
+                            request_headers: Default::default(),
                             resource_type: "Script".to_string(), status: 0,
                             response_headers: Default::default(), body_size: 0,
                             timestamp: 0.0, error_text: None,
@@ -289,8 +339,53 @@ impl ModuleLoader for ObscuraModuleLoader {
                     });
                     let request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    let mut target = requested.clone();
+                    let mut intercepted = false;
+                    let mut synthetic = None;
+                    let mut changed_method = None;
+                    let mut changed_headers = None;
+                    let mut changed_body = None;
+                    if let Some((tx, page_id, patterns)) = interception {
+                        if crate::ops::should_intercept_url(true, &patterns, &url) {
+                            crate::ops::validate_fetch_url(&requested, client.allow_private_network).map_err(io_err)?;
+                            let (resolver, resolution) = tokio::sync::oneshot::channel();
+                            if tx.send(crate::ops::InterceptedRequest { request_id: request_id.clone(), page_id,
+                                url: url.clone(), method: "GET".into(), headers: Default::default(),
+                                resource_type: "Script".into(), resolver }).is_ok() {
+                                intercepted = true;
+                                if let Some(event) = network_guard.as_mut().and_then(|guard| guard.event.as_mut()) {
+                                    event.intercepted = true;
+                                }
+                                match resolution.await.map_err(|_| io_err("module interception cancelled".into()))? {
+                                    crate::ops::InterceptResolution::Continue { url, method, headers, body } => {
+                                        if let Some(url) = url {
+                                            target = ModuleSpecifier::parse(&url).map_err(|e| io_err(e.to_string()))?;
+                                            crate::ops::validate_fetch_url(&target, client.allow_private_network).map_err(io_err)?;
+                                        }
+                                        changed_method = method; changed_headers = headers; changed_body = body;
+                                    }
+                                    crate::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
+                                        obscura_net::client::validate_intercepted_response(&request, &target, &headers)
+                                            .map_err(|e| io_err(e.to_string()))?;
+                                        let headers = obscura_net::client::normalize_intercepted_headers(headers);
+                                        let body = if body_base64.is_empty() { body.into_bytes() } else {
+                                            BASE64.decode(body_base64).map_err(|e| io_err(e.to_string()))?
+                                        };
+                                        if body.len() > request.max_response_bytes { return Err(io_err("fulfilled module too large".into())); }
+                                        synthetic = Some(obscura_net::Response { url: target.clone(), status, headers, body, redirected_from: Vec::new() });
+                                    }
+                                    crate::ops::InterceptResolution::Fail { reason } => {
+                                        if let Some(guard) = &mut network_guard { guard.event = None; }
+                                        return Err(io_err(reason));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     #[cfg(feature = "stealth")]
-                    let resp = match stealth {
+                    let resp = if let Some(response) = synthetic { response } else { match stealth {
+                        Some(stealth) if intercepted => stealth.fetch_resource_request(&target, request,
+                            changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await,
                         Some(stealth) => stealth
                             .fetch_resource_with_callbacks(
                                 &requested,
@@ -298,6 +393,8 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 callbacks.as_deref(),
                             )
                             .await,
+                        None if intercepted => client.fetch_resource_request(&target, request,
+                            changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await,
                         None => {
                             client
                                 .fetch_resource_with_callbacks(
@@ -308,17 +405,19 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 .await
                         }
                     }
-                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))? };
                     #[cfg(not(feature = "stealth"))]
-                    let resp = {
+                    let resp = if let Some(response) = synthetic { response } else {
                         let _ = &stealth;
-                        client
+                        if intercepted { client.fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"),
+                            changed_body, changed_headers, callbacks.as_deref()).await }
+                        else { client
                             .fetch_resource_with_callbacks(
                                 &requested,
                                 request,
                                 callbacks.as_deref(),
                             )
-                            .await
+                            .await }
                             .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
                     };
                     // A response (including the blocked-tracker sentinel) is
@@ -333,8 +432,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 io_err("Module loader page state is already borrowed".to_string())
                             })?;
                             record_network_completion(&mut state, JsNetworkEvent {
-                                request_id, intercepted: false,
+                                request_id, intercepted,
                                 url: resp.url.to_string(), method: "GET".to_string(),
+                                request_headers: Default::default(),
                                 resource_type: "Script".to_string(), status: resp.status,
                                 response_headers: resp.headers.clone(), body_size: resp.body.len(),
                                 timestamp: std::time::SystemTime::now()
@@ -377,5 +477,20 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Err(error) => Err(io_err(error)),
             }
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_modules_decode_and_require_javascript_mime() {
+        assert_eq!(local_module_source("data:text/javascript,export%20default%2042", None).unwrap(), b"export default 42");
+        assert_eq!(local_module_source("data:application/javascript;base64,ZXhwb3J0IGRlZmF1bHQgNDM=", None).unwrap(), b"export default 43");
+        assert!(local_module_source("data:text/javascript1.5,export%20default%2044", None).is_ok());
+        assert!(local_module_source("data:text/plain,export%20default%2045", None).is_err());
+        assert!(local_module_source("data:,export%20default%2046", None).is_err());
+        assert!(local_module_source("data:text/javascript;base64,%%%", None).is_err());
     }
 }

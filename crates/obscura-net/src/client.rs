@@ -122,12 +122,11 @@ impl Response {
 /// a header name (`Link`, `Via`, `WWW-Authenticate`, ...), silently dropping the
 /// earlier lines. Per RFC 9110 §5.3 duplicate field lines of the same name may
 /// be combined into one comma-separated value without changing semantics.
-/// `Set-Cookie` is the exception (RFC 6265 forbids folding it): it is captured
-/// individually by the cookie jar via `get_all`, so the map keeps it only as a
-/// presence signal and last-wins there is fine.
-pub(crate) fn merge_response_header(map: &mut HashMap<String, String>, name: String, value: String) {
+/// `Set-Cookie` is the exception (RFC 6265 forbids comma folding it): retain
+/// its individual field values separated by newlines, as CDP represents them.
+pub fn merge_response_header(map: &mut HashMap<String, String>, name: String, value: String) {
     if name == "set-cookie" {
-        map.insert(name, value);
+        map.entry(name).and_modify(|existing| { existing.push('\n'); existing.push_str(&value); }).or_insert(value);
         return;
     }
     map.entry(name)
@@ -426,6 +425,40 @@ pub(crate) fn validate_cors_response(
         )));
     }
     Ok(())
+}
+
+/// Apply the same request-mode and CORS checks to a synthetic response as to
+/// one received from the network.
+pub fn validate_intercepted_response(
+    request: &ResourceRequest, target: &Url, headers: &HashMap<String, String>,
+) -> Result<(), ObscuraNetError> {
+    validate_request_mode(request, target)?;
+    let header = |name: &str| headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str());
+    validate_cors_response(request, target, &serialized_request_origin(request, false),
+        header("access-control-allow-origin"), header("access-control-allow-credentials"))
+}
+
+pub fn normalize_intercepted_headers(headers: HashMap<String, String>) -> HashMap<String, String> {
+    headers.into_iter().map(|(name, value)| (name.to_ascii_lowercase(), value)).collect()
+}
+
+#[cfg(test)]
+mod intercepted_response_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_cors_responses_obey_credentials_and_header_case() {
+        let document = Url::parse("https://page.test/").unwrap();
+        let target = Url::parse("https://cdn.test/font.woff").unwrap();
+        let mut request = ResourceRequest::subresource(ResourceType::Font, &document);
+        let headers = [("Access-Control-Allow-Origin".into(), "*".into())].into_iter().collect();
+        assert!(validate_intercepted_response(&request, &target, &headers).is_ok());
+        request.credentials = RequestCredentials::Include;
+        assert!(validate_intercepted_response(&request, &target, &headers).is_err());
+        let normalized = normalize_intercepted_headers(headers);
+        assert_eq!(normalized.get("access-control-allow-origin").unwrap(), "*");
+    }
 }
 
 pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
@@ -1412,6 +1445,16 @@ impl ObscuraHttpClient {
         self.fetch_request_uncached(method, url, body, callbacks, ResourceRequest::navigation(), headers).await
     }
 
+    /// Continue a subresource with request-local interception overrides.
+    pub async fn fetch_resource_request(
+        &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+    }
+
     async fn fetch_request_uncached(
         &self, initial_method: Method, url: &Url, initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
@@ -1876,8 +1919,7 @@ mod ssrf_tests {
         );
     }
 
-    // Set-Cookie must not be comma-folded (RFC 6265); the cookie jar captures
-    // each line via get_all, so the map keeps it only as a presence signal.
+    // Set-Cookie must not be comma-folded (RFC 6265).
     #[test]
     fn response_headers_do_not_fold_set_cookie() {
         let mut headers = HashMap::new();
@@ -1885,8 +1927,8 @@ mod ssrf_tests {
         merge_response_header(&mut headers, "set-cookie".into(), "b=2".into());
         assert_eq!(
             headers.get("set-cookie").map(String::as_str),
-            Some("b=2"),
-            "Set-Cookie must stay a single (last) value, never comma-folded"
+            Some("a=1\nb=2"),
+            "Set-Cookie field lines must remain distinguishable"
         );
     }
 

@@ -227,8 +227,17 @@ pub async fn handle(
                 let page_id = ctx.sessions.remove(session_id);
                 ctx.dom_documents.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
+                ctx.network_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
+                    let network_enabled = ctx.network_enabled_sessions.iter().any(|session| ctx.sessions.get(session) == Some(&page_id));
+                    if let Some(page) = ctx.get_page_mut(&page_id) { page.set_network_reporting_enabled(network_enabled); }
+                    if ctx.fetch_intercept.sessions_by_page.get(&page_id).is_some_and(|owner| owner == session_id) {
+                        ctx.fetch_intercept.sessions_by_page.remove(&page_id);
+                        if let Some(page) = ctx.get_page_mut(&page_id) {
+                            page.enable_intercept(false);
+                        }
+                    }
                     ctx.refresh_runtime_event_collection(&page_id);
                     let params = json!({"sessionId": session_id, "targetId": page_id});
                     let event = match parent_session_id {

@@ -1541,6 +1541,14 @@ impl ObscuraJsRuntime {
         state.intercept_enabled = enabled;
     }
 
+    pub fn set_network_reporting_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().network_reporting_enabled = enabled;
+    }
+
+    pub fn set_extra_http_headers(&self, headers: std::collections::HashMap<String, String>) {
+        self.state.borrow_mut().extra_http_headers = headers;
+    }
+
     pub fn set_intercept_page_id(&self, page_id: &str) {
         self.state.borrow_mut().intercept_page_id = page_id.to_string();
     }
@@ -2356,6 +2364,9 @@ impl ObscuraJsRuntime {
         }
         let initiator = initiator.expect("checked above");
         let callbacks = state.callbacks.clone();
+        let interception = if state.intercept_enabled {
+            state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone()))
+        } else { None };
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
@@ -2369,6 +2380,7 @@ impl ObscuraJsRuntime {
                 #[cfg(feature = "stealth")]
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
+                let interception = interception.clone();
                 let initiator = initiator.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
@@ -2384,6 +2396,7 @@ impl ObscuraJsRuntime {
                                 url: raw,
                                 profile,
                                 is_font,
+                                intercepted_request_id: None,
                                 response: None,
                                 };
                         }
@@ -2405,8 +2418,63 @@ impl ObscuraJsRuntime {
                         }
                         _ => {}
                     }
+                    let mut target = parsed.clone();
+                    let mut request_id = None;
+                    let mut changed_method = None;
+                    let mut changed_body = None;
+                    let mut changed_headers = None;
+                    if let Some((intercept_tx, page_id, patterns)) = interception {
+                        if matches!(parsed.scheme(), "http" | "https")
+                            && crate::ops::should_intercept_url(true, &patterns, &raw) {
+                            let allow_private = http_client.as_ref().is_some_and(|client| client.allow_private_network);
+                            if crate::ops::validate_fetch_url(&parsed, allow_private).is_err() {
+                                return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                    intercepted_request_id: None, response: None };
+                            }
+                            let id = crate::ops::next_subresource_interception_id();
+                            let (resolver, resolution) = tokio::sync::oneshot::channel();
+                            if intercept_tx.send(crate::ops::InterceptedRequest {
+                                request_id: id.clone(), page_id, url: raw.clone(), method: "GET".into(),
+                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), resolver,
+                            }).is_ok() {
+                                request_id = Some(id);
+                                match resolution.await {
+                                    Ok(crate::ops::InterceptResolution::Continue { url, method, headers, body }) => {
+                                        if let Some(url) = url {
+                                            let Ok(parsed) = url::Url::parse(&url) else {
+                                                return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                                    intercepted_request_id: request_id, response: None };
+                                            };
+                                            if crate::ops::validate_fetch_url(&parsed, allow_private).is_err() {
+                                                return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                                    intercepted_request_id: request_id, response: None };
+                                            }
+                                            target = parsed;
+                                        }
+                                        changed_method = method; changed_body = body; changed_headers = headers;
+                                    }
+                                    Ok(crate::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }) => {
+                                        use base64::Engine as _;
+                                        let headers = obscura_net::client::normalize_intercepted_headers(headers);
+                                        let bytes = if body_base64.is_empty() { Some(body.into_bytes()) }
+                                            else { base64::engine::general_purpose::STANDARD.decode(body_base64).ok() };
+                                        let response = bytes.filter(|bytes| bytes.len() <= request.max_response_bytes)
+                                            .filter(|_| obscura_net::client::validate_intercepted_response(&request, &target, &headers).is_ok())
+                                            .map(|body| crate::ops::RenderResourceResponse { url: target.to_string(), status, headers,
+                                                body: std::sync::Arc::from(body) });
+                                        return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                            intercepted_request_id: request_id, response };
+                                    }
+                                    _ => return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                        intercepted_request_id: request_id, response: None },
+                                }
+                            }
+                        }
+                    }
                     #[cfg(feature = "stealth")]
                     let response = match (stealth_client, http_client) {
+                        (Some(stealth_client), _) if request_id.is_some() => stealth_client
+                            .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         (Some(stealth_client), _) => stealth_client
                                 .fetch_resource_with_callbacks(
                                     &parsed,
@@ -2415,6 +2483,8 @@ impl ObscuraJsRuntime {
                                 )
                             .await
                             .ok(),
+                        (None, Some(http_client)) if request_id.is_some() => http_client
+                            .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         (None, Some(http_client)) => http_client
                                 .fetch_resource_with_callbacks(
                                     &parsed,
@@ -2427,6 +2497,8 @@ impl ObscuraJsRuntime {
                     };
                     #[cfg(not(feature = "stealth"))]
                     let response = match http_client {
+                        Some(http_client) if request_id.is_some() => http_client
+                            .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         Some(http_client) => http_client
                                 .fetch_resource_with_callbacks(
                                     &parsed,
@@ -2442,6 +2514,7 @@ impl ObscuraJsRuntime {
                         url: raw,
                         profile,
                         is_font,
+                        intercepted_request_id: request_id,
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
                             status: response.status,
@@ -2461,6 +2534,7 @@ impl ObscuraJsRuntime {
                             url: fallback.0,
                             profile: fallback.1,
                             is_font: fallback.2,
+                            intercepted_request_id: None,
                             response: None,
                         })
                     })
@@ -2569,7 +2643,7 @@ impl ObscuraJsRuntime {
                 self.state
                     .borrow_mut()
                     .render_resource_events
-                    .push(crate::ops::RenderResourceEvent { is_font, response });
+                    .push(crate::ops::RenderResourceEvent { is_font, intercepted_request_id: load.intercepted_request_id, response });
             }
         }
         loaded
@@ -5024,6 +5098,7 @@ mod tests {
                 url: url.clone(),
                 profile: None,
                 is_font: false,
+                intercepted_request_id: None,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
                     status: 200,
@@ -18227,6 +18302,72 @@ mod tests {
         assert_eq!(value["attribute"], "color: red;");
     }
 
+    #[test]
+    fn style_declaration_preserves_important_priority_and_reflection() {
+        let mut rt = setup_runtime("<html><body><div id='target'></div></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const style = document.getElementById('target').style;
+            style.setProperty('visibility', 'hidden', 'IMPORTANT');
+            const first = [style.visibility, style.getPropertyPriority('visibility'), style.cssText];
+            style.setProperty('visibility', 'visible', 'invalid');
+            const invalid = [style.visibility, style.getPropertyPriority('visibility')];
+            style.setProperty('visibility', 'visible');
+            const normal = [style.visibility, style.getPropertyPriority('visibility')];
+            style.cssText = 'color: red !important; visibility: visible; color: blue;';
+            const parsed = [style.cssText, style.color, style.getPropertyPriority('color')];
+            const removed = style.removeProperty('color');
+            const after = style.getPropertyPriority('color'), attribute = document.getElementById('target').getAttribute('style');
+            style.cssText = 'visibility: hidden !/**/important /*c*/';
+            const commented = [style.cssText, style.getPropertyPriority('visibility')];
+            style.setProperty('--Foo', 'bar', 'important');
+            const custom = [style.getPropertyValue('--Foo'), style.getPropertyPriority('--Foo'), style.getPropertyPriority('--foo')];
+            style.setProperty('VISIBILITY', 'visible', 'important');
+            const uppercase = [style.getPropertyValue('visibility'), style.getPropertyPriority('VISIBILITY')];
+            return JSON.stringify({first, invalid, normal, parsed, removed, after, attribute, commented, custom, uppercase});
+        })()"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({
+            "first": ["hidden", "important", "visibility: hidden !important;"],
+            "invalid": ["hidden", "important"], "normal": ["visible", ""],
+            "parsed": ["visibility: visible; color: red !important;", "red", "important"],
+            "removed": "red", "after": "", "attribute": "visibility: visible;",
+            "commented": ["visibility: hidden !important;", "important"], "custom": ["bar", "important", ""],
+            "uppercase": ["visible", "important"]
+        }));
+    }
+
+    #[test]
+    fn svg_path_length_and_points_expose_geometry_and_errors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt.evaluate(r#"(() => {
+            const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            p.setAttribute('d', 'M10 20 h80 v30 h-80 z');
+            const at = n => { const q = p.getPointAtLength(n); return [q.x, q.y, q instanceof DOMPoint]; };
+            const result = [p.getTotalLength(), at(-1), at(120), at(999)];
+            p.setAttribute('d', '');
+            try { p.getPointAtLength(0); } catch (e) { result.push(e.name); }
+            try { p.getPointAtLength(Infinity); } catch (e) { result.push(e.name); }
+            return result;
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!([220, [10, 20, true], [80, 50, true], [10, 20, true], "InvalidStateError", "TypeError"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn inline_important_priority_is_used_by_the_author_cascade() {
+        let mut rt = setup_runtime("<style>#target { visibility: visible !important }</style><div id='target'></div>");
+        let value = rt.evaluate(r#"(() => {
+            const el = document.getElementById('target');
+            el.style.setProperty('visibility', 'hidden', 'important');
+            const important = getComputedStyle(el).visibility;
+            el.style.setProperty('visibility', 'hidden');
+            const normal = getComputedStyle(el).visibility;
+            el.style.setProperty('visibility', 'hidden', 'important');
+            return [important, normal, getComputedStyle(el).visibility];
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!(["hidden", "visible", "hidden"]));
+    }
+
     // #1168: `Option` is a legacy factory function like `Image`. WPForms does
     // `new Option().style`, so the result must be a real <option> element.
     #[test]
@@ -23540,6 +23681,216 @@ mod tests {
         assert_script_fetch_xhr_destinations(true, false).await;
     }
 
+    async fn assert_subscribed_fetch_network_headers(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            let client = std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true));
+            client.set_extra_headers([("x-extra".into(), "configured".into())].into_iter().collect()).await;
+            rt.set_stealth_client(client);
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        rt.set_network_reporting_enabled(true);
+        rt.set_extra_http_headers([("x-extra".into(), "configured".into())].into_iter().collect());
+        let load = rt.call_function_on_for_cdp(
+            "async () => (await fetch('/data', {headers:{'x-fetch':'fixture'}})).text()", None, &[], true, true,
+        );
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let wire = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(wire.contains("x-fetch: fixture"));
+            assert!(wire.contains("x-extra: configured"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            wire
+        };
+        let (result, wire) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, serve) })
+            .await.expect("fetch and fixture complete");
+        assert_eq!(result.unwrap().value.unwrap(), "ok");
+        let events = rt.take_js_network_events();
+        assert_eq!(events.last().unwrap().request_headers.get("x-fetch").unwrap(), "fixture");
+        assert_eq!(events.last().unwrap().request_headers.get("x-extra").unwrap(), "configured");
+        let user_agent = events.last().unwrap().request_headers.get("user-agent").unwrap().to_ascii_lowercase();
+        assert!(wire.contains(&format!("user-agent: {user_agent}")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribed_fetch_network_event_retains_explicit_request_headers() {
+        assert_subscribed_fetch_network_headers(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribed_stealth_fetch_network_event_retains_explicit_request_headers() {
+        assert_subscribed_fetch_network_headers(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intercepted_fetch_header_override_replaces_configured_stealth_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        let stealth = std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true));
+        stealth.set_extra_headers([("x-extra".into(), "configured".into())].into_iter().collect()).await;
+        rt.set_stealth_client(stealth);
+        rt.set_extra_http_headers([("x-extra".into(), "configured".into())].into_iter().collect());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx); rt.set_intercept_enabled(true);
+        let load = rt.call_function_on_for_cdp("async () => (await fetch('/data')).text()", None, &[], true, true);
+        let resolve = async {
+            rx.recv().await.unwrap().resolver.send(crate::ops::InterceptResolution::Continue {
+                url: None, method: None, headers: Some([("x-only".into(), "yes".into())].into_iter().collect()), body: None,
+            }).unwrap();
+        };
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096]; let n = socket.read(&mut buf).await.unwrap();
+            let wire = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(wire.contains("x-only: yes")); assert!(!wire.contains("x-extra:"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        };
+        let (result, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, resolve, serve) })
+            .await.expect("continued fetch completes");
+        assert_eq!(result.unwrap().value.unwrap(), "ok");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_image_decode_uses_intercepted_binary_response() {
+        use base64::Engine as _;
+        let mut rt = redirect_runtime_for_origin("https://example.test");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.set_intercept_page_id("image-page");
+        let load = rt.call_function_on_for_cdp(
+            "async () => { const image = new Image(); image.src = '/image.png'; await image.decode(); return [image.naturalWidth, image.naturalHeight]; }",
+            None, &[], true, true,
+        );
+        let resolve = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.resource_type, "Image");
+            assert_eq!(request.page_id, "image-page");
+            request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                status: 200, headers: std::collections::HashMap::new(), body: String::new(),
+                body_base64: base64::engine::general_purpose::STANDARD.encode(two_by_three_png()),
+            }).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(load, resolve)
+        }).await.expect("intercepted image must complete");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!([2, 3]));
+        assert_eq!(rt.take_js_network_events().last().unwrap().resource_type, "Image");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_module_import_uses_intercepted_script_response() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.test/page");
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.test/page");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.run_page_init();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.set_intercept_page_id("module-page");
+        {
+        let load = rt.call_function_on_for_cdp("async () => (await import('https://example.test/module.js')).value", None, &[], true, true);
+        tokio::pin!(load);
+        let request = tokio::select! {
+            result = &mut load => panic!("module finished before interception: {result:?}"),
+            request = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()) =>
+                request.expect("module request was not sent").expect("interception channel closed"),
+        };
+        assert_eq!(request.resource_type, "Script");
+        request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+            status: 200, headers: [("Content-Type".into(), "text/javascript".into())].into_iter().collect(),
+            body: "export const value = 42".into(), body_base64: String::new(),
+        }).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut load).await
+            .expect("intercepted module must complete");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!(42.0));
+        }
+        assert!(rt.take_js_network_events().iter().any(|event| event.intercepted && event.resource_type == "Script"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_and_blob_modules_support_imports_and_mime_checks() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.test/page");
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.test/page");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.run_page_init();
+        rt.load_inline_module("import { n } from 'data:text/javascript,export%20const%20n%3D7'; globalThis.staticDataResult = n;",
+            "https://example.test/main.js", 5_000).await.unwrap();
+        assert_eq!(rt.evaluate("globalThis.staticDataResult").unwrap(), serde_json::json!(7.0));
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const percent = (await import('data:text/javascript,export%20default%2042')).default;
+            const base64 = (await import('data:application/javascript;base64,ZXhwb3J0IGRlZmF1bHQgNDM=')).default;
+            let plainRejected = false; try { await import('data:text/plain,export%20default%2045'); } catch (_) { plainRejected = true; }
+            const url = URL.createObjectURL(new Blob(['export default 47'], {type:'text/javascript'}));
+            const blob = (await import(url)).default;
+            const revoked = URL.createObjectURL(new Blob(['export default 49'], {type:'text/javascript'}));
+            URL.revokeObjectURL(revoked);
+            let revokedRejected = false; try { await import(revoked); } catch (_) { revokedRejected = true; }
+            const bad = URL.createObjectURL(new Blob(['export default 48'], {type:'text/plain'}));
+            let blobTypeRejected = false; try { await import(bad); } catch (_) { blobTypeRejected = true; }
+            return [percent, base64, plainRejected, blob, revokedRejected, blobTypeRejected];
+        }"#, None, &[], true, true).await.unwrap();
+        assert!(!result.thrown, "{:?}", result.description);
+        assert_eq!(result.value.unwrap(), serde_json::json!([42, 43, true, 47, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn renderer_image_and_font_use_intercepted_binary_responses() {
+        use base64::Engine as _;
+        let mut rt = redirect_runtime_for_origin("https://example.test");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.set_intercept_page_id("render-page");
+        let requests = rt.mark_render_resources_in_flight(vec![
+            ("https://example.test/a.png".into(), None, false),
+            ("https://example.test/a.woff".into(), None, true),
+        ]);
+        assert_eq!(rt.start_render_resource_loads(requests), 2);
+        let mut types = Vec::new();
+        for _ in 0..2 {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            types.push(request.resource_type);
+            request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                status: 200, headers: std::collections::HashMap::new(), body: String::new(),
+                body_base64: base64::engine::general_purpose::STANDARD.encode([0, 128, 255]),
+            }).unwrap();
+        }
+        types.sort();
+        assert_eq!(types, ["Font", "Image"]);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while rt.has_pending_render_resources() {
+                let notify = rt.render_resource_notify();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                rt.apply_render_resource_results();
+                if rt.has_pending_render_resources() { notified.await; }
+            }
+        }).await.expect("renderer loads must complete");
+        let events = rt.take_render_resource_events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.intercepted_request_id.is_some()
+            && event.response.body.as_ref() == [0, 128, 255]));
+    }
+
     #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_dynamic_resource_destinations_reach_network_events_and_callbacks() {
@@ -24431,12 +24782,12 @@ mod tests {
                 const observer = new MutationObserver((mutations) => {
                     calls++;
                     records += mutations.length;
-                    if (calls < 50) body.style.setProperty("top", "0px", "important");
+                    if (calls < 50) body.style.setProperty("top", "0px");
                 });
                 observer.observe(document.documentElement, {
                     subtree: true, attributes: true, attributeFilter: ["style"],
                 });
-                body.style.setProperty("top", "0px", "important");
+                body.style.setProperty("top", "0px");
                 await new Promise((resolve) => setTimeout(resolve, 20));
                 body.style.removeProperty("left");
                 body.style.top = "0px";

@@ -301,6 +301,10 @@ impl StealthHttpClient {
         self
     }
 
+    pub fn user_agent(&self) -> &str {
+        self.user_agent.as_deref().unwrap_or(STEALTH_USER_AGENT)
+    }
+
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_callbacks(url, None).await
     }
@@ -338,6 +342,14 @@ impl StealthHttpClient {
         headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         self.fetch_request(url, ResourceRequest::navigation(), callbacks, method, body, headers).await
+    }
+
+    /// Continue a subresource with request-local interception overrides.
+    pub async fn fetch_resource_request(
+        &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, request, callbacks, method, body, headers).await
     }
 
     async fn fetch_request(
@@ -596,6 +608,15 @@ impl StealthHttpClient {
         store_cookies: bool,
         max_body_bytes: usize,
     ) -> Result<StealthResponseHeaders, ObscuraNetError> {
+        self.send_single_headers_with_context_override(method, url, headers, body, cookie_context,
+            store_cookies, max_body_bytes, false).await
+    }
+
+    pub async fn send_single_headers_with_context_override(
+        &self, method: &str, url: &Url, headers: &HashMap<String, String>, body: &[u8],
+        cookie_context: Option<SameSiteContext>, store_cookies: bool, max_body_bytes: usize,
+        replace_extra_headers: bool,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
             return Ok(StealthResponseHeaders {
@@ -618,11 +639,12 @@ impl StealthHttpClient {
         }
         let extra_headers = self.extra_headers.read().await;
         if let Some(ua) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v)
-            .or_else(|| extra_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v))
+            .or_else(|| (!replace_extra_headers).then(|| extra_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v)).flatten())
             .or(self.user_agent.as_ref()) {
             req = req.header("user-agent", ua.as_str());
         }
-        for (k, v) in extra_headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
+        for (k, v) in extra_headers.iter().filter(|(k, _)| !replace_extra_headers && !k.eq_ignore_ascii_case("user-agent")
+            && !headers.keys().any(|name| name.eq_ignore_ascii_case(k))) {
             req = req.header(k.as_str(), v.as_str());
         }
         drop(extra_headers);
@@ -646,11 +668,11 @@ impl StealthHttpClient {
                 }
             }
         }
-        let response_headers: HashMap<String, String> = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
-            .collect();
+        let mut response_headers = HashMap::new();
+        for (name, value) in resp.headers().iter() {
+            crate::client::merge_response_header(&mut response_headers, name.as_str().to_lowercase(),
+                value.to_str().unwrap_or("").to_string());
+        }
         let body_url = url.clone();
         Ok(StealthResponseHeaders {
             status: status.as_u16(),
