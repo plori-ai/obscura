@@ -63,6 +63,10 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
+            if params.get("patterns").and_then(Value::as_array).is_some_and(|patterns|
+                patterns.iter().any(|pattern| pattern.get("requestStage").and_then(Value::as_str) == Some("Response"))) {
+                return Err("Fetch response-stage interception is not implemented".into());
+            }
             let patterns = params
                 .get("patterns")
                 .and_then(|v| v.as_array())
@@ -205,7 +209,7 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => Ok(json!({ "body": "", "base64Encoded": false })),
+        "getResponseBody" => Err("Fetch response-stage interception is not implemented".into()),
         "takeResponseBodyAsStream" => {
             // Hand the client a streaming handle for a large response body so it
             // can pull it in chunks via IO.read and free it with IO.close,
@@ -262,6 +266,15 @@ mod tests {
             },
         );
         rx
+    }
+
+    #[tokio::test]
+    async fn response_stage_is_rejected_without_enabling_request_interception() {
+        let mut ctx = CdpContext::new();
+        assert!(handle("enable", &json!({"patterns": [{"urlPattern": "*", "requestStage": "Response"}]}),
+            &mut ctx, &None).await.is_err());
+        assert!(!ctx.fetch_intercept.enabled);
+        assert!(handle("getResponseBody", &json!({"requestId": "missing"}), &mut ctx, &None).await.is_err());
     }
 
     // Parity with server.rs handle_fetch_resolution: continueRequest must

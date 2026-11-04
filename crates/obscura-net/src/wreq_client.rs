@@ -340,6 +340,14 @@ impl StealthHttpClient {
         self.fetch_request(url, ResourceRequest::navigation(), callbacks, method, body, headers).await
     }
 
+    /// Continue a subresource with request-local interception overrides.
+    pub async fn fetch_resource_request(
+        &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, request, callbacks, method, body, headers).await
+    }
+
     async fn fetch_request(
         &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>,
         method: &str, mut body: Option<Vec<u8>>, mut request_headers: Option<HashMap<String, String>>,

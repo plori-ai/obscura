@@ -948,7 +948,7 @@ pub fn emit_navigation_events(
                         "headers": net_event.headers,
                     },
                     "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
+                    "resourceType": cdp_resource_type(&net_event.resource_type),
                     "networkId": rid,
                 }),
                 session_id: es.clone(),
@@ -1005,7 +1005,7 @@ pub fn emit_navigation_events(
                         "headers": net_event.headers,
                     },
                     "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
+                    "resourceType": cdp_resource_type(&net_event.resource_type),
                     "networkId": rid,
                 }),
                 session_id: es.clone(),
@@ -1117,6 +1117,10 @@ pub fn emit_navigation_events(
         }),
     ));
     fan_out_network_events(ctx, page_id, session_id, event_start);
+}
+
+pub(crate) fn cdp_resource_type(resource_type: &str) -> &str {
+    if resource_type == "Fetch" { "XHR" } else { resource_type }
 }
 
 /// Additional sessions observing the same target. Fetch pauses and lifecycle

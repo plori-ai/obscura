@@ -73,6 +73,11 @@ pub struct InterceptedRequest {
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
 
+pub fn next_subresource_interception_id() -> String {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!("subresource-{}", NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredNetworkResponseBody {
     pub body: String,
@@ -1726,6 +1731,7 @@ pub struct RenderResourceLoad {
     pub url: String,
     pub profile: Option<ImageRequestProfile>,
     pub is_font: bool,
+    pub intercepted_request_id: Option<String>,
     /// Final URL, status, headers and body of the response; `None` when the
     /// request failed or was blocked.
     pub response: Option<RenderResourceResponse>,
@@ -1746,6 +1752,7 @@ pub struct RenderResourceResponse {
 #[derive(Debug)]
 pub struct RenderResourceEvent {
     pub is_font: bool,
+    pub intercepted_request_id: Option<String>,
     pub response: RenderResourceResponse,
 }
 
@@ -6263,7 +6270,7 @@ mod tests {
     }
 }
 
-fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
+pub fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
     let scheme = url.scheme();
     // file:// is denied by default here, matching Page.navigate /
     // Target.createTarget (which gate it behind --allow-file-access). The
@@ -8656,6 +8663,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         callbacks,
         page_in_flight,
         blocked,
+        interception,
     ) = {
         let gs = shared.borrow();
         let Some(dom) = gs.dom.as_ref() else {
@@ -8694,6 +8702,9 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         let blocked = gs.blocked_urls.iter().any(|pattern| {
             pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
         });
+        let interception = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &selected_url) {
+            gs.intercept_tx.clone().map(|tx| (tx, gs.intercept_page_id.clone()))
+        } else { None };
         (
             gs.document_generation,
             selected_url,
@@ -8703,6 +8714,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             gs.callbacks.clone(),
             Arc::clone(&gs.page_in_flight),
             blocked,
+            interception,
         )
     };
 
@@ -8757,39 +8769,81 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
-        #[cfg(feature = "stealth")]
-        {
-            if let Some(client) = stealth_client {
-                client
-                    .fetch_resource_with_callbacks(
-                        parsed_url,
-                        resource_request.clone(),
-                        callbacks.as_deref(),
-                    )
-                    .await
-                    .ok()
-            } else {
-                http_client
-                    .as_ref()
-                    .unwrap()
-                    .fetch_resource_with_callbacks(
-                        parsed_url,
-                        resource_request,
-                        callbacks.as_deref(),
-                    )
-                    .await
-                    .ok()
+        let mut resolved_url = parsed_url.clone();
+        let mut override_method = None;
+        let mut override_body = None;
+        let mut override_headers = None;
+        let mut intercepted_id = None;
+        if matches!(parsed_url.scheme(), "http" | "https") {
+            if let Some((tx, page_id)) = interception {
+                let allow_private = http_client.as_ref().is_some_and(|c| c.allow_private_network);
+                if validate_fetch_url(parsed_url, allow_private).is_err() { return None; }
+                let request_id = next_subresource_interception_id();
+                let (resolver, resolution) = tokio::sync::oneshot::channel();
+                if tx.send(InterceptedRequest { request_id: request_id.clone(), page_id,
+                    url: selected_url.clone(), method: "GET".into(), headers: HashMap::new(),
+                    resource_type: "Image".into(), resolver }).is_ok() {
+                    intercepted_id = Some(request_id);
+                    match resolution.await {
+                        Ok(InterceptResolution::Continue { url, method, headers, body }) => {
+                            if let Some(url) = url {
+                                resolved_url = url::Url::parse(&url).ok()?;
+                                if validate_fetch_url(&resolved_url, allow_private).is_err() { return None; }
+                            }
+                            override_method = method;
+                            override_headers = headers;
+                            override_body = body;
+                        }
+                        Ok(InterceptResolution::Fulfill { status, headers, body, body_base64 }) => {
+                            if obscura_net::client::validate_intercepted_response(&resource_request, &resolved_url, &headers).is_err() {
+                                return None;
+                            }
+                            let headers = obscura_net::client::normalize_intercepted_headers(headers);
+                            let bytes = if body_base64.is_empty() { body.into_bytes() }
+                                else { BASE64.decode(body_base64).ok()? };
+                            if bytes.len() > resource_request.max_response_bytes { return None; }
+                            let response = Response { url: resolved_url, status, headers,
+                                body: bytes, redirected_from: Vec::new() };
+                            if let Some(id) = intercepted_id.as_deref() {
+                                record_intercepted_image_completion(&shared, id, &response);
+                            }
+                            return Some(response);
+                        }
+                        Ok(InterceptResolution::Fail { .. }) => return None,
+                        Err(_) => return None,
+                    }
+                }
             }
         }
+        #[cfg(feature = "stealth")]
+        let response = {
+            if let Some(client) = stealth_client {
+                if intercepted_id.is_some() {
+                    client.fetch_resource_request(&resolved_url, resource_request.clone(), override_method.as_deref().unwrap_or("GET"),
+                        override_body, override_headers, callbacks.as_deref()).await.ok()
+                } else {
+                    client.fetch_resource_with_callbacks(parsed_url, resource_request.clone(), callbacks.as_deref()).await.ok()
+                }
+            } else {
+                if intercepted_id.is_some() {
+                    http_client.as_ref().unwrap().fetch_resource_request(&resolved_url, resource_request,
+                        override_method.as_deref().unwrap_or("GET"), override_body, override_headers, callbacks.as_deref()).await.ok()
+                } else {
+                    http_client.as_ref().unwrap().fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref()).await.ok()
+                }
+            }
+        };
         #[cfg(not(feature = "stealth"))]
-        {
-            http_client
-                .as_ref()
-                .unwrap()
-                .fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref())
-                .await
-                .ok()
+        let response = if intercepted_id.is_some() {
+            http_client.as_ref().unwrap().fetch_resource_request(&resolved_url, resource_request,
+                override_method.as_deref().unwrap_or("GET"), override_body, override_headers, callbacks.as_deref()).await.ok()
+        } else {
+            http_client.as_ref().unwrap().fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref()).await.ok()
+        };
+        if let (Some(id), Some(response)) = (intercepted_id.as_deref(), response.as_ref()) {
+            record_intercepted_image_completion(&shared, id, response);
         }
+        response
     } };
     let response = tokio::select! {
         response = fetch => response,
@@ -8841,6 +8895,19 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         &selected_url,
         request_profile,
     )
+}
+
+#[cfg(feature = "render")]
+fn record_intercepted_image_completion(shared: &SharedState, id: &str, response: &Response) {
+    let event = JsNetworkEvent {
+        request_id: id.to_string(), intercepted: true, url: response.url.to_string(), method: "GET".into(),
+        resource_type: "Image".into(), status: response.status, response_headers: response.headers.clone(),
+        body_size: response.body.len(), timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), error_text: None,
+    };
+    record_network_completion(&mut shared.borrow_mut(), event, || StoredNetworkResponseBody {
+        body: BASE64.encode(&response.body), base64_encoded: true,
+    });
 }
 
 #[cfg(feature = "render")]

@@ -428,6 +428,40 @@ pub(crate) fn validate_cors_response(
     Ok(())
 }
 
+/// Apply the same request-mode and CORS checks to a synthetic response as to
+/// one received from the network.
+pub fn validate_intercepted_response(
+    request: &ResourceRequest, target: &Url, headers: &HashMap<String, String>,
+) -> Result<(), ObscuraNetError> {
+    validate_request_mode(request, target)?;
+    let header = |name: &str| headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str());
+    validate_cors_response(request, target, &serialized_request_origin(request, false),
+        header("access-control-allow-origin"), header("access-control-allow-credentials"))
+}
+
+pub fn normalize_intercepted_headers(headers: HashMap<String, String>) -> HashMap<String, String> {
+    headers.into_iter().map(|(name, value)| (name.to_ascii_lowercase(), value)).collect()
+}
+
+#[cfg(test)]
+mod intercepted_response_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_cors_responses_obey_credentials_and_header_case() {
+        let document = Url::parse("https://page.test/").unwrap();
+        let target = Url::parse("https://cdn.test/font.woff").unwrap();
+        let mut request = ResourceRequest::subresource(ResourceType::Font, &document);
+        let headers = [("Access-Control-Allow-Origin".into(), "*".into())].into_iter().collect();
+        assert!(validate_intercepted_response(&request, &target, &headers).is_ok());
+        request.credentials = RequestCredentials::Include;
+        assert!(validate_intercepted_response(&request, &target, &headers).is_err());
+        let normalized = normalize_intercepted_headers(headers);
+        assert_eq!(normalized.get("access-control-allow-origin").unwrap(), "*");
+    }
+}
+
 pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
     ObscuraNetError::ResponseTooLarge {
         url: url.to_string(),
@@ -1410,6 +1444,16 @@ impl ObscuraHttpClient {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         self.fetch_request_uncached(method, url, body, callbacks, ResourceRequest::navigation(), headers).await
+    }
+
+    /// Continue a subresource with request-local interception overrides.
+    pub async fn fetch_resource_request(
+        &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
     }
 
     async fn fetch_request_uncached(

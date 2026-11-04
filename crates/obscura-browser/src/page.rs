@@ -14,6 +14,60 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
+#[derive(Clone)]
+struct NativeInterception {
+    tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    page_id: String,
+    patterns: Vec<String>,
+}
+
+impl NativeInterception {
+    async fn fetch(
+        &self, url: &Url, request: ResourceRequest, kind: &str,
+        client: &ObscuraHttpClient,
+        #[cfg(feature = "stealth")] stealth: Option<&obscura_net::StealthHttpClient>,
+        callbacks: &CallbackRegistry,
+    ) -> Result<Option<(Response, String)>, String> {
+        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
+        if !matches!(url.scheme(), "http" | "https") || (!self.patterns.is_empty()
+            && !self.patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
+            return Ok(None);
+        }
+        obscura_js::ops::validate_fetch_url(url, client.allow_private_network)?;
+        let id = obscura_js::ops::next_subresource_interception_id();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        if self.tx.send(InterceptedRequest { request_id: id.clone(), page_id: self.page_id.clone(),
+            url: url.to_string(), method: "GET".into(), headers: Default::default(),
+            resource_type: kind.into(), resolver }).is_err() { return Ok(None); }
+        let response = match resolution.await.map_err(|_| "interception cancelled".to_string())? {
+            InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
+                obscura_net::client::validate_intercepted_response(&request, url, &headers).map_err(|e| e.to_string())?;
+                let headers = obscura_net::client::normalize_intercepted_headers(headers);
+                let body = if body_base64.is_empty() { body.into_bytes() } else {
+                    BASE64.decode(body_base64).map_err(|e| e.to_string())?
+                };
+                if body.len() > request.max_response_bytes { return Err("fulfilled resource too large".into()); }
+                Response { url: url.clone(), status, headers, body, redirected_from: Vec::new() }
+            }
+            InterceptResolution::Fail { reason } => return Err(reason),
+            InterceptResolution::Continue { url: rewrite, method, headers, body } => {
+                let target = match rewrite { Some(url) => Url::parse(&url).map_err(|e| e.to_string())?, None => url.clone() };
+                obscura_js::ops::validate_fetch_url(&target, client.allow_private_network)?;
+                let method = method.as_deref().unwrap_or("GET");
+                #[cfg(feature = "stealth")]
+                if let Some(stealth) = stealth {
+                    let response = stealth.fetch_resource_request(&target, request, method, body, headers, Some(callbacks)).await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(Some((response, id)));
+                }
+                client.fetch_resource_request(&target, request, method, body, headers, Some(callbacks)).await
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        Ok(Some((response, id)))
+    }
+}
+
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
 /// Returns None when unset or malformed, leaving the built-in default in place.
 /// Lets a deployment align the reported coordinates with the region its exit IP
@@ -2117,6 +2171,9 @@ impl Page {
 
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
+        let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(),
+        }) } else { None };
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
             let client = self.http_client.clone();
@@ -2132,9 +2189,18 @@ impl Page {
                     let stealth_client = stealth_client.clone();
                     let callbacks = callbacks.clone();
                     let initiator = initiator.clone();
+                    let interception = interception.clone();
                     async move {
                         let request =
                             ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        if let Some(interception) = interception {
+                            match interception.fetch(&requested_url, request.clone(), "Stylesheet", &client,
+                                #[cfg(feature = "stealth")] stealth_client.as_deref(), &callbacks).await {
+                                Ok(Some((response, id))) => return (key, requested_url, depth, Ok((response, Some(id)))),
+                                Ok(None) => {},
+                                Err(error) => return (key, requested_url, depth, Err(error)),
+                            }
+                        }
                         #[cfg(feature = "stealth")]
                         let result = if let Some(stealth_client) = stealth_client {
                             stealth_client
@@ -2161,7 +2227,7 @@ impl Page {
                                 Some(&callbacks),
                             )
                             .await;
-                        (key, requested_url, depth, result)
+                        (key, requested_url, depth, result.map(|response| (response, None)).map_err(|error| error.to_string()))
                     }
                 }))
                 .buffered(16)
@@ -2169,7 +2235,7 @@ impl Page {
                 .await;
 
             for (key, requested_url, depth, result) in results {
-                let response = match result {
+                let (response, intercepted_id) = match result {
                     Ok(response) => response,
                     Err(error) => {
                         tracing::debug!("Failed to fetch stylesheet {}: {}", requested_url, error);
@@ -2177,7 +2243,9 @@ impl Page {
                     }
                 };
                 let response_url = response.url.clone();
-                self.record_network_event_with_body(
+                if let Some(id) = intercepted_id {
+                    self.record_intercepted_resource(id, "Stylesheet", &response);
+                } else { self.record_network_event_with_body(
                     response_url.as_str(),
                     "GET",
                     "Stylesheet",
@@ -2185,7 +2253,7 @@ impl Page {
                     &response.headers,
                     &response.body,
                     false,
-                );
+                ); }
 
                 let (response_key, response_url) = canonical_stylesheet_url(response_url);
                 if let Some(existing) = aliases.get(&response_key).cloned() {
@@ -2551,6 +2619,11 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
+        let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(),
+        }) } else { None };
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let script_initiator = self
             .url
             .clone()
@@ -2561,6 +2634,9 @@ impl Page {
                 let client = client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
+                let interception = interception.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let url = url.clone();
                 let idx = *idx;
                 async move {
@@ -2588,14 +2664,22 @@ impl Page {
                             body,
                             redirected_from: Vec::new(),
                         };
-                        return Some((idx, url, resp));
+                        return Some((idx, url, resp, None));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    if let Some(interception) = interception {
+                        match interception.fetch(&parsed, request.clone(), "Script", &client,
+                            #[cfg(feature = "stealth")] stealth_client.as_deref(), &cbs).await {
+                            Ok(Some((resp, id))) => return Some((idx, url, resp, Some(id))),
+                            Ok(None) => {},
+                            Err(error) => { tracing::warn!("Failed to fetch script {}: {}", url, error); return None; }
+                        }
+                    }
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
                         .await
                     {
-                        Ok(resp) => Some((idx, url, resp)),
+                        Ok(resp) => Some((idx, url, resp, None)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
                             None
@@ -2627,12 +2711,13 @@ impl Page {
             }
         };
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response, Option<String>)> =
             std::collections::HashMap::new();
         for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
+            if let Some((idx, url, resp, intercepted_id)) = result {
                 if !script_response_is_executable(resp.status) {
-                    self.record_network_event_with_body(
+                    if let Some(id) = intercepted_id { self.record_intercepted_resource(id, "Script", &resp); }
+                    else { self.record_network_event_with_body(
                         &url,
                         "GET",
                         "Script",
@@ -2640,7 +2725,7 @@ impl Page {
                         &resp.headers,
                         &resp.body,
                         false,
-                    );
+                    ); }
                     tracing::warn!(
                         "Refusing to execute script {} after HTTP {}",
                         url,
@@ -2651,7 +2736,7 @@ impl Page {
                 // Script bodies: only the HTTP Content-Type charset matters
                 // (no in-band meta-charset for JS).
                 let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
+                fetched.insert(idx, (url, code, resp, intercepted_id));
             }
         }
 
@@ -2769,12 +2854,13 @@ impl Page {
         let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
-             fetched_script: Option<(String, String, obscura_net::Response)>| {
+             fetched_script: Option<(String, String, obscura_net::Response, Option<String>)>| {
                 if script.src.is_some() {
-                    if let Some((url, code, resp)) = fetched_script {
+                    if let Some((url, code, resp, intercepted_id)) = fetched_script {
                         tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                         let execution_url = resp.url.to_string();
-                        page.record_network_event_with_body(
+                        if let Some(id) = intercepted_id { page.record_intercepted_resource(id, "Script", &resp); }
+                        else { page.record_network_event_with_body(
                             &url,
                             "GET",
                             "Script",
@@ -2782,7 +2868,7 @@ impl Page {
                             &resp.headers,
                             &resp.body,
                             false,
-                        );
+                        ); }
                         if let Some(js) = &mut page.js {
                             let _ = js.execute_script(
                                 "<current-script>",
@@ -4086,6 +4172,19 @@ impl Page {
         };
         let events = js.take_render_resource_events();
         for event in events {
+            if let Some(request_id) = event.intercepted_request_id {
+                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64();
+                self.network_events.push(NetworkEvent {
+                    request_id: request_id.clone(), intercepted: true, url: event.response.url.clone(),
+                    method: "GET".into(), resource_type: if event.is_font { "Font" } else { "Image" }.into(),
+                    status: event.response.status, headers: Default::default(),
+                    response_headers: Arc::new(event.response.headers.clone()), body_size: event.response.body.len(),
+                    timestamp, error_text: None,
+                });
+                self.store_response_body(request_id, &event.response.body, true);
+                continue;
+            }
             self.record_network_event_with_body(
                 &event.response.url,
                 "GET",
@@ -4749,6 +4848,17 @@ impl Page {
         self.store_response_body(request_id, body, base64_encoded);
     }
 
+    fn record_intercepted_resource(&mut self, request_id: String, resource_type: &str, response: &Response) {
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs_f64();
+        self.network_events.push(NetworkEvent {
+            request_id: request_id.clone(), intercepted: true, url: response.url.to_string(), method: "GET".into(),
+            resource_type: resource_type.into(), status: response.status, headers: Default::default(),
+            response_headers: Arc::new(response.headers.clone()), body_size: response.body.len(), timestamp, error_text: None,
+        });
+        self.store_response_body(request_id, &response.body, resource_type == "Image" || resource_type == "Font");
+    }
+
     fn record_network_event_inner(
         &mut self,
         url: &str,
@@ -5215,8 +5325,10 @@ mod tests {
         register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
-        Page, BrowserContext, LifecycleState, BASE64,
+        Page, BrowserContext, LifecycleState, NativeInterception, BASE64,
     };
+    use obscura_net::{CallbackRegistry, ObscuraHttpClient, ResourceRequest, ResourceType};
+    use url::Url;
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
@@ -5264,6 +5376,110 @@ mod tests {
         let cookies = page.context.cookie_jar.get_cookie_header(&url::Url::parse("http://127.0.0.1:9/original").unwrap());
         assert!(cookies.split("; ").any(|cookie| cookie == "first=1"), "{cookies}");
         assert!(cookies.split("; ").any(|cookie| cookie == "second=2"), "{cookies}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_script_and_stylesheet_are_fulfilled_by_interception() {
+        use obscura_js::ops::InterceptResolution;
+        let context = Arc::new(BrowserContext::new("parser-interception".into()));
+        let mut page = Page::new("parser-interception".into(), context);
+        let mut requests = page.enable_interception();
+        let (result, types) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(page.navigate("https://example.test/page"), async {
+                let mut types = Vec::new();
+                for _ in 0..3 {
+                    let request = requests.recv().await.unwrap();
+                    let (mime, body) = match request.resource_type.as_str() {
+                        "Document" => ("text/html", "<link rel=stylesheet href='/style.css'><script src='/app.js'></script>"),
+                        "Stylesheet" => ("text/css", "body { color: rgb(1, 2, 3) }"),
+                        "Script" => ("application/javascript", "globalThis.parserIntercepted = 42"),
+                        other => panic!("unexpected type {other}"),
+                    };
+                    types.push(request.resource_type);
+                    request.resolver.send(InterceptResolution::Fulfill {
+                        status: 200, headers: [("content-type".into(), mime.into())].into_iter().collect(),
+                        body: body.into(), body_base64: String::new(),
+                    }).unwrap();
+                }
+                types
+            })
+        }).await.expect("intercepted parser resources must finish");
+        result.unwrap();
+        assert_eq!(types, ["Document", "Stylesheet", "Script"]);
+        assert_eq!(page.evaluate_script("globalThis.parserIntercepted").unwrap(), serde_json::json!(42.0));
+        for kind in ["Stylesheet", "Script"] {
+            assert!(page.network_events.iter().any(|event| event.intercepted && event.resource_type == kind));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn continued_parser_resource_applies_request_local_binary_overrides() {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let original = Url::parse(&format!("http://{address}/original")).unwrap();
+        let target = format!("http://{address}/rewritten");
+        let client = ObscuraHttpClient::with_full_options(Arc::new(obscura_net::CookieJar::new()), None, true);
+        let callbacks = CallbackRegistry::new();
+        let request = ResourceRequest::subresource(ResourceType::Script, &original);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()] };
+        let (result, (), wire) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                interception.fetch(&original, request, "Script", &client,
+                    #[cfg(feature = "stealth")] None, &callbacks),
+                async {
+                    let request = rx.recv().await.unwrap();
+                    request.resolver.send(InterceptResolution::Continue {
+                        url: Some(target), method: Some("POST".into()),
+                        headers: Some([("x-test".into(), "override".into())].into_iter().collect()),
+                        body: Some(vec![0, 128, 255]),
+                    }).unwrap();
+                },
+                async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut chunk = [0; 1024];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 { break; }
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                            .is_some_and(|end| bytes.len() >= end + 4 + 3) { break; }
+                    }
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                    bytes
+                }
+            )
+        }).await.expect("continued resource completes");
+        assert_eq!(result.unwrap().unwrap().0.body, b"ok");
+        let head = String::from_utf8_lossy(&wire).to_ascii_lowercase();
+        assert!(head.starts_with("post /rewritten http/1.1\r\n"));
+        assert!(head.contains("x-test: override\r\n"));
+        assert!(wire.ends_with(&[0, 128, 255]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn continued_parser_resource_rejects_private_url_rewrite() {
+        use obscura_js::ops::InterceptResolution;
+        std::env::remove_var("OBSCURA_ALLOW_PRIVATE_NETWORK");
+        let original = Url::parse("https://example.test/script.js").unwrap();
+        let client = ObscuraHttpClient::new();
+        let callbacks = CallbackRegistry::new();
+        let request = ResourceRequest::subresource(ResourceType::Script, &original);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()] };
+        let (result, ()) = tokio::join!(
+            interception.fetch(&original, request, "Script", &client,
+                #[cfg(feature = "stealth")] None, &callbacks),
+            async {
+                rx.recv().await.unwrap().resolver.send(InterceptResolution::Continue {
+                    url: Some("http://127.0.0.1:9/private".into()), method: None, headers: None, body: None,
+                }).unwrap();
+            }
+        );
+        assert!(result.is_err(), "a rewritten private address must not reach transport");
     }
 
     #[tokio::test(flavor = "current_thread")]

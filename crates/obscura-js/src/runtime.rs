@@ -2348,6 +2348,9 @@ impl ObscuraJsRuntime {
         }
         let initiator = initiator.expect("checked above");
         let callbacks = state.callbacks.clone();
+        let interception = if state.intercept_enabled {
+            state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone()))
+        } else { None };
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
@@ -2361,6 +2364,7 @@ impl ObscuraJsRuntime {
                 #[cfg(feature = "stealth")]
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
+                let interception = interception.clone();
                 let initiator = initiator.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
@@ -2376,6 +2380,7 @@ impl ObscuraJsRuntime {
                                 url: raw,
                                 profile,
                                 is_font,
+                                intercepted_request_id: None,
                                 response: None,
                                 };
                         }
@@ -2397,8 +2402,63 @@ impl ObscuraJsRuntime {
                         }
                         _ => {}
                     }
+                    let mut target = parsed.clone();
+                    let mut request_id = None;
+                    let mut changed_method = None;
+                    let mut changed_body = None;
+                    let mut changed_headers = None;
+                    if let Some((intercept_tx, page_id, patterns)) = interception {
+                        if matches!(parsed.scheme(), "http" | "https")
+                            && crate::ops::should_intercept_url(true, &patterns, &raw) {
+                            let allow_private = http_client.as_ref().is_some_and(|client| client.allow_private_network);
+                            if crate::ops::validate_fetch_url(&parsed, allow_private).is_err() {
+                                return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                    intercepted_request_id: None, response: None };
+                            }
+                            let id = crate::ops::next_subresource_interception_id();
+                            let (resolver, resolution) = tokio::sync::oneshot::channel();
+                            if intercept_tx.send(crate::ops::InterceptedRequest {
+                                request_id: id.clone(), page_id, url: raw.clone(), method: "GET".into(),
+                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), resolver,
+                            }).is_ok() {
+                                request_id = Some(id);
+                                match resolution.await {
+                                    Ok(crate::ops::InterceptResolution::Continue { url, method, headers, body }) => {
+                                        if let Some(url) = url {
+                                            let Ok(parsed) = url::Url::parse(&url) else {
+                                                return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                                    intercepted_request_id: request_id, response: None };
+                                            };
+                                            if crate::ops::validate_fetch_url(&parsed, allow_private).is_err() {
+                                                return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                                    intercepted_request_id: request_id, response: None };
+                                            }
+                                            target = parsed;
+                                        }
+                                        changed_method = method; changed_body = body; changed_headers = headers;
+                                    }
+                                    Ok(crate::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }) => {
+                                        use base64::Engine as _;
+                                        let headers = obscura_net::client::normalize_intercepted_headers(headers);
+                                        let bytes = if body_base64.is_empty() { Some(body.into_bytes()) }
+                                            else { base64::engine::general_purpose::STANDARD.decode(body_base64).ok() };
+                                        let response = bytes.filter(|bytes| bytes.len() <= request.max_response_bytes)
+                                            .filter(|_| obscura_net::client::validate_intercepted_response(&request, &target, &headers).is_ok())
+                                            .map(|body| crate::ops::RenderResourceResponse { url: target.to_string(), status, headers,
+                                                body: std::sync::Arc::from(body) });
+                                        return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                            intercepted_request_id: request_id, response };
+                                    }
+                                    _ => return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
+                                        intercepted_request_id: request_id, response: None },
+                                }
+                            }
+                        }
+                    }
                     #[cfg(feature = "stealth")]
                     let response = match (stealth_client, http_client) {
+                        (Some(stealth_client), _) if request_id.is_some() => stealth_client
+                            .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         (Some(stealth_client), _) => stealth_client
                                 .fetch_resource_with_callbacks(
                                     &parsed,
@@ -2407,6 +2467,8 @@ impl ObscuraJsRuntime {
                                 )
                             .await
                             .ok(),
+                        (None, Some(http_client)) if request_id.is_some() => http_client
+                            .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         (None, Some(http_client)) => http_client
                                 .fetch_resource_with_callbacks(
                                     &parsed,
@@ -2419,6 +2481,8 @@ impl ObscuraJsRuntime {
                     };
                     #[cfg(not(feature = "stealth"))]
                     let response = match http_client {
+                        Some(http_client) if request_id.is_some() => http_client
+                            .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         Some(http_client) => http_client
                                 .fetch_resource_with_callbacks(
                                     &parsed,
@@ -2434,6 +2498,7 @@ impl ObscuraJsRuntime {
                         url: raw,
                         profile,
                         is_font,
+                        intercepted_request_id: request_id,
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
                             status: response.status,
@@ -2453,6 +2518,7 @@ impl ObscuraJsRuntime {
                             url: fallback.0,
                             profile: fallback.1,
                             is_font: fallback.2,
+                            intercepted_request_id: None,
                             response: None,
                         })
                     })
@@ -2561,7 +2627,7 @@ impl ObscuraJsRuntime {
                 self.state
                     .borrow_mut()
                     .render_resource_events
-                    .push(crate::ops::RenderResourceEvent { is_font, response });
+                    .push(crate::ops::RenderResourceEvent { is_font, intercepted_request_id: load.intercepted_request_id, response });
             }
         }
         loaded
@@ -5016,6 +5082,7 @@ mod tests {
                 url: url.clone(),
                 profile: None,
                 is_font: false,
+                intercepted_request_id: None,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
                     status: 200,
@@ -23450,6 +23517,107 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_resource_destinations_survive_interception_fulfillment() {
         assert_script_fetch_xhr_destinations(true, false).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_image_decode_uses_intercepted_binary_response() {
+        use base64::Engine as _;
+        let mut rt = redirect_runtime_for_origin("https://example.test");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.set_intercept_page_id("image-page");
+        let load = rt.call_function_on_for_cdp(
+            "async () => { const image = new Image(); image.src = '/image.png'; await image.decode(); return [image.naturalWidth, image.naturalHeight]; }",
+            None, &[], true, true,
+        );
+        let resolve = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.resource_type, "Image");
+            assert_eq!(request.page_id, "image-page");
+            request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                status: 200, headers: std::collections::HashMap::new(), body: String::new(),
+                body_base64: base64::engine::general_purpose::STANDARD.encode(two_by_three_png()),
+            }).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(load, resolve)
+        }).await.expect("intercepted image must complete");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!([2, 3]));
+        assert_eq!(rt.take_js_network_events().last().unwrap().resource_type, "Image");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_module_import_uses_intercepted_script_response() {
+        let mut rt = ObscuraJsRuntime::with_base_url("https://example.test/page");
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.test/page");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.run_page_init();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.set_intercept_page_id("module-page");
+        {
+        let load = rt.call_function_on_for_cdp("async () => (await import('https://example.test/module.js')).value", None, &[], true, true);
+        tokio::pin!(load);
+        let request = tokio::select! {
+            result = &mut load => panic!("module finished before interception: {result:?}"),
+            request = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()) =>
+                request.expect("module request was not sent").expect("interception channel closed"),
+        };
+        assert_eq!(request.resource_type, "Script");
+        request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+            status: 200, headers: [("Content-Type".into(), "text/javascript".into())].into_iter().collect(),
+            body: "export const value = 42".into(), body_base64: String::new(),
+        }).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut load).await
+            .expect("intercepted module must complete");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!(42.0));
+        }
+        assert!(rt.take_js_network_events().iter().any(|event| event.intercepted && event.resource_type == "Script"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn renderer_image_and_font_use_intercepted_binary_responses() {
+        use base64::Engine as _;
+        let mut rt = redirect_runtime_for_origin("https://example.test");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        rt.set_intercept_page_id("render-page");
+        let requests = rt.mark_render_resources_in_flight(vec![
+            ("https://example.test/a.png".into(), None, false),
+            ("https://example.test/a.woff".into(), None, true),
+        ]);
+        assert_eq!(rt.start_render_resource_loads(requests), 2);
+        let mut types = Vec::new();
+        for _ in 0..2 {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            types.push(request.resource_type);
+            request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                status: 200, headers: std::collections::HashMap::new(), body: String::new(),
+                body_base64: base64::engine::general_purpose::STANDARD.encode([0, 128, 255]),
+            }).unwrap();
+        }
+        types.sort();
+        assert_eq!(types, ["Font", "Image"]);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while rt.has_pending_render_resources() {
+                let notify = rt.render_resource_notify();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                rt.apply_render_resource_results();
+                if rt.has_pending_render_resources() { notified.await; }
+            }
+        }).await.expect("renderer loads must complete");
+        let events = rt.take_render_resource_events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.intercepted_request_id.is_some()
+            && event.response.body.as_ref() == [0, 128, 255]));
     }
 
     #[cfg(feature = "stealth")]

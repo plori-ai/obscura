@@ -100,7 +100,7 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setCacheDisabled" => Ok(json!({})),
-        "setRequestInterception" => Ok(json!({})),
+        "setRequestInterception" => Err("Network.setRequestInterception is not implemented; use Fetch.enable".into()),
         "setBlockedURLs" => {
             let patterns = params
                 .get("urls")
@@ -248,6 +248,13 @@ mod tests {
             .await
             .expect("clearBrowserCookies must succeed");
         assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deprecated_request_interception_is_rejected_instead_of_ignored() {
+        let mut ctx = CdpContext::new();
+        assert!(handle("setRequestInterception", &json!({"patterns": [{"urlPattern": "*"}]}),
+            &mut ctx, &None).await.unwrap_err().contains("Fetch.enable"));
     }
 
     #[tokio::test]
