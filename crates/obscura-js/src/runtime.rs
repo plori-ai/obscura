@@ -17511,6 +17511,37 @@ mod tests {
     }
 
     #[test]
+    fn canvas_path_rect_does_not_paint_until_fill() {
+        let mut rt = setup_runtime("<html><body><canvas width='10' height='10'></canvas></body></html>");
+        let result = rt.evaluate(r#"
+            (() => {
+                const ctx = document.querySelector('canvas').getContext('2d');
+                ctx.beginPath();
+                ctx.rect(Infinity, 0, 1, 1);
+                ctx.stroke();
+                ctx.rect(0, 0, 10, 10);
+                ctx.clip();
+                const before = Array.from(ctx.getImageData(2, 2, 1, 1).data);
+                ctx.beginPath();
+                ctx.rect(1, 1, 4, 4);
+                ctx.rect(7, 1, 2, 2);
+                ctx.fillStyle = '#ff0000';
+                ctx.fill();
+                const filled = [Array.from(ctx.getImageData(2, 2, 1, 1).data),
+                    Array.from(ctx.getImageData(6, 2, 1, 1).data),
+                    Array.from(ctx.getImageData(8, 2, 1, 1).data)];
+                ctx.fillStyle = '#0000ff';
+                ctx.fill();
+                return [before, filled, Array.from(ctx.getImageData(2, 2, 1, 1).data)];
+            })()
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [0, 0, 0, 0], [[255, 0, 0, 255], [0, 0, 0, 0], [255, 0, 0, 255]],
+            [0, 0, 255, 255],
+        ]));
+    }
+
+    #[test]
     fn unavailable_webgl_context_does_not_claim_success() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt

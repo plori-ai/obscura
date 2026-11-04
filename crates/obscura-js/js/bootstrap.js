@@ -16314,7 +16314,12 @@ class _Canvas2D {
   bezierCurveTo() {} quadraticCurveTo() {}
   arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
   arcTo() {}
-  rect(x, y, w, h) { this.fillRect(x, y, w, h); }
+  rect(x, y, w, h) {
+    if (!this._path) this._path = [];
+    x = +x; y = +y; w = +w; h = +h;
+    if (![x, y, w, h, x + w, y + h].every(Number.isFinite)) return;
+    this._path.push({t:'M',x,y}, {t:'L',x:x+w,y}, {t:'L',x:x+w,y:y+h}, {t:'L',x,y:y+h}, {t:'Z'});
+  }
   fill() {
     if (!this._path) return;
     const style = this._resolvePaint(this.fillStyle);
@@ -16325,17 +16330,26 @@ class _Canvas2D {
     // Polygon fill: the old code only handled arcs, so a path built from
     // moveTo/lineTo (area charts, wedges, any closed shape) filled nothing.
     // Even-odd scanline over the M/L vertices, arcs still handled below.
-    const poly = this._path.filter((s) => s.t === 'M' || s.t === 'L');
-    if (poly.length >= 3) {
+    const polys = [];
+    let poly = null;
+    for (const seg of this._path) {
+      if (seg.t === 'M') { poly = [seg]; polys.push(poly); }
+      else if (seg.t === 'L' && poly) poly.push(seg);
+      else if (seg.t === 'Z') poly = null;
+    }
+    const vertices = polys.flat();
+    if (vertices.length >= 3) {
       let minY = Infinity, maxY = -Infinity;
-      for (const p of poly) { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
+      for (const p of vertices) { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
       minY = Math.max(0, Math.round(minY)); maxY = Math.min(this._h - 1, Math.round(maxY));
       for (let py = minY; py <= maxY; py++) {
         const xs = [];
-        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-          const a = poly[i], b = poly[j];
-          if ((a.y > py) !== (b.y > py)) {
-            xs.push(a.x + ((py - a.y) / (b.y - a.y)) * (b.x - a.x));
+        for (const shape of polys) {
+          for (let i = 0, j = shape.length - 1; i < shape.length; j = i++) {
+            const a = shape[i], b = shape[j];
+            if ((a.y > py) !== (b.y > py)) {
+              xs.push(a.x + ((py - a.y) / (b.y - a.y)) * (b.x - a.x));
+            }
           }
         }
         xs.sort((m, n) => m - n);
@@ -16357,7 +16371,6 @@ class _Canvas2D {
         }
       }
     }
-    this._path = [];
     this._markPaintDamage();
   }
   // Draw the accumulated path. Was a no-op, so every line chart, sparkline and
