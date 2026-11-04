@@ -24,7 +24,7 @@
 
 use std::rc::Rc;
 
-use obscura_dom::parse_html;
+use obscura_dom::{parse_html, NodeId};
 
 use crate::ops::{ObscuraState, RealmStates};
 use crate::runtime::ObscuraJsRuntime;
@@ -316,6 +316,15 @@ impl FrameRealm {
             Err(error) => return vec![error],
         };
 
+        // Parser-prepared scripts must remain started if page code later moves
+        // their node or an ancestor. Keep data scripts eligible if their type
+        // is changed to JavaScript before insertion, as in Chrome.
+        if let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) {
+            state.borrow().already_started_scripts.borrow_mut().extend(scripts.iter()
+                .filter(|script| (script.is_classic() || script.type_attribute == "module")
+                    && (!script.src.is_empty() || !script.text.trim().is_empty()))
+                .map(|script| script.nid));
+        }
         let mut problems = Vec::new();
         let parser_scripts = scripts.iter().enumerate().filter(|(_, script)| !script.is_deferred());
         let deferred_scripts = scripts.iter().enumerate().filter(|(_, script)| script.is_deferred());
@@ -391,6 +400,7 @@ impl FrameRealm {
         Ok(nodes.into_iter().filter_map(|id| {
             let text = dom.text_content(id);
             dom.with_node(id, |node| DocumentScript {
+                nid: id,
                 src: node.get_attribute("src").unwrap_or("").to_string(),
                 type_attribute: node.get_attribute("type").unwrap_or("").to_lowercase(),
                 defer: node.get_attribute("defer").is_some(),
@@ -402,6 +412,7 @@ impl FrameRealm {
 }
 
 struct DocumentScript {
+    nid: NodeId,
     src: String,
     type_attribute: String,
     defer: bool,
@@ -909,6 +920,28 @@ mod tests {
             document.body.appendChild(script);
         "#).unwrap();
         assert_eq!(frame.evaluate(&mut parent, "window.dynamicScriptRuns").unwrap().as_i64(), Some(1));
+    }
+
+    #[test]
+    fn moving_parsed_frame_script_subtree_does_not_rerun_script() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/",
+            r#"<html><head><script id="data" type="text/plain">
+                window.dataRuns = (window.dataRuns || 0) + 1;
+            </script></head><body><div id="container"><script>
+                window.runs = (window.runs || 0) + 1;
+            </script></div></body></html>"#,
+        ).expect("frame realm");
+        assert!(frame.run_document_scripts(&mut parent, |_| None).is_empty());
+        frame.execute_script(&mut parent, r#"
+            document.body.appendChild(document.getElementById('container'));
+            const data = document.getElementById('data');
+            data.type = 'text/javascript';
+            document.body.appendChild(data);
+        "#).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "[window.runs, window.dataRuns]").unwrap(),
+            serde_json::json!([1, 1]));
     }
 
     /// The capability the frame realm exists for: scripts that arrived with the
