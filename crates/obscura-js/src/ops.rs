@@ -360,6 +360,8 @@ pub struct ObscuraState {
     pub referrer: String,
     /// Last-Modified of this document response, if one was supplied.
     pub document_last_modified: Option<String>,
+    /// Fingerprint noise is shared by all frames in a page.
+    fingerprint_seed: Rc<Cell<i32>>,
     pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
@@ -613,6 +615,7 @@ pub struct PendingFrameMessage {
 impl ObscuraState {
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
         self.media_preferences = parent.media_preferences.clone();
+        self.fingerprint_seed = parent.fingerprint_seed.clone();
         #[cfg(feature = "render")]
         {
             let (reduce, dark) = parent.media_preferences.get();
@@ -659,6 +662,7 @@ impl ObscuraState {
             media_preferences: Rc::new(Cell::new((false, false))),
             referrer: String::new(),
             document_last_modified: None,
+            fingerprint_seed: Rc::new(Cell::new(0)),
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
@@ -1297,6 +1301,17 @@ pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
         Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
         None => page(),
     }
+}
+
+/// Initialize a page's fingerprint once and reuse it for every child realm.
+#[op2(fast)]
+fn op_fingerprint_seed(state: &OpState, seed: i32, frame_id: u32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let state = shared.borrow();
+        if frame_id == 0 { state.fingerprint_seed.set(seed); }
+        state.fingerprint_seed.get()
+    })).unwrap_or(seed)
 }
 
 /// The state of the realm running right now, or the page's when the caller is
@@ -7890,6 +7905,7 @@ pub fn build_extension() -> Extension {
         op_session_history(),
         op_history_traverse(),
         op_frame_document_ready(),
+        op_fingerprint_seed(),
         op_initial_frame(),
         op_document_realm_member(),
         op_register_document_realm(),

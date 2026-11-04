@@ -1001,12 +1001,15 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 10] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
             "__obscura_stealth",
+            "__obscura_screen_w",
+            "__obscura_screen_h",
+            "__obscura_screen_emulated",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
         ];

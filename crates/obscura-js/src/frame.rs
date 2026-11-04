@@ -1019,6 +1019,24 @@ mod tests {
         assert_eq!(value, serde_json::json!(true));
     }
 
+    #[test]
+    fn frames_share_the_page_device_fingerprint() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent.set_screen_size_override(Some((1440.0, 900.0)), true);
+        let properties = "[navigator.hardwareConcurrency, navigator.deviceMemory, screen.width, screen.height, screen.availWidth, screen.availHeight]";
+        let expected = parent.evaluate(properties).unwrap();
+        for (id, url) in [(1, "https://parent.example/child"), (2, "https://other.example/child")] {
+            let frame = FrameRealm::new(&mut parent, id, 0, url, "<html></html>").unwrap();
+            assert_eq!(frame.evaluate(&mut parent, properties).unwrap(), expected);
+        }
+        assert_eq!(parent.evaluate(r#"(() => {
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const child = frame.contentWindow;
+            return [child.navigator.hardwareConcurrency, child.navigator.deviceMemory,
+                child.screen.width, child.screen.height, child.screen.availWidth, child.screen.availHeight];
+        })()"#).unwrap(), expected);
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn frame_canvas_backing_budget_is_shared_and_released() {

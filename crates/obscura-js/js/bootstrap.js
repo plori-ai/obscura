@@ -15773,6 +15773,7 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     delete child.Deno;
     for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
                        '__obscura_ua_platform_version', '__obscura_stealth',
+                       '__obscura_screen_w', '__obscura_screen_h', '__obscura_screen_emulated',
                        '__obscura_geo_lat', '__obscura_geo_lon']) {
       if (globalThis[name] !== undefined) child[name] = globalThis[name];
     }
@@ -18802,7 +18803,7 @@ globalThis.__obscura_init = (function() {
     _realmFrameId);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  _fpSeed = __obscuraCore.ops.op_fingerprint_seed(Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0), _realmFrameId);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
