@@ -12445,6 +12445,66 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_text_can_cast_a_shadow_into_the_viewport() {
+        let tree = parse_html(r#"<html style="background:white"><body style="margin:0">
+            <div style="position:absolute;left:-90px;top:20px;font:40px Arial;color:transparent;
+                        text-shadow:100px 0 0 black">TEST</div>
+            <div style="position:absolute;left:160px;top:-200px;font:40px Arial;color:transparent;
+                        text-shadow:0 230px 0 black">TEST</div>
+            </body></html>"#);
+        let pixmap = paint_dom(&tree, (320.0, 100.0), None).expect("paint");
+        let ink = |left: u32, right: u32| (10..80).flat_map(|y| (left..right).map(move |x| (x, y)))
+            .filter(|&(x, y)| pixmap.pixel(x, y).is_some_and(|p| p.red() < 180)).count();
+        assert!(ink(10, 40) > 30, "leftmost glyph of horizontal shadow is missing");
+        assert!(ink(160, 260) > 100, "vertically translated shadow is missing");
+    }
+
+    #[test]
+    fn text_shadows_paint_multiple_inherited_layers() {
+        let tree = parse_html(r#"<html style="background:white"><body style="margin:0">
+            <div style="position:absolute;left:60px;top:20px;font:32px Arial;color:black;
+                        text-shadow:25px 0 0 red,-25px 0 0 blue"><span>X</span></div>
+            </body></html>"#);
+        let pixmap = paint_dom(&tree, (140.0, 80.0), None).expect("paint");
+        let mut red = 0;
+        let mut blue = 0;
+        for y in 15..65 {
+            for x in 20..120 {
+                let p = pixmap.pixel(x, y).unwrap();
+                if p.red() > 180 && p.green() < 100 && p.blue() < 100 { red += 1; }
+                if p.blue() > 180 && p.green() < 100 && p.red() < 100 { blue += 1; }
+            }
+        }
+        assert!(red > 10 && blue > 10, "red={red}, blue={blue}");
+    }
+
+    #[test]
+    fn text_shadow_first_layer_is_on_top_and_blur_extends_ink() {
+        let tree = parse_html(r#"<html style="background:white"><body style="margin:0">
+            <div style="position:absolute;left:30px;top:20px;font:32px Arial;color:transparent;
+                        text-shadow:0 0 0 red,0 0 0 blue">X</div>
+            <div style="position:absolute;left:90px;top:20px;font:32px Arial;color:transparent;
+                        text-shadow:0 0 6px black">X</div>
+            </body></html>"#);
+        let pixmap = paint_dom(&tree, (150.0, 80.0), None).expect("paint");
+        let mut red = 0;
+        let mut blue = 0;
+        let mut gray = 0;
+        for y in 5..65 {
+            for x in 20..70 {
+                let p = pixmap.pixel(x, y).unwrap();
+                if p.red() > 200 && p.green() < 80 && p.blue() < 80 { red += 1; }
+                if p.blue() > 200 && p.green() < 80 && p.red() < 80 { blue += 1; }
+            }
+            for x in 80..130 {
+                let p = pixmap.pixel(x, y).unwrap();
+                if p.red() > 20 && p.red() < 235 && p.red() == p.green() && p.red() == p.blue() { gray += 1; }
+            }
+        }
+        assert!(red > 10 && blue == 0 && gray > 20, "red={red}, blue={blue}, gray={gray}");
+    }
+
+    #[test]
     fn blur_filter_composites_descendants_as_one_group() {
         let tree = parse_html(r#"<html style="background:white"><body style="margin:0">
             <div style="position:absolute;left:20px;top:20px;filter:blur(4px)">

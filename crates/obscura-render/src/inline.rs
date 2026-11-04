@@ -780,6 +780,9 @@ pub struct InlineItem {
     /// Empty for ordinary IFCs and for nested inlines that remain at their
     /// normal-flow position, so paint pays no provenance cost on that path.
     relative_owner_ranges: Vec<RelativeOwnerTextRange>,
+    /// Text byte ranges with their computed shadow lists, allocated only for
+    /// an inline context that actually paints shadows.
+    shadow_ranges: Vec<ShadowRange>,
     /// Mixed-content IFCs own only this sibling range. Caret queries replay
     /// the collector on demand rather than retaining a map for every glyph.
     caret_run: Option<(NodeId, NodeId)>,
@@ -844,6 +847,13 @@ struct RelativeOwnerTextRange {
     start: usize,
     end: usize,
     offset: (f32, f32),
+}
+
+#[derive(Clone)]
+struct ShadowRange {
+    start: usize,
+    end: usize,
+    shadows: Arc<[crate::TextShadow]>,
 }
 
 /// One ordinary inline owner's horizontal continuation on a finalized visual
@@ -1279,6 +1289,121 @@ impl Default for TextEngine {
     }
 }
 
+fn paint_text_shadows(
+    font_system: &mut FontSystem,
+    swash: &mut SwashCache,
+    variable_swash: &mut VariableSwashCache,
+    item: &InlineItem,
+    pixmap: &mut tiny_skia::Pixmap,
+    origin: (f32, f32),
+    clip: Option<Rect>,
+    clip_mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
+    line_source_starts: &[usize],
+) {
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let mut mask = if clip.is_some() || clip_mask.is_some() { tiny_skia::Mask::new(width, height) } else { None };
+    if let Some(mask) = mask.as_mut() {
+        for (i, alpha) in mask.data_mut().iter_mut().enumerate() {
+            let x = (i % width as usize) as f32;
+            let y = (i / width as usize) as f32;
+            let inside = clip.is_none_or(|c| x >= c.x * raster_scale && y >= c.y * raster_scale
+                && x < (c.x + c.width) * raster_scale && y < (c.y + c.height) * raster_scale);
+            *alpha = if inside { clip_mask.and_then(|m| m.data().get(i)).copied().unwrap_or(255) } else { 0 };
+        }
+    }
+    for range in &item.shadow_ranges {
+        for shadow in range.shadows.iter().rev() {
+            let px = |dimension: Dimension| match dimension { Dimension::Px(v) if v.is_finite() => v, _ => 0.0 };
+            let sigma = px(shadow.blur).max(0.0) * raster_scale / 2.0;
+            let dx = px(shadow.offset_x) * raster_scale;
+            let dy = px(shadow.offset_y) * raster_scale;
+            if !sigma.is_finite() || !dx.is_finite() || !dy.is_finite() { continue; }
+            let mut bounds = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for (line_index, run) in item.buffer.layout_runs().enumerate() {
+                let line_offset = if line_index == 0 { item.first_line_offset } else { 0.0 };
+                let start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
+                let end = start + run.text.len();
+                let alignment = line_edge_alignment_shift(item, start, end);
+                for glyph in run.glyphs {
+                    if start + glyph.start >= range.end || start + glyph.end <= range.start { continue; }
+                    let mut relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                    relative.0 += alignment + line_advance_before_text(item, start + glyph.start, start, end);
+                    let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);
+                    let x = origin.0 + physical.x as f32;
+                    let y = origin.1 + run.line_y * raster_scale + physical.y as f32;
+                    let guard = (glyph.font_size * raster_scale * 2.0).max(4.0) + sigma * 3.0;
+                    bounds.0 = bounds.0.min(x - guard);
+                    bounds.1 = bounds.1.min(y - guard);
+                    bounds.2 = bounds.2.max(x + glyph.w * raster_scale + guard);
+                    bounds.3 = bounds.3.max(y + guard);
+                }
+            }
+            if !bounds.0.is_finite() { continue; }
+            // Clip in source space, before applying the shadow offset. Keep a
+            // bounded blur margin so offscreen glyphs can cast visible ink.
+            let margin = (sigma * 3.0).min(256.0);
+            let left = bounds.0.floor().max(-dx - margin) as i32;
+            let top = bounds.1.floor().max(-dy - margin) as i32;
+            let right = bounds.2.ceil().min(width as f32 - dx + margin) as i32;
+            let bottom = bounds.3.ceil().min(height as f32 - dy + margin) as i32;
+            if right <= left || bottom <= top { continue; }
+            let Ok(layer_width) = u32::try_from(i64::from(right) - i64::from(left)) else { continue };
+            let Ok(layer_height) = u32::try_from(i64::from(bottom) - i64::from(top)) else { continue };
+            let Some(mut layer) = tiny_skia::Pixmap::new(layer_width, layer_height) else { return };
+            for (line_index, run) in item.buffer.layout_runs().enumerate() {
+                let line_offset = if line_index == 0 { item.first_line_offset } else { 0.0 };
+                let start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
+                let end = start + run.text.len();
+                let alignment = line_edge_alignment_shift(item, start, end);
+                for glyph in run.glyphs {
+                    if start + glyph.start >= range.end || start + glyph.end <= range.start { continue; }
+                    if item.marker.is_some_and(|marker| marker.line_index == line_index
+                        && glyph.x + line_offset + glyph.w > marker.content_end) { continue; }
+                    let mut relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                    relative.0 += alignment + line_advance_before_text(item, start + glyph.start, start, end);
+                    let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);
+                    let glyph_color = glyph.color_opt.unwrap_or(Color::rgba(0, 0, 0, 255));
+                    let color = shadow.color.unwrap_or([glyph_color.r(), glyph_color.g(), glyph_color.b(), glyph_color.a()]);
+                    if color[3] == 0 { continue; }
+                    let pixels = layer.pixels_mut();
+                    let mut draw = |x: i32, y: i32, coverage: Color| {
+                        let px = i64::from(origin.0 as i32) + i64::from(physical.x) + i64::from(x) - i64::from(left);
+                        let py = i64::from(origin.1 as i32) + i64::from((run.line_y * raster_scale) as i32)
+                            + i64::from(physical.y) + i64::from(y) - i64::from(top);
+                        if px < 0 || py < 0 || px >= i64::from(layer_width) || py >= i64::from(layer_height) { return; }
+                        let index = py as usize * layer_width as usize + px as usize;
+                        let alpha = u32::from(coverage.a()) * u32::from(color[3]) / 255;
+                        let dst = pixels[index];
+                        let inv = 255 - alpha;
+                        let over = |source: u8, prior: u8| (u32::from(source) * alpha / 255 + u32::from(prior) * inv / 255) as u8;
+                        pixels[index] = tiny_skia::PremultipliedColorU8::from_rgba(
+                            over(color[0], dst.red()), over(color[1], dst.green()), over(color[2], dst.blue()),
+                            (alpha + u32::from(dst.alpha()) * inv / 255) as u8,
+                        ).unwrap_or(dst);
+                    };
+                    let explicit = metadata_variation(glyph.metadata)
+                        .and_then(|index| item.variation_sets.get(index)).map(Arc::clone);
+                    let variations = glyph.font_is_variable.then(|| variable_swash.effective_variations(
+                        font_system, physical.cache_key.font_id, glyph.font_weight_axis_opt,
+                        glyph.font_optical_size_opt, glyph.font_italic_axis, explicit,
+                    )).flatten();
+                    let base = Color::rgba(color[0], color[1], color[2], 255);
+                    if let Some(variations) = variations {
+                        variable_swash.with_pixels(font_system, physical.cache_key, variations, base, &mut draw);
+                    } else {
+                        swash.with_pixels(font_system, physical.cache_key, base, &mut draw);
+                    }
+                }
+            }
+            crate::paint::gaussian_blur_pixmap(&mut layer, sigma);
+            pixmap.draw_pixmap(left, top, layer.as_ref(), &tiny_skia::PixmapPaint::default(),
+                tiny_skia::Transform::from_translate(dx, dy),
+                mask.as_ref());
+        }
+    }
+}
+
 impl TextEngine {
     pub fn new() -> Self {
         Self::new_with_fonts(&[])
@@ -1525,6 +1650,7 @@ impl TextEngine {
             overline: context.overline,
             line_through: context.line_through,
             color: context.color,
+            text_shadow: context.text_shadow.clone(),
             family: context.family,
             clip_fill: context.clip_fill,
             white_space: context.white_space,
@@ -1620,7 +1746,20 @@ impl TextEngine {
         for event in &mut boundary_events {
             event.position = event.position.min(text_len);
         }
-        let owner_text = (!owner_boxes.is_empty()).then(|| {
+        let mut shadow_ranges: Vec<ShadowRange> = Vec::new();
+        let mut shadow_offset = 0;
+        for (text, attrs) in &spans {
+            let end = shadow_offset + text.len();
+            if let Some(shadows) = attrs.text_shadow.as_ref().filter(|s| !s.is_empty()) {
+                if let Some(previous) = shadow_ranges.last_mut().filter(|r| r.end == shadow_offset && r.shadows == *shadows) {
+                    previous.end = end;
+                } else {
+                    shadow_ranges.push(ShadowRange { start: shadow_offset, end, shadows: Arc::clone(shadows) });
+                }
+            }
+            shadow_offset = end;
+        }
+        let owner_text = (!owner_boxes.is_empty() || !shadow_ranges.is_empty()).then(|| {
             let mut text = String::with_capacity(text_len);
             for (span, _) in &spans {
                 text.push_str(span);
@@ -1817,6 +1956,7 @@ impl TextEngine {
             owner_boxes,
             boundary_events,
             relative_owner_ranges: Vec::new(),
+            shadow_ranges,
             caret_run: None,
             measured: Vec::new(),
         });
@@ -2352,6 +2492,7 @@ struct SpanAttrs {
     overline: bool,
     line_through: bool,
     color: [u8; 4],
+    text_shadow: Option<Arc<[crate::TextShadow]>>,
     family: Arc<str>,
     clip_fill: Option<usize>,
     white_space: crate::WhiteSpace,
@@ -2474,6 +2615,7 @@ struct SpanCtx {
     word_spacing: f32,
     letter_spacing_non_normal: bool,
     color: [u8; 4],
+    text_shadow: Option<Arc<[crate::TextShadow]>>,
     weight: u16,
     optical_sizing: crate::FontOpticalSizing,
     font_id: Option<cosmic_text::fontdb::ID>,
@@ -2629,6 +2771,7 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         word_spacing: base.word_spacing.unwrap_or(0.0),
         letter_spacing_non_normal: base.letter_spacing_non_normal.unwrap_or(false),
         color: base.color.unwrap_or([0, 0, 0, 255]),
+        text_shadow: base.text_shadow.clone(),
         weight: crate::style::used_font_weight(base),
         optical_sizing: base.font_optical_sizing.unwrap_or_default(),
         font_id: font.font_id,
@@ -2696,6 +2839,7 @@ fn collect_node_spans(
                 overline: ctx.overline,
                 line_through: ctx.line_through,
                 color: ctx.color,
+                text_shadow: ctx.text_shadow.clone(),
                 family: Arc::clone(&ctx.family),
                 clip_fill: ctx.clip_fill,
                 white_space: ctx.white_space,
@@ -2731,6 +2875,7 @@ fn collect_node_spans(
                         overline: ctx.overline,
                         line_through: ctx.line_through,
                         color: ctx.color,
+                        text_shadow: ctx.text_shadow.clone(),
                         family: Arc::clone(&ctx.family),
                         clip_fill: ctx.clip_fill,
                         white_space: ctx.white_space,
@@ -2799,6 +2944,7 @@ fn collect_node_spans(
                     .and_then(|style| style.letter_spacing_non_normal)
                     .unwrap_or(ctx.letter_spacing_non_normal),
                 color,
+                text_shadow: style.and_then(|s| s.text_shadow.clone()).or_else(|| ctx.text_shadow.clone()),
                 weight: requested_weight,
                 optical_sizing: style
                     .and_then(|style| style.font_optical_sizing)
@@ -3612,9 +3758,19 @@ fn inline_item_may_intersect_surface(
             relative_bottom = relative_bottom.max(range.offset.1);
         }
     }
+    let mut shadow_top = 0.0f32;
+    let mut shadow_bottom = 0.0f32;
+    for range in &item.shadow_ranges {
+        for shadow in range.shadows.iter() {
+            let offset = match shadow.offset_y { Dimension::Px(v) if v.is_finite() => v, _ => 0.0 };
+            let blur = match shadow.blur { Dimension::Px(v) if v.is_finite() => v.max(0.0) * 1.5, _ => 0.0 };
+            shadow_top = shadow_top.min(offset - blur);
+            shadow_bottom = shadow_bottom.max(offset + blur);
+        }
+    }
     let origin_y = item.origin.1 + offset.1;
-    let visual_top = origin_y + line_top + relative_top - ink_guard;
-    let visual_bottom = origin_y + line_bottom + relative_bottom + ink_guard;
+    let visual_top = origin_y + line_top + relative_top + shadow_top - ink_guard;
+    let visual_bottom = origin_y + line_bottom + relative_bottom + shadow_bottom + ink_guard;
     visual_top < surface_bottom && visual_bottom > 0.0
 }
 
@@ -3729,9 +3885,14 @@ impl TextEngine {
         let line_source_starts = item
             .owner_text
             .as_deref()
-            .filter(|_| !item.relative_owner_ranges.is_empty() || !item.boundary_events.is_empty())
+            .filter(|_| !item.relative_owner_ranges.is_empty() || !item.boundary_events.is_empty() || !item.shadow_ranges.is_empty())
             .map(|source| source_line_starts(&item.buffer, source))
             .unwrap_or_default();
+
+        if !item.shadow_ranges.is_empty() {
+            paint_text_shadows(font_system, swash, variable_swash, item, pixmap,
+                (ox, oy), clip, clip_mask, raster_scale, &line_source_starts);
+        }
 
         let mut underlines: Vec<(f32, f32, f32, f32, [u8; 4])> = Vec::new(); // x0, x1, y, thickness, color
         let mut fill_bounds: Vec<Option<(f32, f32, f32, f32)>> = vec![None; item.clip_fills.len()];
@@ -4812,6 +4973,7 @@ mod tests {
             overline: true,
             line_through: true,
             color: [1, 2, 3, 255],
+            text_shadow: None,
             family: Arc::from(FAMILY),
             clip_fill: Some(37),
             white_space: crate::WhiteSpace::Normal,
@@ -4895,6 +5057,7 @@ mod tests {
             overline: false,
             line_through: false,
             color: [0, 0, 0, 255],
+            text_shadow: None,
             family: Arc::from(FAMILY),
             clip_fill: None,
             white_space: crate::WhiteSpace::Normal,
