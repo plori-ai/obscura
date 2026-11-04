@@ -975,6 +975,55 @@ mod tests {
             serde_json::json!(["inline", "blocking", "inline-defer", "defer1", "defer2", "ready"]));
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_canvas_2d_uses_the_frame_document() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/",
+            "<html><body></body></html>",
+        ).expect("frame realm");
+        let pixels = frame.evaluate(&mut parent, r#"(() => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1; canvas.height = 1;
+            document.body.appendChild(canvas);
+            const context = canvas.getContext('2d');
+            if (!context) return null;
+            context.fillStyle = '#ff0000';
+            context.fillRect(0, 0, 1, 1);
+            return Array.from(context.getImageData(0, 0, 1, 1).data);
+        })()"#).unwrap();
+        assert_eq!(pixels, serde_json::json!([255, 0, 0, 255]));
+        let state = frame.realms.borrow().by_frame_id(1).unwrap();
+        assert_eq!(state.borrow().canvas_surfaces.len(), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_canvas_backing_budget_is_shared_and_released() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let first = FrameRealm::new(&mut parent, 1, 0, "https://first.example/", "<html></html>").unwrap();
+        let second = FrameRealm::new(&mut parent, 2, 0, "https://second.example/", "<html></html>").unwrap();
+        for frame in [&first, &second] {
+            assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+                const canvas = document.createElement('canvas');
+                canvas.width = 1; canvas.height = 1;
+                return !!canvas.getContext('2d');
+            })()"#).unwrap(), serde_json::json!(true));
+        }
+        let first_state = first.realms.borrow().by_frame_id(1).unwrap();
+        let second_state = second.realms.borrow().by_frame_id(2).unwrap();
+        let budget = first_state.borrow().canvas_bytes.clone();
+        assert!(Rc::ptr_eq(&budget, &second_state.borrow().canvas_bytes));
+        assert_eq!(budget.get(), 8);
+        drop(first_state);
+        drop(second_state);
+        drop(first);
+        assert_eq!(budget.get(), 4);
+        drop(second);
+        assert_eq!(budget.get(), 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn frame_posted_task_runs_in_its_creation_realm() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");

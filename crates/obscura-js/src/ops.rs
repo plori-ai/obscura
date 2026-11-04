@@ -114,6 +114,14 @@ pub(crate) struct CanvasBackingSurface {
     pub width: u32,
     pub height: u32,
     pub pixels: JsBuffer,
+    budget: Rc<Cell<usize>>,
+}
+
+#[cfg(feature = "render")]
+impl Drop for CanvasBackingSurface {
+    fn drop(&mut self) {
+        self.budget.set(self.budget.get().saturating_sub(self.pixels.len()));
+    }
 }
 
 const NAVIGATION_TIMING_FIELDS: [&str; 10] = [
@@ -533,6 +541,9 @@ pub struct ObscuraState {
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
+    /// Shared across the page and its frames to bound retained canvas memory.
+    #[cfg(feature = "render")]
+    pub(crate) canvas_bytes: Rc<Cell<usize>>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -603,6 +614,7 @@ impl ObscuraState {
         {
             let (reduce, dark) = parent.media_preferences.get();
             self.render_media = self.render_media.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+            self.canvas_bytes = parent.canvas_bytes.clone();
         }
         self.cookie_jar = parent.cookie_jar.clone();
         // A frame shares its page's Web Storage Arcs. The ops key by the frame
@@ -728,6 +740,8 @@ impl ObscuraState {
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
+            #[cfg(feature = "render")]
+            canvas_bytes: Rc::new(Cell::new(0)),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -7707,6 +7721,16 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     true
 }
 
+#[cfg(feature = "render")]
+fn canvas_frame_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 {
+        return Some(state.borrow::<SharedState>().clone());
+    }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?;
+    let frame = registry.borrow().by_frame_id(frame_id);
+    frame
+}
+
 /// Retain the JavaScript-owned Canvas2D pixel buffer without copying it. A
 /// canvas resize supplies a new fixed backing store and atomically replaces
 /// the previous surface for the same DOM node.
@@ -7718,6 +7742,16 @@ fn op_canvas_register_surface(
     width: u32,
     height: u32,
     #[buffer] pixels: JsBuffer,
+    frame_id: u32,
+) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        register_canvas_surface(state, nid, width, height, pixels, frame_id)
+    })).unwrap_or(false)
+}
+
+#[cfg(feature = "render")]
+fn register_canvas_surface(
+    state: &OpState, nid: u32, width: u32, height: u32, pixels: JsBuffer, frame_id: u32,
 ) -> bool {
     const MAX_CANVAS_DIMENSION: u32 = 32_767;
     const MAX_CANVAS_PIXELS: usize = 67_108_864;
@@ -7736,7 +7770,7 @@ fn op_canvas_register_surface(
         return false;
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let Some(shared) = canvas_frame_state(state, frame_id) else { return false };
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     let is_canvas = state
@@ -7754,25 +7788,24 @@ fn op_canvas_register_surface(
         .canvas_surfaces
         .get(&node)
         .map(|surface| surface.pixels.len());
-    let retained_bytes = state
-        .canvas_surfaces
-        .values()
-        .try_fold(0usize, |total, surface| {
-            total.checked_add(surface.pixels.len())
-        })
-        .and_then(|total| total.checked_sub(replacing.unwrap_or(0)))
+    let budget = state.canvas_bytes.clone();
+    let retained_bytes = budget.get()
+        .checked_sub(replacing.unwrap_or(0))
         .and_then(|total| total.checked_add(expected));
-    if retained_bytes.is_none_or(|bytes| bytes > MAX_CANVAS_SURFACE_BYTES) {
+    let Some(retained_bytes) = retained_bytes.filter(|bytes| *bytes <= MAX_CANVAS_SURFACE_BYTES) else {
         return false;
-    }
-    state.canvas_surfaces.insert(
+    };
+    let old = state.canvas_surfaces.insert(
         node,
         CanvasBackingSurface {
             width,
             height,
             pixels,
+            budget: budget.clone(),
         },
     );
+    drop(old);
+    budget.set(retained_bytes);
     true
 }
 
@@ -7781,8 +7814,15 @@ fn op_canvas_register_surface(
 /// screencast/readiness without throwing away otherwise-valid layout.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_canvas_paint_damage(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        canvas_paint_damage(state, nid, frame_id)
+    })).unwrap_or(false)
+}
+
+#[cfg(feature = "render")]
+fn canvas_paint_damage(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    let Some(shared) = canvas_frame_state(state, frame_id) else { return false };
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     if !state.canvas_surfaces.contains_key(&node) {
