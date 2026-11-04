@@ -8321,18 +8321,20 @@ globalThis.navigator = {
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
     getHighEntropyValues(hints) {
       var brands = _uaBrands();
-      return Promise.resolve({
+      var highEntropy = {
         architecture: "x86",
         bitness: "64",
-        brands: brands,
         fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
-        mobile: false,
         model: "",
-        platform: globalThis.__obscura_ua_platform || "Windows",
         platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
         uaFullVersion: _chromeMajor() + ".0.0.0",
         wow64: false,
-      });
+      };
+      var result = {brands: brands, mobile: false, platform: this.platform};
+      for (var hint of hints) {
+        if (Object.prototype.hasOwnProperty.call(highEntropy, hint)) result[hint] = highEntropy[hint];
+      }
+      return Promise.resolve(result);
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
