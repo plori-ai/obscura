@@ -19,6 +19,7 @@ struct NativeInterception {
     tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
     page_id: String,
     patterns: Vec<String>,
+    headers: std::collections::HashMap<String, String>,
 }
 
 impl NativeInterception {
@@ -37,7 +38,7 @@ impl NativeInterception {
         let id = obscura_js::ops::next_subresource_interception_id();
         let (resolver, resolution) = tokio::sync::oneshot::channel();
         if self.tx.send(InterceptedRequest { request_id: id.clone(), page_id: self.page_id.clone(),
-            url: url.to_string(), method: "GET".into(), headers: Default::default(),
+            url: url.to_string(), method: "GET".into(), headers: self.headers.clone(),
             resource_type: kind.into(), resolver }).is_err() { return Ok(None); }
         let response = match resolution.await.map_err(|_| "interception cancelled".to_string())? {
             InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
@@ -387,6 +388,9 @@ pub struct Page {
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
+    pub network_reporting_enabled: bool,
+    pub cdp_extra_headers: std::collections::HashMap<String, String>,
+    pub cdp_full_extra_headers: std::collections::HashMap<String, String>,
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
@@ -1210,6 +1214,9 @@ impl Page {
             response_body_order: std::collections::VecDeque::new(),
             network_event_counter: 0,
             intercept_enabled: false,
+            network_reporting_enabled: false,
+            cdp_extra_headers: std::collections::HashMap::new(),
+            cdp_full_extra_headers: std::collections::HashMap::new(),
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
@@ -2043,6 +2050,8 @@ impl Page {
         }
 
         rt.set_intercept_page_id(&self.id);
+        rt.set_network_reporting_enabled(self.network_reporting_enabled);
+        if !self.cdp_full_extra_headers.is_empty() { rt.set_extra_http_headers(self.cdp_full_extra_headers.clone()); }
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
         }
@@ -2172,7 +2181,7 @@ impl Page {
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
@@ -2620,7 +2629,7 @@ impl Page {
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
@@ -4549,7 +4558,7 @@ impl Page {
                 method: ev.method,
                 resource_type: ev.resource_type,
                 status: ev.status,
-                headers: std::collections::HashMap::new(),
+                headers: ev.request_headers,
                 response_headers: Arc::new(ev.response_headers),
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
@@ -4874,6 +4883,21 @@ impl Page {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
+        let mut headers = if self.network_reporting_enabled && matches!(resource_type, "Document" | "Script" | "Stylesheet" | "Image" | "Font") {
+            self.cdp_extra_headers.clone()
+        } else { std::collections::HashMap::new() };
+        if self.network_reporting_enabled && (url.starts_with("http://") || url.starts_with("https://"))
+            && !headers.keys().any(|name| name.eq_ignore_ascii_case("user-agent")) {
+            #[cfg(feature = "stealth")]
+            let stealth_ua = (resource_type != "Script").then(|| self.stealth_client.as_ref().map(|client| client.user_agent())).flatten();
+            #[cfg(not(feature = "stealth"))]
+            let stealth_ua: Option<&str> = None;
+            if let Some(ua) = stealth_ua {
+                headers.insert("User-Agent".into(), ua.to_string());
+            } else if let Ok(ua) = self.http_client.user_agent.try_read() {
+                headers.insert("User-Agent".into(), ua.clone());
+            }
+        }
         self.network_events.push(NetworkEvent {
             request_id: request_id.clone(),
             intercepted: false,
@@ -4881,7 +4905,7 @@ impl Page {
             method: method.to_string(),
             resource_type: resource_type.to_string(),
             status,
-            headers: std::collections::HashMap::new(),
+            headers,
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
@@ -5289,6 +5313,22 @@ impl Page {
         }
     }
 
+    pub fn set_network_reporting_enabled(&mut self, enabled: bool) {
+        self.network_reporting_enabled = enabled;
+        if let Some(js) = &self.js { js.set_network_reporting_enabled(enabled); }
+    }
+
+    pub fn set_cdp_extra_headers(&mut self, headers: std::collections::HashMap<String, String>) {
+        self.cdp_extra_headers = headers.iter().filter(|(name, _)| !matches!(name.to_ascii_lowercase().as_str(),
+            "cookie" | "origin" | "host" | "content-length" | "connection" | "accept-encoding"))
+            .filter(|(name, value)| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()
+                || b"!#$%&'*+-.^_`|~".contains(&b))
+                && value.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b)))
+            .map(|(name, value)| (name.clone(), value.clone())).collect();
+        self.cdp_full_extra_headers = headers.clone();
+        if let Some(js) = &self.js { js.set_extra_http_headers(headers); }
+    }
+
     pub fn enable_intercept(&mut self, enabled: bool) {
         self.intercept_enabled = enabled;
         if let Some(js) = &self.js {
@@ -5424,7 +5464,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()] };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], headers: Default::default() };
         let (result, (), wire) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
                 interception.fetch(&original, request, "Script", &client,
@@ -5469,7 +5509,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()] };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], headers: Default::default() };
         let (result, ()) = tokio::join!(
             interception.fetch(&original, request, "Script", &client,
                 #[cfg(feature = "stealth")] None, &callbacks),
@@ -5480,6 +5520,20 @@ mod tests {
             }
         );
         assert!(result.is_err(), "a rewritten private address must not reach transport");
+    }
+
+    #[test]
+    fn subscribed_native_network_events_include_explicit_headers() {
+        let context = Arc::new(BrowserContext::new("network-header-events".into()));
+        let mut page = Page::new("network-header-events".into(), context);
+        page.cdp_extra_headers.insert("X-Fixture".into(), "requested".into());
+        page.record_network_event_inner("https://example.test/", "GET", "Document", 200, &Default::default(), 0);
+        assert!(page.network_events.last().unwrap().headers.is_empty());
+        page.network_reporting_enabled = true;
+        page.record_network_event_inner("https://example.test/app.js", "GET", "Script", 200, &Default::default(), 0);
+        assert_eq!(page.network_events.last().unwrap().headers.get("X-Fixture").unwrap(), "requested");
+        assert_eq!(page.network_events.last().unwrap().headers.get("User-Agent").unwrap(),
+            &*page.http_client.user_agent.try_read().unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -91,6 +91,7 @@ pub struct CdpContext {
     /// Sessions that called Runtime.enable. Console and exception events are
     /// page-scoped but only delivered to these subscribers.
     pub runtime_enabled_sessions: HashSet<String>,
+    pub(crate) network_enabled_sessions: HashSet<String>,
     /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
     pub(crate) lifecycle_enabled_sessions: HashSet<String>,
     /// Reached phases of the current main-frame document, retained for late
@@ -203,6 +204,7 @@ impl CdpContext {
             preload_script_pages: HashMap::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
+            network_enabled_sessions: HashSet::new(),
             lifecycle_enabled_sessions: HashSet::new(),
             lifecycle_timestamps: HashMap::new(),
             preload_counter: 0,
@@ -382,6 +384,7 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.network_enabled_sessions.remove(session_id);
             self.lifecycle_enabled_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {

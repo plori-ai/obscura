@@ -1533,6 +1533,14 @@ impl ObscuraJsRuntime {
         state.intercept_enabled = enabled;
     }
 
+    pub fn set_network_reporting_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().network_reporting_enabled = enabled;
+    }
+
+    pub fn set_extra_http_headers(&self, headers: std::collections::HashMap<String, String>) {
+        self.state.borrow_mut().extra_http_headers = headers;
+    }
+
     pub fn set_intercept_page_id(&self, page_id: &str) {
         self.state.borrow_mut().intercept_page_id = page_id.to_string();
     }
@@ -23583,6 +23591,88 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_resource_destinations_survive_interception_fulfillment() {
         assert_script_fetch_xhr_destinations(true, false).await;
+    }
+
+    async fn assert_subscribed_fetch_network_headers(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            let client = std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true));
+            client.set_extra_headers([("x-extra".into(), "configured".into())].into_iter().collect()).await;
+            rt.set_stealth_client(client);
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        rt.set_network_reporting_enabled(true);
+        rt.set_extra_http_headers([("x-extra".into(), "configured".into())].into_iter().collect());
+        let load = rt.call_function_on_for_cdp(
+            "async () => (await fetch('/data', {headers:{'x-fetch':'fixture'}})).text()", None, &[], true, true,
+        );
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let wire = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(wire.contains("x-fetch: fixture"));
+            assert!(wire.contains("x-extra: configured"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            wire
+        };
+        let (result, wire) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, serve) })
+            .await.expect("fetch and fixture complete");
+        assert_eq!(result.unwrap().value.unwrap(), "ok");
+        let events = rt.take_js_network_events();
+        assert_eq!(events.last().unwrap().request_headers.get("x-fetch").unwrap(), "fixture");
+        assert_eq!(events.last().unwrap().request_headers.get("x-extra").unwrap(), "configured");
+        let user_agent = events.last().unwrap().request_headers.get("user-agent").unwrap().to_ascii_lowercase();
+        assert!(wire.contains(&format!("user-agent: {user_agent}")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribed_fetch_network_event_retains_explicit_request_headers() {
+        assert_subscribed_fetch_network_headers(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribed_stealth_fetch_network_event_retains_explicit_request_headers() {
+        assert_subscribed_fetch_network_headers(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intercepted_fetch_header_override_replaces_configured_stealth_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        let stealth = std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true));
+        stealth.set_extra_headers([("x-extra".into(), "configured".into())].into_iter().collect()).await;
+        rt.set_stealth_client(stealth);
+        rt.set_extra_http_headers([("x-extra".into(), "configured".into())].into_iter().collect());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx); rt.set_intercept_enabled(true);
+        let load = rt.call_function_on_for_cdp("async () => (await fetch('/data')).text()", None, &[], true, true);
+        let resolve = async {
+            rx.recv().await.unwrap().resolver.send(crate::ops::InterceptResolution::Continue {
+                url: None, method: None, headers: Some([("x-only".into(), "yes".into())].into_iter().collect()), body: None,
+            }).unwrap();
+        };
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096]; let n = socket.read(&mut buf).await.unwrap();
+            let wire = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(wire.contains("x-only: yes")); assert!(!wire.contains("x-extra:"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        };
+        let (result, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, resolve, serve) })
+            .await.expect("continued fetch completes");
+        assert_eq!(result.unwrap().value.unwrap(), "ok");
     }
 
     #[cfg(feature = "render")]

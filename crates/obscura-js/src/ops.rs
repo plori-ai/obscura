@@ -99,6 +99,7 @@ pub struct JsNetworkEvent {
     pub intercepted: bool,
     pub url: String,
     pub method: String,
+    pub request_headers: HashMap<String, String>,
     pub resource_type: String,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
@@ -389,6 +390,8 @@ pub struct ObscuraState {
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_enabled: bool,
+    pub network_reporting_enabled: bool,
+    pub extra_http_headers: HashMap<String, String>,
     /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
     /// sent to the interception channel; empty means every request.
     pub intercept_url_patterns: Vec<String>,
@@ -667,6 +670,8 @@ impl ObscuraState {
             intercept_tx: None,
             blob_urls: HashMap::new(),
             intercept_enabled: false,
+            network_reporting_enabled: false,
+            extra_http_headers: HashMap::new(),
             intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
@@ -3951,6 +3956,7 @@ async fn fetch_url_inner(
     body: JsBuffer, origin: String, mode: String, credentials: String,
     destination: String, cancel: Option<Rc<CancelHandle>>,
 ) -> Result<String, deno_error::JsErrorBox> {
+    const DEFAULT_FETCH_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
     let (resource_type, resource_type_name) = match destination.as_str() {
         "Script" => (ResourceType::Script, "Script"),
         "Stylesheet" => (ResourceType::Stylesheet, "Stylesheet"),
@@ -3967,7 +3973,8 @@ async fn fetch_url_inner(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client,
+        network_reporting_enabled, extra_http_headers, reported_stealth_ua) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -4011,6 +4018,12 @@ async fn fetch_url_inner(
         } else {
             None
         };
+        #[cfg(feature = "stealth")]
+        let reported_stealth_ua = if gs.network_reporting_enabled {
+            gs.stealth_client.as_ref().map(|client| client.user_agent().to_string())
+        } else { None };
+        #[cfg(not(feature = "stealth"))]
+        let reported_stealth_ua: Option<String> = None;
         (
             jar,
             in_flight,
@@ -4021,6 +4034,9 @@ async fn fetch_url_inner(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            gs.network_reporting_enabled,
+            if gs.extra_http_headers.is_empty() { None } else { Some(gs.extra_http_headers.clone()) },
+            reported_stealth_ua,
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -4054,6 +4070,7 @@ async fn fetch_url_inner(
         event: Some(JsNetworkEvent {
             request_id: request_id.clone(), intercepted: false,
             url: url.clone(), method: method.clone(), status: 0,
+            request_headers: HashMap::new(),
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
@@ -4068,7 +4085,6 @@ async fn fetch_url_inner(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    let mut was_intercepted = false;
     if let Some(tx) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
@@ -4083,7 +4099,6 @@ async fn fetch_url_inner(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            was_intercepted = true;
             network_guard.event.as_mut().unwrap().intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
@@ -4101,6 +4116,7 @@ async fn fetch_url_inner(
                         request_id: request_id.clone(), intercepted: true,
                         error_text: None,
                         url: url.clone(), method: method.clone(), status,
+                        request_headers: HashMap::new(),
                         resource_type: resource_type_name.to_string(),
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -4212,8 +4228,23 @@ async fn fetch_url_inner(
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
+    let replace_extra_headers = override_headers.is_some();
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    if network_reporting_enabled {
+        if let Some(event) = &mut network_guard.event {
+            event.request_headers = extra_http_headers.iter().filter(|_| !replace_extra_headers)
+                .flat_map(|headers| headers.iter()).chain(custom_headers.iter())
+                .filter(|(name, _)| !matches!(name.to_ascii_lowercase().as_str(),
+                "cookie" | "origin" | "host" | "content-length" | "connection" | "accept-encoding"))
+                .filter(|(name, value)| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()
+                    || b"!#$%&'*+-.^_`|~".contains(&b))
+                    && value.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b)))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.clone())).collect();
+            event.request_headers.entry("user-agent".into()).or_insert_with(||
+                reported_stealth_ua.unwrap_or_else(|| DEFAULT_FETCH_UA.to_string()));
+        }
+    }
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -4346,6 +4377,7 @@ async fn fetch_url_inner(
                 cancel,
                 network_guard,
                 resource_type,
+                replace_extra_headers,
             )
             .await;
         }
@@ -4360,7 +4392,16 @@ async fn fetch_url_inner(
     let mut current_body = body;
     // A mutable copy applied per hop: credential headers are dropped when a
     // redirect crosses origin, and body headers when the method downgrades.
-    let mut current_headers = custom_headers.clone();
+    let mut current_headers = match extra_http_headers.filter(|_| !replace_extra_headers) {
+        Some(mut extra) => {
+            for (name, value) in &custom_headers {
+                extra.retain(|existing, _| !existing.eq_ignore_ascii_case(name));
+                extra.insert(name.clone(), value.clone());
+            }
+            extra
+        }
+        None => custom_headers.clone(),
+    };
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
@@ -4407,7 +4448,7 @@ async fn fetch_url_inner(
         {
             req = req.header(
                 "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                DEFAULT_FETCH_UA,
             );
         }
 
@@ -4536,11 +4577,11 @@ async fn fetch_url_inner(
     let redirected = redirects_followed > 0;
     let status = response.status().as_u16();
 
-    let resp_headers: std::collections::HashMap<String, String> = response
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
+    let mut resp_headers = std::collections::HashMap::new();
+    for (name, value) in response.headers().iter() {
+        obscura_net::client::merge_response_header(&mut resp_headers, name.to_string(),
+            value.to_str().unwrap_or("").to_string());
+    }
 
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
@@ -4610,15 +4651,13 @@ async fn fetch_url_inner(
             }
         }
         if let Some(state) = body_state.upgrade() {
-            record_js_network_completion(&state, JsNetworkEvent {
-                request_id, intercepted: was_intercepted,
-                error_text: None,
-                url: current_url, method: current_method.as_str().to_string(), status,
-                resource_type: resource_type_name.to_string(),
-                response_headers: resp_headers, body_size: resp_bytes.len(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+            if let Some(mut event) = network_guard.event.take() {
+                event.url = current_url; event.method = current_method.as_str().to_string(); event.status = status;
+                event.response_headers = resp_headers; event.body_size = resp_bytes.len();
+                event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64();
+                record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+            }
         }
         network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
@@ -4669,6 +4708,7 @@ async fn stealth_fetch_all(
     cancel: Option<Rc<CancelHandle>>,
     network_guard: FetchNetworkGuard,
     resource_type: ResourceType,
+    replace_extra_headers: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -4716,7 +4756,7 @@ async fn stealth_fetch_all(
             }
         });
         let r = stealth
-            .send_single_headers_with_context(
+            .send_single_headers_with_context_override(
                 &current_method,
                 &parsed_current,
                 &req_headers,
@@ -4724,6 +4764,7 @@ async fn stealth_fetch_all(
                 cookie_context,
                 credentials_allowed,
                 fetch_max_body_bytes().min(64 * 1024 * 1024),
+                replace_extra_headers,
             )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
@@ -8937,7 +8978,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
 fn record_intercepted_image_completion(shared: &SharedState, id: &str, response: &Response) {
     let event = JsNetworkEvent {
         request_id: id.to_string(), intercepted: true, url: response.url.to_string(), method: "GET".into(),
-        resource_type: "Image".into(), status: response.status, response_headers: response.headers.clone(),
+        resource_type: "Image".into(), status: response.status, request_headers: HashMap::new(), response_headers: response.headers.clone(),
         body_size: response.body.len(), timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), error_text: None,
     };

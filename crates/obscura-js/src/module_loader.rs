@@ -331,6 +331,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                         event: Some(JsNetworkEvent {
                             request_id: request_id.clone(), intercepted: false,
                             url: url.clone(), method: "GET".to_string(),
+                            request_headers: Default::default(),
                             resource_type: "Script".to_string(), status: 0,
                             response_headers: Default::default(), body_size: 0,
                             timestamp: 0.0, error_text: None,
@@ -433,6 +434,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                             record_network_completion(&mut state, JsNetworkEvent {
                                 request_id, intercepted,
                                 url: resp.url.to_string(), method: "GET".to_string(),
+                                request_headers: Default::default(),
                                 resource_type: "Script".to_string(), status: resp.status,
                                 response_headers: resp.headers.clone(), body_size: resp.body.len(),
                                 timestamp: std::time::SystemTime::now()

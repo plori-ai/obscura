@@ -31,8 +31,21 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            if let Some(session) = session_id {
+                ctx.network_enabled_sessions.insert(session.clone());
+                if let Some(page_id) = ctx.sessions.get(session).cloned() {
+                    if let Some(page) = ctx.get_page_mut(&page_id) { page.set_network_reporting_enabled(true); }
+                }
+            }
+            Ok(json!({}))
+        }
         "disable" => {
+            if let Some(session) = session_id { ctx.network_enabled_sessions.remove(session); }
+            if let Some(page_id) = session_id.as_ref().and_then(|session| ctx.sessions.get(session)).cloned() {
+                let enabled = ctx.network_enabled_sessions.iter().any(|session| ctx.sessions.get(session) == Some(&page_id));
+                if let Some(page) = ctx.get_page_mut(&page_id) { page.set_network_reporting_enabled(enabled); }
+            }
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.clear_response_bodies();
             } else {
@@ -44,12 +57,18 @@ pub async fn handle(
         }
         "setExtraHTTPHeaders" => {
             let headers = params.get("headers").and_then(|v| v.as_object());
-            if let Some(page) = ctx.get_session_page(session_id) {
+            let page_id = session_id.as_ref().and_then(|session| ctx.sessions.get(session)).cloned();
+            if let Some(page) = page_id.as_deref().and_then(|page_id| ctx.get_page_mut(page_id)) {
                 if let Some(headers) = headers {
                     let header_map: std::collections::HashMap<String, String> = headers
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
+                    page.set_cdp_extra_headers(header_map.clone());
+                    #[cfg(feature = "stealth")]
+                    if let Some(stealth) = &page.stealth_client {
+                        stealth.set_extra_headers(header_map.clone()).await;
+                    }
                     page.http_client.set_extra_headers(header_map).await;
                 }
             }
@@ -255,6 +274,31 @@ mod tests {
         let mut ctx = CdpContext::new();
         assert!(handle("setRequestInterception", &json!({"patterns": [{"urlPattern": "*"}]}),
             &mut ctx, &None).await.unwrap_err().contains("Fetch.enable"));
+    }
+
+    #[tokio::test]
+    async fn network_subscription_is_scoped_to_each_session() {
+        let mut ctx = CdpContext::new();
+        let a = Some("a".to_string());
+        let b = Some("b".to_string());
+        handle("enable", &json!({}), &mut ctx, &a).await.unwrap();
+        handle("enable", &json!({}), &mut ctx, &b).await.unwrap();
+        handle("disable", &json!({}), &mut ctx, &a).await.unwrap();
+        assert!(!ctx.network_enabled_sessions.contains("a"));
+        assert!(ctx.network_enabled_sessions.contains("b"));
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn extra_http_headers_reach_plain_and_stealth_transports() {
+        let mut ctx = CdpContext::new_with_options(None, true);
+        let page_id = ctx.create_page();
+        let session = Some("headers-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        handle("setExtraHTTPHeaders", &json!({"headers": {"x-fixture": "requested"}}), &mut ctx, &session).await.unwrap();
+        let page = ctx.get_page(&page_id).unwrap();
+        assert_eq!(page.http_client.extra_headers.read().await.get("x-fixture").unwrap(), "requested");
+        assert_eq!(page.stealth_client.as_ref().unwrap().extra_headers.read().await.get("x-fixture").unwrap(), "requested");
     }
 
     #[tokio::test]

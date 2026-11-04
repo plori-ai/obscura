@@ -1026,6 +1026,7 @@ pub fn emit_navigation_events(
             ctx.pending_events.push(network_loading_failed(net_event, rid, es.clone(), error_text));
             continue;
         }
+        emit_response_extra_info(ctx, page_id, rid, net_event);
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
             params: json!({"requestId": rid, "loaderId": if net_event.resource_type == "Document" && net_event.intercepted
@@ -1121,6 +1122,24 @@ pub fn emit_navigation_events(
 
 pub(crate) fn cdp_resource_type(resource_type: &str) -> &str {
     if resource_type == "Fetch" { "XHR" } else { resource_type }
+}
+
+fn emit_response_extra_info(ctx: &mut CdpContext, page_id: &str, request_id: &str, event: &obscura_browser::NetworkEvent) {
+    // Synthetic fulfillments do not have network extra-info in Chromium.
+    // Continued intercepted requests currently share this flag, so omit them
+    // until the transport exposes whether a response actually came from wire.
+    if event.intercepted || event.status == 0 || !(event.url.starts_with("http://") || event.url.starts_with("https://")) {
+        return;
+    }
+    let mut sessions = ctx.sessions.iter().filter(|(session, page)| page.as_str() == page_id
+        && ctx.network_enabled_sessions.contains(*session)).map(|(session, _)| session.clone()).collect::<Vec<_>>();
+    sessions.sort_unstable();
+    for session in sessions {
+        ctx.pending_events.push(CdpEvent::with_session("Network.responseReceivedExtraInfo", json!({
+            "requestId": request_id, "blockedCookies": [], "headers": &*event.response_headers,
+            "resourceIPAddressSpace": "Unknown", "statusCode": event.status,
+        }), session));
+    }
 }
 
 /// Additional sessions observing the same target. Fetch pauses and lifecycle
@@ -1230,6 +1249,7 @@ pub(crate) fn emit_runtime_network_events(
             ctx.pending_events.push(network_loading_failed(network_event, request_id, session_id.clone(), error_text));
             continue;
         }
+        emit_response_extra_info(ctx, page_id, request_id, network_event);
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
             params: json!({
@@ -2566,6 +2586,32 @@ mod tests {
         assert_eq!(ctx.pending_events.iter().filter(|e| e.method.starts_with("Network."))
             .map(|e| e.method.as_str()).collect::<Vec<_>>(),
             ["Network.requestWillBeSent", "Network.loadingFailed"]);
+    }
+
+    #[test]
+    fn response_extra_info_preserves_cookies_for_subscribed_sessions() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions.insert("enabled".into(), page_id.clone());
+        ctx.sessions.insert("observer".into(), page_id.clone());
+        ctx.network_enabled_sessions.insert("enabled".into());
+        let event = obscura_browser::NetworkEvent {
+            request_id: "response-1".into(), intercepted: false, url: "https://example.test/".into(),
+            method: "GET".into(), resource_type: "Document".into(), status: 200, headers: Default::default(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([
+                ("set-cookie".into(), "first=1\nsecond=2".into()),
+            ])), body_size: 0, timestamp: 1.0, error_text: None,
+        };
+        emit_runtime_network_events(&mut ctx, &Some("enabled".into()), "frame", "https://example.test/",
+            &page_id, std::slice::from_ref(&event));
+        let extra: Vec<_> = ctx.pending_events.iter().filter(|event| event.method == "Network.responseReceivedExtraInfo").collect();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].session_id.as_deref(), Some("enabled"));
+        assert_eq!(extra[0].params["headers"]["set-cookie"], "first=1\nsecond=2");
+        ctx.pending_events.clear();
+        emit_runtime_network_events(&mut ctx, &Some("enabled".into()), "frame", "https://example.test/",
+            &page_id, &[obscura_browser::NetworkEvent { intercepted: true, ..event }]);
+        assert!(!ctx.pending_events.iter().any(|event| event.method == "Network.responseReceivedExtraInfo"));
     }
 
     #[test]
