@@ -19931,6 +19931,22 @@ mod tests {
     }
 
     #[test]
+    fn navigator_pdf_plugins_expose_their_mime_types() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const plugins = navigator.plugins, types = navigator.mimeTypes;
+            return [plugins.length, types.length,
+              Array.from(plugins, p => [p.length, plugins[p.name] === p,
+                Array.from(p, m => [m.type, m.enabledPlugin === p]),
+                p.namedItem('application/pdf').type, p[0] !== p[0]]),
+              Array.from(types, m => [m.type, m.enabledPlugin === plugins[0], types[m.type] === m])];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([5, 2,
+            vec![serde_json::json!([2, true, [["application/pdf", true], ["text/pdf", true]], "application/pdf", true]); 5],
+            [["application/pdf", true, true], ["text/pdf", true, true]]]));
+    }
+
+    #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ua = rt.evaluate("navigator.userAgent").unwrap();

@@ -8455,10 +8455,25 @@ globalThis.navigator = {
     new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
     new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
   ]);
+  // Chrome exposes the PDF MIME types on each plugin, with each type pointing
+  // back to the plugin that supplied it. A plugin lookup creates a fresh
+  // MimeType wrapper; the navigator-wide array below keeps its own objects.
+  for (const plugin of _plugins) {
+    for (const [index, type] of ['application/pdf', 'text/pdf'].entries()) {
+      const get = () => new MimeType(type, 'Portable Document Format', 'pdf', plugin);
+      Object.defineProperty(plugin, index, { get, enumerable: true, configurable: true });
+      Object.defineProperty(plugin, type, { get, enumerable: false, configurable: true });
+    }
+    plugin.length = 2;
+    Object.defineProperty(_plugins, plugin.name, { value: plugin, configurable: true });
+  }
   var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
+    new MimeType("application/pdf", "Portable Document Format", "pdf", _plugins[0]),
+    new MimeType("text/pdf", "Portable Document Format", "pdf", _plugins[0]),
   ]);
+  for (const mime of _mimeTypes) {
+    Object.defineProperty(_mimeTypes, mime.type, { value: mime, configurable: true });
+  }
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
