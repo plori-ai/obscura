@@ -12,6 +12,8 @@ pub struct BrowserContext {
     /// there in the next (issue #678).
     pub local_storage: Arc<OriginStorage>,
     pub indexed_db: Arc<obscura_js::indexed_db::IndexedDbStorage>,
+    /// Device fingerprint shared by all pages and frames in this context.
+    pub fingerprint_seed: i32,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     /// The UA the caller set explicitly (`--user-agent`), or `None` when the
@@ -42,6 +44,16 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+}
+
+fn fingerprint_seed() -> i32 {
+    // The default identity stays stable across contexts and process restarts.
+    // Profile rotation opts into a different device fingerprint per context.
+    if !crate::profiles::rotate_profile_enabled() {
+        return 0x4f62_7363;
+    }
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish() as i32
 }
 
 /// One origin's persisted `localStorage`. The origin is inside the file, so the
@@ -187,10 +199,22 @@ impl BrowserContext {
         }
         let profile = crate::profiles::select_profile();
         let user_agent_override = user_agent.clone();
-        let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
-        let platform = profile.platform.to_string();
-        let ua_platform = profile.ua_platform.to_string();
-        let ua_platform_version = profile.ua_platform_version.to_string();
+        let resolved_ua = user_agent.unwrap_or_else(|| {
+            #[cfg(feature = "stealth")]
+            if stealth { return obscura_net::STEALTH_USER_AGENT.to_string(); }
+            profile.user_agent.to_string()
+        });
+        #[cfg(feature = "stealth")]
+        let (platform, ua_platform, ua_platform_version) = if stealth {
+            (obscura_net::STEALTH_NAVIGATOR_PLATFORM.to_string(),
+                obscura_net::STEALTH_UA_PLATFORM.to_string(),
+                obscura_net::STEALTH_UA_PLATFORM_VERSION.to_string())
+        } else {
+            (profile.platform.to_string(), profile.ua_platform.to_string(), profile.ua_platform_version.to_string())
+        };
+        #[cfg(not(feature = "stealth"))]
+        let (platform, ua_platform, ua_platform_version) =
+            (profile.platform.to_string(), profile.ua_platform.to_string(), profile.ua_platform_version.to_string());
         // Sync the http client's UA at construction so navigation requests pick it
         // up before any async setup runs. The lock has no other holders here, so
         // try_write always succeeds; we fall back silently if it ever fails.
@@ -208,6 +232,7 @@ impl BrowserContext {
             cookie_jar,
             local_storage,
             indexed_db: Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()),
+            fingerprint_seed: fingerprint_seed(),
             http_client,
             user_agent: resolved_ua,
             user_agent_override,
@@ -285,6 +310,7 @@ impl BrowserContext {
             },
             indexed_db: if persistent { self.indexed_db.clone() }
                 else { Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()) },
+            fingerprint_seed: if persistent { self.fingerprint_seed } else { fingerprint_seed() },
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             user_agent_override: self.user_agent_override.clone(),
@@ -361,6 +387,29 @@ impl BrowserContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotated_contexts_choose_independent_fingerprint_seeds() {
+        std::env::set_var("OBSCURA_ROTATE_PROFILE", "1");
+        let source = BrowserContext::new("source".into());
+        let copies: std::collections::HashSet<_> = (0..8)
+            .map(|i| source.isolated_copy(format!("copy-{i}"), false).fingerprint_seed)
+            .collect();
+        assert!(copies.len() > 1);
+        assert_eq!(source.isolated_copy("persistent".into(), true).fingerprint_seed,
+            source.fingerprint_seed);
+    }
+
+    #[cfg(feature = "stealth")]
+    #[test]
+    fn stealth_context_identity_matches_the_transport() {
+        std::env::set_var("OBSCURA_PROFILE", "7");
+        let context = BrowserContext::with_options("stealth".into(), None, true);
+        assert_eq!(context.user_agent, obscura_net::STEALTH_USER_AGENT);
+        assert_eq!(context.platform, obscura_net::STEALTH_NAVIGATOR_PLATFORM);
+        assert_eq!(context.ua_platform, obscura_net::STEALTH_UA_PLATFORM);
+        assert_eq!(context.ua_platform_version, obscura_net::STEALTH_UA_PLATFORM_VERSION);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn with_full_options_propagates_user_agent_to_http_client() {

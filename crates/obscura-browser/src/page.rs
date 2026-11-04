@@ -1977,6 +1977,7 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_fingerprint_seed(self.context.fingerprint_seed);
         // Web Storage lives outside the realm so a navigation cannot drop it.
         rt.set_local_storage(self.context.local_storage.clone());
         rt.set_indexed_db(self.context.indexed_db.clone());
@@ -5226,6 +5227,35 @@ mod tests {
     use base64::Engine as _;
     use std::sync::Arc;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn context_fingerprint_survives_page_and_realm_recreation() {
+        let context = Arc::new(BrowserContext::new("identity-context".into()));
+        let mut page = Page::new("identity-one".into(), context.clone());
+        let probe = r#"(() => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 4; canvas.height = 4;
+            const context = canvas.getContext('2d');
+            context.fillRect(0, 0, 4, 4);
+            return [navigator.hardwareConcurrency, navigator.deviceMemory,
+                screen.width, screen.height, Array.from(context.getImageData(0, 0, 4, 4).data),
+                new AudioContext().createDynamicsCompressor().threshold.value];
+        })()"#;
+        let mut expected = None;
+        for i in 0..8 {
+            page.url = Some(url::Url::parse(&format!("https://origin{}.example/", i % 3)).unwrap());
+            page.dom = Some(parse_html("<html><body></body></html>"));
+            page.init_js();
+            let actual = page.evaluate_script(probe).unwrap();
+            if let Some(ref first) = expected { assert_eq!(&actual, first); }
+            else { expected = Some(actual); }
+        }
+        let mut other = Page::new("identity-two".into(), context);
+        other.url = Some(url::Url::parse("https://another.example/").unwrap());
+        other.dom = Some(parse_html("<html><body></body></html>"));
+        other.init_js();
+        assert_eq!(other.evaluate_script(probe).unwrap(), expected.unwrap());
+    }
 
     #[cfg(feature = "stealth")]
     #[test]

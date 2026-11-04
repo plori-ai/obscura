@@ -1276,6 +1276,11 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    /// Keep the browser context's fingerprint through page and realm rebuilds.
+    pub fn set_fingerprint_seed(&self, seed: i32) {
+        self.state.borrow().fingerprint_seed.set(Some(seed));
+    }
+
     /// Install the context-scoped `localStorage` backing store. The Arc lives on
     /// the BrowserContext, so entries outlive the V8 realm that wrote them.
     pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
@@ -6126,6 +6131,20 @@ mod tests {
                 0,
             ])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_navigator_uses_the_page_fingerprint() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-fingerprint", r#"
+            globalThis.__workerFingerprint = null;
+            const source = 'postMessage([navigator.hardwareConcurrency, navigator.deviceMemory, navigator.platform, navigator.userAgent])';
+            const worker = new Worker(URL.createObjectURL(new Blob([source], {type: 'text/javascript'})));
+            worker.onmessage = event => { __workerFingerprint = event.data; worker.terminate(); };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__workerFingerprint").unwrap(),
+            rt.evaluate("[navigator.hardwareConcurrency, navigator.deviceMemory, navigator.platform, navigator.userAgent]").unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]

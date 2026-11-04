@@ -361,7 +361,7 @@ pub struct ObscuraState {
     /// Last-Modified of this document response, if one was supplied.
     pub document_last_modified: Option<String>,
     /// Fingerprint noise is shared by all frames in a page.
-    fingerprint_seed: Rc<Cell<i32>>,
+    pub(crate) fingerprint_seed: Rc<Cell<Option<i32>>>,
     pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
@@ -662,7 +662,7 @@ impl ObscuraState {
             media_preferences: Rc::new(Cell::new((false, false))),
             referrer: String::new(),
             document_last_modified: None,
-            fingerprint_seed: Rc::new(Cell::new(0)),
+            fingerprint_seed: Rc::new(Cell::new(None)),
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
@@ -1303,14 +1303,17 @@ pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
     }
 }
 
-/// Initialize a page's fingerprint once and reuse it for every child realm.
+/// Initialize a standalone page's fingerprint once and reuse it in child realms.
+/// A browser context may supply a seed before the first realm is initialized.
 #[op2(fast)]
 fn op_fingerprint_seed(state: &OpState, seed: i32, frame_id: u32) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let shared = frame_state(state, frame_id);
         let state = shared.borrow();
-        if frame_id == 0 { state.fingerprint_seed.set(seed); }
-        state.fingerprint_seed.get()
+        if frame_id == 0 && state.fingerprint_seed.get().is_none() {
+            state.fingerprint_seed.set(Some(seed));
+        }
+        state.fingerprint_seed.get().unwrap_or(seed)
     })).unwrap_or(seed)
 }
 
