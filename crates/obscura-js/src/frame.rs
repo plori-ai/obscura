@@ -294,7 +294,8 @@ impl FrameRealm {
         serde_json::from_str(&json).map_err(|error| error.to_string())
     }
 
-    /// Runs the frame document's classic scripts, in document order.
+    /// Runs parser-blocking classic scripts in document order, then deferred
+    /// external classic scripts in document order, before DOMContentLoaded.
     ///
     /// `load_external` resolves a `src=` script to its source text; returning
     /// `None` skips it, which is what a failed subresource fetch looks like to
@@ -316,7 +317,9 @@ impl FrameRealm {
         };
 
         let mut problems = Vec::new();
-        for (index, script) in scripts.iter().enumerate() {
+        let parser_scripts = scripts.iter().enumerate().filter(|(_, script)| !script.is_deferred());
+        let deferred_scripts = scripts.iter().enumerate().filter(|(_, script)| script.is_deferred());
+        for (index, script) in parser_scripts.chain(deferred_scripts) {
             if !script.is_classic() {
                 if script.type_attribute == "module" {
                     problems.push(format!("frame module script {index} skipped: not supported"));
@@ -390,6 +393,8 @@ impl FrameRealm {
             dom.with_node(id, |node| DocumentScript {
                 src: node.get_attribute("src").unwrap_or("").to_string(),
                 type_attribute: node.get_attribute("type").unwrap_or("").to_lowercase(),
+                defer: node.get_attribute("defer").is_some(),
+                async_script: node.get_attribute("async").is_some(),
                 text,
             })
         }).collect())
@@ -399,10 +404,16 @@ impl FrameRealm {
 struct DocumentScript {
     src: String,
     type_attribute: String,
+    defer: bool,
+    async_script: bool,
     text: String,
 }
 
 impl DocumentScript {
+    fn is_deferred(&self) -> bool {
+        self.is_classic() && !self.src.is_empty() && self.defer && !self.async_script
+    }
+
     /// An empty type, or a JavaScript MIME type, is a classic script. Anything
     /// else is data or a module.
     fn is_classic(&self) -> bool {
@@ -936,6 +947,32 @@ mod tests {
             parent.evaluate("document.body.innerHTML").unwrap(),
             serde_json::json!("")
         );
+    }
+
+    #[test]
+    fn frame_runs_deferred_external_scripts_after_parser_scripts() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/",
+            r#"<html><head>
+               <script defer src="/first.js"></script>
+               <script>var fixtureConfig = {enabled: true}; window.log = ['inline'];
+                 document.addEventListener('DOMContentLoaded', () => window.log.push('ready'));</script>
+               <script defer src="/second.js"></script>
+               <script src="/blocking.js"></script>
+               <script defer>window.log.push('inline-defer');</script>
+               </head><body></body></html>"#,
+        ).expect("frame realm");
+        let problems = frame.run_document_scripts(&mut parent, |url| match url {
+            "https://child.example/first.js" => Some("const enabled = window.fixtureConfig.enabled; window.log.push(enabled ? 'defer1' : 'wrong');".into()),
+            "https://child.example/second.js" => Some("window.log.push('defer2');".into()),
+            "https://child.example/blocking.js" => Some("window.log.push('blocking');".into()),
+            _ => None,
+        });
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        frame.dispatch_load_events(&mut parent).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "window.log").unwrap(),
+            serde_json::json!(["inline", "blocking", "inline-defer", "defer1", "defer2", "ready"]));
     }
 
     #[tokio::test(flavor = "current_thread")]
