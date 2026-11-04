@@ -3006,7 +3006,8 @@ impl Page {
             js.record_navigation_timing("domInteractive");
             let _ = js.execute_script(
                 "<ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';",
+                "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { document.dispatchEvent(globalThis.__obscura_markTrusted(new Event('readystatechange'))); } catch(e) {}",
             );
         }
 
@@ -3103,11 +3104,15 @@ impl Page {
             // inserted by an onload handler is therefore post-load work and
             // remains pending until an explicit caller settle/wait.
             js.record_navigation_timing("domComplete");
+            let _ = js.execute_script(
+                "<ready-state-complete>",
+                "globalThis.__documentReadyState__ = 'complete';\n\
+                 try { document.dispatchEvent(globalThis.__obscura_markTrusted(new Event('readystatechange'))); } catch(e) {}",
+            );
             js.record_navigation_timing("loadEventStart");
             let completed = js.execute_script(
                 "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 try {\n\
+                "try {\n\
                    const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
                    try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
                  } catch(e) {}",
@@ -8883,6 +8888,30 @@ mod tests {
                 .unwrap(),
             serde_json::json!(true),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_dispatches_readystatechange_in_lifecycle_order() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(1),
+            "__states.push('defer:' + document.readyState);",
+        );
+        let mut page = import_map_test_page(
+            "ready-state-order", &base,
+            r#"<!doctype html><script>
+                globalThis.__states = ['inline:' + document.readyState];
+                document.addEventListener('readystatechange', event => __states.push(
+                    'rs:' + document.readyState + ':' + (performance.timing.loadEventStart === 0) + ':' + event.isTrusted));
+                document.addEventListener('DOMContentLoaded', () => __states.push('dom:' + document.readyState));
+                window.addEventListener('load', () => __states.push('load:' + document.readyState));
+            </script><script defer src="./deferred.js"></script>"#,
+        );
+        page.execute_scripts().await;
+        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/app/deferred.js");
+        assert_eq!(page.js.as_mut().unwrap().evaluate("__states").unwrap(), serde_json::json!([
+            "inline:loading", "rs:interactive:true:true", "defer:interactive",
+            "dom:interactive", "rs:complete:true:true", "load:complete"
+        ]));
     }
 
     #[tokio::test(flavor = "current_thread")]

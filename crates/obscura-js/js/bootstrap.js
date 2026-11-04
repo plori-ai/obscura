@@ -9041,7 +9041,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       const text = wantsText ? new TextDecoder().decode(buffer) : '';
 
       xhr.responseText = text;
-      xhr._setReadyState(3); // LOADING
+      if (buffer.byteLength > 0) xhr._setReadyState(3); // LOADING requires response bytes
 
       switch (xhr.responseType) {
         case 'json':
