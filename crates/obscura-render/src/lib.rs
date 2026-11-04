@@ -1663,6 +1663,10 @@ pub struct LayoutStyle {
     /// modern web rely on it for depth, and without it those elements paint
     /// flat. See [`BoxShadow`] and `paint::paint_box_shadow`.
     pub box_shadow: Option<BoxShadow>,
+    /// Gaussian standard deviations for a supported filter list. Relative
+    /// lengths resolve against the element font and viewport at paint time.
+    /// `Some` with zero radii still establishes a stacking context.
+    pub filter_blur: Option<Box<[Dimension]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

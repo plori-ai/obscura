@@ -1939,7 +1939,20 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "rotate" => parse_individual_rotate(style, value),
         "scale" => parse_individual_scale(style, value),
         "filter" => {
-            set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, non_none_value(value))
+            if let Some(blur) = parse_blur_filter(value) {
+                set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, blur.is_some());
+                style.filter_blur = blur;
+            } else {
+                // A later recognized CSS filter function replaces a
+                // prior blur even though that other effect is not painted yet.
+                let lower = value.trim().to_ascii_lowercase();
+                if ["brightness(", "contrast(", "grayscale(", "opacity(", "drop-shadow(",
+                    "saturate(", "sepia(", "invert(", "hue-rotate(", "url("]
+                    .iter().any(|prefix| lower.starts_with(prefix)) && lower.ends_with(')') {
+                    style.filter_blur = None;
+                }
+                set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, non_none_value(value));
+            }
         }
         "backdrop-filter" | "-webkit-backdrop-filter" => set_containing_block_trigger(
             style,
@@ -2393,7 +2406,8 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
         // bookkeeping. Advertising an effect that is not painted is worse
         // than a conservative false result because feature queries commonly
         // use them to select the only visible implementation of an effect.
-        "filter" | "backdrop-filter" | "-webkit-backdrop-filter" | "perspective" => {
+        "filter" => parse_blur_filter(value).is_some(),
+        "backdrop-filter" | "-webkit-backdrop-filter" | "perspective" => {
             value.eq_ignore_ascii_case("none")
         }
         "contain" => value.eq_ignore_ascii_case("none"),
@@ -8737,6 +8751,32 @@ fn parse_background_position(value: &str) -> crate::BackgroundPosition {
 }
 
 /// Parse a `box-shadow` value into its first layer:
+/// Parse a list of Gaussian blur filters. Consecutive blurs combine by adding
+/// their variances. Unsupported filter functions remain outside this subset.
+fn parse_blur_filter(value: &str) -> Option<Option<Box<[crate::Dimension]>>> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.eq_ignore_ascii_case("none") { return Some(None); }
+    let mut rest = value.as_str();
+    let mut radii = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix("blur(")?;
+        let end = rest.find(')')?;
+        let inner = rest[..end].trim();
+        let radius = if inner.is_empty() { crate::Dimension::Px(0.0) } else { dimension_value(inner) };
+        let amount = match radius {
+            crate::Dimension::Px(v) | crate::Dimension::Em(v) | crate::Dimension::Ex(v)
+            | crate::Dimension::Rem(v) | crate::Dimension::Vw(v) | crate::Dimension::Vh(v)
+            | crate::Dimension::Vmin(v) | crate::Dimension::Vmax(v) => v,
+            _ => return None,
+        };
+        if !amount.is_finite() || amount < 0.0 { return None; }
+        if inner.parse::<f32>().ok().is_some_and(|v| v != 0.0) { return None; }
+        radii.push(radius);
+        rest = rest[end + 1..].trim_start();
+    }
+    (!radii.is_empty()).then(|| Some(radii.into_boxed_slice()))
+}
+
 /// `[inset]? <offset-x> <offset-y> <blur>? <spread>? <color>?`. The `inset`
 /// keyword and the color may each lead or trail the lengths; comma-separated
 /// multiples are accepted but only the first layer is stored. `current_color`
@@ -8924,7 +8964,12 @@ mod tests {
         for value in ["normal", "break-all", "keep-all", "break-word"] {
             assert!(supports_declaration("word-break", value), "{value}");
         }
-        for property in ["filter", "backdrop-filter", "-webkit-backdrop-filter"] {
+        assert!(supports_declaration("filter", "blur(2px)"));
+        assert!(supports_declaration("filter", "blur(0.5em) blur(1rem)"));
+        assert!(supports_declaration("filter", "blur(1px)blur(2px)"));
+        assert!(!supports_declaration("filter", "blur(-2px)"));
+        assert!(!supports_declaration("filter", "blur(5%)"));
+        for property in ["backdrop-filter", "-webkit-backdrop-filter"] {
             assert!(supports_declaration(property, "none"), "{property}");
             assert!(!supports_declaration(property, "blur(2px)"), "{property}");
         }

@@ -3730,6 +3730,9 @@ fn stacking_z_index(
     if style.display == crate::Display::None || style.display_contents {
         return None;
     }
+    if style.filter_blur.is_some() {
+        return Some(style.z_index.unwrap_or(0));
+    }
     // Fixed and sticky positioned boxes establish stacking contexts even
     // when their used z-index is `auto`. Treat that context as stack level
     // zero so a high-z descendant cannot escape above a later sibling layer.
@@ -3757,6 +3760,18 @@ fn stacking_z_index(
         return is_flex_or_grid.then_some(z);
     }
     None
+}
+
+fn filter_blur_radius(style: &crate::LayoutStyle, root_font_size: f32, viewport: (f32, f32)) -> f32 {
+    let Some(radii) = style.filter_blur.as_ref() else { return 0.0 };
+    let font_size = style.font_size.unwrap_or(16.0);
+    let variance = radii.iter().fold(0.0f64, |sum, radius| {
+        match radius.resolve(font_size, root_font_size, viewport.0 / 100.0, viewport.1 / 100.0) {
+            crate::Dimension::Px(value) if value.is_finite() => sum + f64::from(value).powi(2),
+            _ => sum,
+        }
+    });
+    variance.sqrt().min(f64::from(f32::MAX)) as f32
 }
 
 /// Whether this box participates in the float painting band of its current
@@ -4157,8 +4172,8 @@ fn paint_laid_dom_scrolled(
             && laid
                 .styles
                 .get(&nid)
-                .and_then(|style| style.opacity)
-                .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
+                .is_some_and(|style| style.opacity.is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0)
+                    || filter_blur_radius(style, root_font_size, viewport) > 0.0);
         let is_transform_root = suppress_transform_for != Some(nid)
             && laid.styles.get(&nid).is_some_and(has_authored_transform);
         let z = (suppress_stacking_for != Some(nid))
@@ -4573,7 +4588,8 @@ fn paint_laid_dom_scrolled(
             .and_then(|style| style.opacity)
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
-        if suppress_opacity_for != Some(nid) && own_opacity < 1.0 {
+        let blur = filter_blur_radius(style, root_font_size, viewport);
+        if suppress_opacity_for != Some(nid) && (own_opacity < 1.0 || blur > 0.0) {
             opacity_subtree_skip.insert(nid);
             opacity_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
             if own_opacity <= 0.0 {
@@ -4583,7 +4599,7 @@ fn paint_laid_dom_scrolled(
             // each primitive. Otherwise two opaque overlapping children at
             // opacity:.5 incorrectly become .75 alpha in their overlap.
             let layer = Pixmap::new(pixmap.width(), pixmap.height())?;
-            let layer = paint_laid_dom_scrolled(
+            let mut layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
                 base_url,
@@ -4611,6 +4627,9 @@ fn paint_laid_dom_scrolled(
                 print_economy,
                 canvas_background,
             )?;
+            if blur > 0.0 {
+                gaussian_blur_pixmap(&mut layer, blur * raster_scale);
+            }
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
                 ..tiny_skia::PixmapPaint::default()
@@ -6787,6 +6806,55 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
         channel(color[2]),
         color[3],
     ]
+}
+
+/// Approximate a Gaussian using three separable box filters. Work is linear in
+/// surface pixels, including for very large author-provided blur radii.
+pub(crate) fn gaussian_blur_pixmap(pixmap: &mut Pixmap, sigma: f32) {
+    if !sigma.is_finite() || sigma <= 0.0 { return; }
+    let sigma = f64::from(sigma);
+    let ideal = (4.0 * sigma * sigma + 1.0).sqrt();
+    let mut lower = ideal.floor().max(1.0) as u32;
+    if lower % 2 == 0 { lower -= 1; }
+    let upper = lower.saturating_add(2);
+    let l = f64::from(lower);
+    let count = ((12.0 * sigma * sigma - 3.0 * l * l - 12.0 * l - 9.0)
+        / (-4.0 * l - 4.0)).round().clamp(0.0, 3.0) as usize;
+    let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
+    let mut src = pixmap.data().to_vec();
+    let mut dst = vec![0u8; src.len()];
+    for pass in 0..3 {
+        let radius = (if pass < count { lower } else { upper } / 2) as usize;
+        if radius == 0 { continue; }
+        box_blur_axis(&src, &mut dst, width, height, radius, true);
+        box_blur_axis(&dst, &mut src, width, height, radius, false);
+    }
+    pixmap.data_mut().copy_from_slice(&src);
+}
+
+fn box_blur_axis(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize, horizontal: bool) {
+    let (lines, length) = if horizontal { (height, width) } else { (width, height) };
+    let divisor = (radius as u64).saturating_mul(2).saturating_add(1);
+    for line in 0..lines {
+        let index = |p: usize| if horizontal { (line * width + p) * 4 } else { (p * width + line) * 4 };
+        let mut sum = [0u64; 4];
+        for p in 0..length.min(radius.saturating_add(1)) {
+            let i = index(p);
+            for channel in 0..4 { sum[channel] += u64::from(src[i + channel]); }
+        }
+        for p in 0..length {
+            let i = index(p);
+            for channel in 0..4 { dst[i + channel] = ((sum[channel] + divisor / 2) / divisor) as u8; }
+            if p >= radius {
+                let i = index(p - radius);
+                for channel in 0..4 { sum[channel] -= u64::from(src[i + channel]); }
+            }
+            if let Some(next) = p.checked_add(radius).and_then(|v| v.checked_add(1)).filter(|&v| v < length) {
+                let i = index(next);
+                for channel in 0..4 { sum[channel] += u64::from(src[i + channel]); }
+            }
+        }
+    }
 }
 
 /// Paint an outset `box-shadow` layer behind the element's own box. `rect` is
@@ -12374,6 +12442,24 @@ mod tests {
         assert!(blue.blue() > 240 && blue.red() < 20 && blue.green() < 20);
         assert!(red.red() > 240 && red.green() < 20 && red.blue() < 20);
         assert!(yellow.red() > 240 && yellow.green() > 240 && yellow.blue() < 20);
+    }
+
+    #[test]
+    fn blur_filter_composites_descendants_as_one_group() {
+        let tree = parse_html(r#"<html style="background:white"><body style="margin:0">
+            <div style="position:absolute;left:20px;top:20px;filter:blur(4px)">
+              <div style="width:30px;height:30px;background:black"></div>
+            </div>
+            <div style="position:absolute;left:80px;top:20px;width:30px;height:30px;background:black"></div>
+            </body></html>"#);
+        let pixmap = paint_dom(&tree, (140.0, 80.0), None).expect("paint");
+        let outside = pixmap.pixel(18, 35).unwrap();
+        let edge = pixmap.pixel(20, 35).unwrap();
+        let center = pixmap.pixel(35, 35).unwrap();
+        assert!(outside.red() < 255 && outside.red() > edge.red());
+        assert!(edge.red() > center.red(), "outside={outside:?} edge={edge:?} center={center:?}");
+        assert_eq!(pixmap.pixel(78, 35).unwrap().red(), 255);
+        assert_eq!(pixmap.pixel(80, 35).unwrap().red(), 0);
     }
 
     #[test]
