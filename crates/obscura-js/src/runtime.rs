@@ -24662,12 +24662,12 @@ mod tests {
                 const observer = new MutationObserver((mutations) => {
                     calls++;
                     records += mutations.length;
-                    if (calls < 50) body.style.setProperty("top", "0px", "important");
+                    if (calls < 50) body.style.setProperty("top", "0px");
                 });
                 observer.observe(document.documentElement, {
                     subtree: true, attributes: true, attributeFilter: ["style"],
                 });
-                body.style.setProperty("top", "0px", "important");
+                body.style.setProperty("top", "0px");
                 await new Promise((resolve) => setTimeout(resolve, 20));
                 body.style.removeProperty("left");
                 body.style.top = "0px";
