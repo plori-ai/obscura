@@ -59,9 +59,9 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
-// The wreq emulation (Profile::Chrome132, Platform::Windows) sends this exact
+// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
 // UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
 // site cross-checks the mismatch as a bot signal.
@@ -216,7 +216,7 @@ impl StealthHttpClient {
         allow_private_network: bool,
     ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome132)
+            .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
             .build();
 
@@ -295,7 +295,7 @@ impl StealthHttpClient {
     }
 
     /// Overrides the emulation's User-Agent for every request (`--user-agent`).
-    /// `None` keeps the Chrome132/Windows emulation UA untouched.
+    /// `None` keeps the Chrome145/Windows emulation UA untouched.
     pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
         self.user_agent = user_agent;
         self
