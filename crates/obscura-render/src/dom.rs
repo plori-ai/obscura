@@ -4781,18 +4781,119 @@ pub fn accessibility_styles_without_layout(
 
 /// Cheap negative check used before scheduling CSS animation lifecycle work.
 /// False positives are harmless: the ordinary cascade checks keyframe names.
+fn document_contains_animation_text(tree: &DomTree, needles: &[&[u8]], inline_style: bool) -> bool {
+    fn contains(source: &str, needles: &[&[u8]]) -> bool {
+        let bytes = source.as_bytes();
+        needles.iter().any(|needle| bytes.windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle)))
+    }
+    // External sources are Arc-backed: avoid cloning their text for a negative check.
+    if tree.external_stylesheets().values().any(|sheet| {
+        sheet.sources.iter().any(|source| contains(source, needles))
+            || sheet.cssom_rules.as_ref().is_some_and(|rules|
+                rules.iter().any(|rule| contains(rule, needles)))
+    }) { return true; }
+    let has_shadow = tree.has_shadow_roots();
+    let mut roots = vec![tree.document()];
+    let mut remaining = tree.len();
+    while let Some(root) = roots.pop() {
+        for node in tree.descendants(root) {
+            if remaining == 0 { return true; }
+            remaining -= 1;
+            if has_shadow {
+                if let Some(shadow) = tree.shadow_root(node) { roots.push(shadow); }
+            }
+            let (is_style, inline_match) = tree.with_node(node, |node| (
+                node.as_element().is_some_and(|element| element.local.as_ref() == "style"),
+                inline_style && node.get_attribute("style").is_some_and(|value| contains(value, needles)),
+            )).unwrap_or_default();
+            if inline_match || (is_style && contains(&tree.text_content(node), needles)) { return true; }
+        }
+    }
+    false
+}
+
 pub fn document_may_have_keyframes(
     tree: &DomTree,
-    viewport: (f32, f32),
-    media_type: crate::CssMediaType,
+    _viewport: (f32, f32),
+    _media_type: crate::CssMediaType,
 ) -> bool {
-    fn contains_rule(source: &str) -> bool {
-        let source = source.to_ascii_lowercase();
-        source.contains("@keyframes") || source.contains("@-webkit-keyframes")
+    document_contains_animation_text(tree, &[b"@keyframes", b"@-webkit-keyframes"], false)
+}
+
+// Avoid compiling a whole stylesheet when every animation declaration has a
+// simple class selector and none of those classes exists. Any syntax outside
+// this small, unambiguous subset falls back to the ordinary cascade.
+fn simple_animation_selectors_may_match(tree: &DomTree) -> bool {
+    fn scan(source: &str, classes: &mut Vec<String>) -> Option<()> {
+        if !source.as_bytes().windows(9).any(|w| w.eq_ignore_ascii_case(b"animation")) {
+            return Some(());
+        }
+        if source.bytes().any(|b| matches!(b, b'\\' | b'\'' | b'"' | b'/')) { return None; }
+        let bytes = source.as_bytes();
+        let mut start = 0;
+        let mut depth = 0usize;
+        let mut header = "";
+        let mut body = 0;
+        for (i, byte) in bytes.iter().enumerate() {
+            match *byte {
+                b'{' => {
+                    if depth == 0 { header = source[start..i].trim(); body = i + 1; }
+                    depth += 1;
+                }
+                b'}' => {
+                    if depth == 0 { return None; }
+                    depth -= 1;
+                    if depth != 0 { continue; }
+                    let content = &source[body..i];
+                    if header.to_ascii_lowercase().starts_with("@keyframes ")
+                        || header.to_ascii_lowercase().starts_with("@-webkit-keyframes ") {
+                        start = i + 1; continue;
+                    }
+                    if content.contains('{') {
+                        if content.as_bytes().windows(9).any(|w| w.eq_ignore_ascii_case(b"animation")) { return None; }
+                        start = i + 1; continue;
+                    }
+                    let has_animation = content.split(';').any(|declaration| declaration.split_once(':')
+                        .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("animation")
+                            || name.trim().eq_ignore_ascii_case("animation-name")));
+                    if has_animation {
+                        let Some(class) = header.strip_prefix('.') else { return None; };
+                        if class.is_empty() || !class.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                            return None;
+                        }
+                        classes.push(class.to_string());
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 || source[start..].contains('{') { return None; }
+        Some(())
     }
-    document_stylesheet_sources(tree, viewport, media_type).iter().any(|s| contains_rule(s))
-        || collect_shadow_stylesheet_sources(tree, viewport, media_type)
-            .values().flatten().any(|s| contains_rule(s))
+    if tree.has_shadow_roots() { return true; }
+    let mut classes = Vec::new();
+    for sheet in tree.external_stylesheets().values() {
+        for source in &sheet.sources { if scan(source, &mut classes).is_none() { return true; } }
+        if let Some(rules) = &sheet.cssom_rules {
+            for rule in rules { if scan(rule, &mut classes).is_none() { return true; } }
+        }
+    }
+    let nodes = tree.descendants(tree.document());
+    for &id in &nodes {
+        let (style, inline) = tree.with_node(id, |node| (
+            node.as_element().is_some_and(|element| element.local.as_ref() == "style"),
+            node.get_attribute("style").is_some_and(|value| value.as_bytes().windows(9)
+                .any(|w| w.eq_ignore_ascii_case(b"animation"))),
+        )).unwrap_or_default();
+        if inline { return true; }
+        if style && scan(&tree.text_content(id), &mut classes).is_none() { return true; }
+    }
+    if classes.is_empty() { return false; }
+    nodes.into_iter().any(|id| tree.with_node(id, |node| node.get_attribute("class")
+        .is_some_and(|value| value.split_ascii_whitespace().any(|name| classes.iter().any(|class| class.eq_ignore_ascii_case(name)))))
+        .unwrap_or(false))
 }
 
 /// Check potentially matching animation declarations without building layout.
@@ -4802,6 +4903,10 @@ pub fn document_may_start_css_animation(
     media_type: crate::CssMediaType,
     cache: &mut crate::css::StylesheetCache,
 ) -> bool {
+    // A document with keyframes but no animation declarations need not parse
+    // and retain its stylesheet merely to discover an empty timeline.
+    if !document_contains_animation_text(tree, &[b"animation"], true) { return false; }
+    if !simple_animation_selectors_may_match(tree) { return false; }
     // Shadow sheets have separate scopes and selectors. Only defer to the
     // complete cascade when their sources or inline styles could animate.
     for (root, sources) in collect_shadow_stylesheet_sources(tree, viewport, media_type) {

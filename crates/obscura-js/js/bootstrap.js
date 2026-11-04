@@ -169,7 +169,7 @@ let _cssAnimationHasRules = false;
 let _cssAnimationCheckRules = true;
 let _cssAnimationRefreshPending = false;
 let _cssAnimationGeneration = 0;
-const _cssAnimationInstances = new Map();
+let _cssAnimationInstances = null;
 
 const _dom = (cmd, a1, a2) => {
   let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
@@ -8802,7 +8802,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
-  const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
+  const pageOrigin = _realmOrigin();
   const initSignal = init.signal;
   const inputSignal = initSignal !== undefined ? initSignal : (request ? request.signal : null);
   if (inputSignal != null && !_abortSignalState(inputSignal)) {
@@ -12164,12 +12164,14 @@ function _scheduleCssAnimationRefresh(checkRules = false) {
   });
 }
 function _cssAnimationMutation(cmd, a1, a2) {
+  if (!_cssAnimationHasRules && (cmd === 'set_attribute' || cmd === 'remove_attribute')
+      && !/^(?:rel|href|media|disabled)(?:\0|$)/i.test(String(a2 || ''))) return;
   const mayContainSheet = (node, descendants) => {
     if (!node) return false;
     if (node.nodeType === 3) node = node.parentNode;
     if (!node) return false;
     if (node.localName === 'style' || node.localName === 'link') return true;
-    return descendants && !!(_domParse('query_selector_all_scoped', node._nid,
+    return descendants && node.hasChildNodes() && !!(_domParse('query_selector_all_scoped', node._nid,
       'style,link[rel~="stylesheet"]') || []).length;
   };
   const sheetChanged = ((cmd === 'set_inner_html' || cmd === 'set_inner_html_context'
@@ -12198,7 +12200,9 @@ function _refreshCssAnimations() {
   catch (_) { return; }
   if (check) _cssAnimationHasRules = rows !== null;
   rows ||= [];
-  const live = new Map(rows.map(row => [row[0], row[1]]));
+  if (!rows.length && !_cssAnimationInstances?.size) return;
+  _cssAnimationInstances ||= new Map();
+  const live = new Map(rows.map(row => [row[0] + ':' + row[7], row[1]]));
   for (const [id, instance] of _cssAnimationInstances) {
     if (live.get(id) === instance.name) continue;
     if (instance.timer !== undefined) _cancelScheduled(instance.timer);
@@ -12209,13 +12213,14 @@ function _refreshCssAnimations() {
     }
     _cssAnimationInstances.delete(id);
   }
-  for (const [id, name, local, duration, delay, count, paused] of rows) {
-    let instance = _cssAnimationInstances.get(id);
+  for (const [id, name, local, duration, delay, count, paused, index] of rows) {
+    const key = id + ':' + index;
+    let instance = _cssAnimationInstances.get(key);
     if (!instance) {
       const target = _wrapEl(id);
       if (!target) continue;
       instance = { name, target, started: false, ended: false, iteration: 0 };
-      _cssAnimationInstances.set(id, instance);
+      _cssAnimationInstances.set(key, instance);
     }
     if (instance.timer !== undefined) { _cancelScheduled(instance.timer); instance.timer = undefined; }
     if (instance.ended) continue;
@@ -16326,7 +16331,7 @@ class _Canvas2D {
         this._buf.byteOffset,
         this._buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+      if (!register(this.canvas._nid, this._w, this._h, bytes, _realmFrameId)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
@@ -16337,7 +16342,7 @@ class _Canvas2D {
     queueMicrotask(() => {
       this._damageQueued = false;
       const damage = __obscuraCore.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas._nid);
+      if (typeof damage === 'function') damage(this.canvas._nid, _realmFrameId);
     });
   }
   _parseColor(css) {
@@ -17335,7 +17340,8 @@ globalThis.Worker = class Worker {
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
       postMessage: (msg) => {
         if (worker._terminated) return;
-        const evt = { data: msg };
+        const evt = new MessageEvent('message', { data: msg });
+        _trustedEvents.add(evt);
         if (worker.onmessage) worker.onmessage(evt);
         const ls = worker._listeners['message'] || [];
         for (const h of ls) h(evt);
@@ -17408,7 +17414,8 @@ globalThis.Worker = class Worker {
       if (worker._terminated || !worker._scope) return;
       const scope = worker._scope;
       try {
-        const event = { data };
+        const event = new MessageEvent('message', { data });
+        _trustedEvents.add(event);
         if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
         const evs = (scope._ev && scope._ev['message']) || [];
         for (const handler of evs.slice()) handler.call(scope, event);
@@ -19277,10 +19284,12 @@ globalThis.__obscura_init_frames = function() {
 
 globalThis.__obscura_init = (function() {
   _cssAnimationGeneration++;
-  for (const instance of _cssAnimationInstances.values()) {
-    if (instance.timer !== undefined) _cancelScheduled(instance.timer);
+  if (_cssAnimationInstances) {
+    for (const instance of _cssAnimationInstances.values()) {
+      if (instance.timer !== undefined) _cancelScheduled(instance.timer);
+    }
+    _cssAnimationInstances = null;
   }
-  _cssAnimationInstances.clear();
   _cssAnimationWatching = false;
   _cssAnimationHasRules = false;
   _cssAnimationCheckRules = true;
@@ -19315,7 +19324,7 @@ globalThis.__obscura_init = (function() {
     // Track animations even when no listener was present at their start;
     // listeners installed later must not receive a replayed start event.
     _eventTargetAdd(document, 'DOMContentLoaded', _watchCssAnimations);
-    if (+_dom('query_selector', '[onanimationstart],[onanimationend],[onanimationiteration],[onanimationcancel]') > 0) {
+    if (_dom('has_animation_handler') === 'true') {
       _watchCssAnimations();
     }
   }

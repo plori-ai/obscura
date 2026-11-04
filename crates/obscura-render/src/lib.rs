@@ -1479,6 +1479,8 @@ pub struct LayoutStyle {
     /// before author `!important`, matching the animation cascade origin.
     pub animation_name: Option<String>,
     pub animation_timing: AnimationTiming,
+    /// Additional list state is allocated only for comma-separated controls.
+    pub(crate) animation_lists: Option<Box<AnimationLists>>,
     /// True when the selected keyframes contain at least one property this
     /// renderer can sample. Unsupported custom-property-only animations must
     /// not keep layout or screencast damage active forever.
@@ -2038,6 +2040,34 @@ pub enum AnimationPlayState {
     Paused,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AnimationLists {
+    pub names: Vec<Option<String>>,
+    pub durations: Vec<f32>,
+    pub delays: Vec<f32>,
+    pub iterations: Vec<f32>,
+    pub directions: Vec<AnimationDirection>,
+    pub fills: Vec<AnimationFillMode>,
+    pub states: Vec<AnimationPlayState>,
+}
+
+impl AnimationLists {
+    pub(crate) fn from_style(style: &LayoutStyle) -> Self {
+        let timing = style.animation_timing;
+        Self { names: vec![style.animation_name.clone()], durations: vec![timing.duration_ms],
+            delays: vec![timing.delay_ms], iterations: vec![timing.iteration_count],
+            directions: vec![timing.direction], fills: vec![timing.fill_mode], states: vec![timing.play_state] }
+    }
+    pub(crate) fn timing(&self, index: usize) -> AnimationTiming {
+        AnimationTiming { duration_ms: self.durations[index % self.durations.len()],
+            delay_ms: self.delays[index % self.delays.len()],
+            iteration_count: self.iterations[index % self.iterations.len()],
+            direction: self.directions[index % self.directions.len()],
+            fill_mode: self.fills[index % self.fills.len()],
+            play_state: self.states[index % self.states.len()] }
+    }
+}
+
 /// Timing fields for the first CSS animation. Milliseconds are used
 /// internally so `s`, `ms`, negative delays, and calculated stagger values
 /// share one unit.
@@ -2072,6 +2102,7 @@ pub(crate) struct AnimationInstanceKey {
 
 #[derive(Debug, Clone)]
 struct AnimationInstance {
+    id: u64,
     key: AnimationInstanceKey,
     start_ms: f32,
     hold_time_ms: Option<f32>,
@@ -2119,7 +2150,8 @@ pub struct WaapiAnimation {
 #[derive(Debug, Clone, Default)]
 pub struct AnimationTimelineState {
     display_suppressed: std::collections::HashSet<obscura_dom::tree::NodeId>,
-    instances: std::collections::HashMap<obscura_dom::tree::NodeId, AnimationInstance>,
+    instances: std::collections::HashMap<obscura_dom::tree::NodeId, Vec<Option<AnimationInstance>>>,
+    next_css_animation_id: u64,
     start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
     subtree_start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
     waapi: std::collections::BTreeMap<u64, WaapiAnimation>,
@@ -2301,6 +2333,7 @@ impl AnimationTimelineState {
     pub(crate) fn sample_for(
         &mut self,
         node: obscura_dom::tree::NodeId,
+        index: usize,
         key: AnimationInstanceKey,
         timing: AnimationTiming,
         sample: AnimationSample,
@@ -2310,33 +2343,25 @@ impl AnimationTimelineState {
         }
         let document_time_ms = sample.time.milliseconds;
         let was_suppressed = self.display_suppressed.remove(&node);
-        let transition_time_ms = self.start_candidates.remove(&node);
-        let retained = self
-            .instances
-            .get_mut(&node)
-            .filter(|instance| instance.key == key);
-        let instance = match retained {
-            Some(instance) => instance,
-            None => {
-                let candidate = transition_time_ms.unwrap_or(if was_suppressed {
-                    document_time_ms
-                } else {
-                    0.0
-                });
-                let paused = timing.play_state == AnimationPlayState::Paused;
-                self.instances.insert(
-                    node,
-                    AnimationInstance {
-                        key,
-                        start_ms: if paused { document_time_ms } else { candidate },
-                        hold_time_ms: paused.then_some(0.0),
-                        was_paused: paused,
-                        timing,
-                    },
-                );
-                self.instances.get_mut(&node).expect("inserted animation instance")
-            }
+        let transition_time_ms = if was_suppressed {
+            Some(*self.start_candidates.entry(node).or_insert(document_time_ms))
+        } else {
+            self.start_candidates.get(&node).copied()
         };
+        let slots = self.instances.entry(node).or_default();
+        if slots.len() <= index { slots.resize_with(index + 1, || None); }
+        if slots[index].as_ref().is_none_or(|instance| instance.key != key) {
+            let candidate = transition_time_ms.unwrap_or(0.0);
+            let paused = timing.play_state == AnimationPlayState::Paused;
+            self.next_css_animation_id = self.next_css_animation_id.wrapping_add(1);
+            slots[index] = Some(AnimationInstance {
+                id: self.next_css_animation_id,
+                key,
+                start_ms: if paused { document_time_ms } else { candidate },
+                hold_time_ms: paused.then_some(0.0), was_paused: paused, timing,
+            });
+        }
+        let Some(instance) = slots[index].as_mut() else { return sample.time; };
 
         let paused = timing.play_state == AnimationPlayState::Paused;
         if paused && !instance.was_paused {
@@ -2357,12 +2382,37 @@ impl AnimationTimelineState {
     }
 
     /// Animation instances whose names resolve to keyframes in the current style.
-    pub fn css_animation_instances(&self, now_ms: f32) -> Vec<(u32, String, f32, AnimationTiming)> {
-        self.instances.iter().map(|(node, instance)| (
-            node.raw(), instance.key.name.clone(),
-            instance.hold_time_ms.unwrap_or_else(|| (now_ms - instance.start_ms).max(0.0)),
-            instance.timing,
-        )).collect()
+    pub fn css_animation_instances(&self, now_ms: f32) -> Vec<(u32, u64, String, f32, AnimationTiming)> {
+        let mut result = Vec::new();
+        for (node, slots) in &self.instances {
+            for instance in slots {
+                if let Some(instance) = instance {
+                    result.push((node.raw(), instance.id, instance.key.name.clone(),
+                        instance.hold_time_ms.unwrap_or_else(|| (now_ms - instance.start_ms).max(0.0)),
+                        instance.timing));
+                }
+            }
+        }
+        result.sort_unstable_by_key(|row| (row.0, row.1));
+        result
+    }
+
+    pub(crate) fn retain_css_animation_indices(&mut self, node: obscura_dom::tree::NodeId,
+        names: &[Option<&str>], sample: AnimationSample) {
+        if sample.mode != AnimationSampleMode::DocumentTime { return; }
+        if let Some(slots) = self.instances.get_mut(&node) {
+            // CSS matches animations by name from the end of each list, so
+            // reordering names does not restart an existing animation.
+            let mut previous = std::mem::take(slots);
+            slots.resize_with(names.len(), || None);
+            for index in (0..names.len()).rev() {
+                let Some(name) = names[index] else { continue; };
+                if let Some(old) = previous.iter().rposition(|slot| slot.as_ref()
+                    .is_some_and(|instance| instance.key.name == name)) {
+                    slots[index] = previous[old].take();
+                }
+            }
+        }
     }
 
     /// Discard CSS instances when no keyframes can match; WAAPI is independent.

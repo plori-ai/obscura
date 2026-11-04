@@ -24,7 +24,7 @@
 
 use std::rc::Rc;
 
-use obscura_dom::parse_html;
+use obscura_dom::{parse_html, NodeId};
 
 use crate::ops::{ObscuraState, RealmStates};
 use crate::runtime::ObscuraJsRuntime;
@@ -294,7 +294,8 @@ impl FrameRealm {
         serde_json::from_str(&json).map_err(|error| error.to_string())
     }
 
-    /// Runs the frame document's classic scripts, in document order.
+    /// Runs parser-blocking classic scripts in document order, then deferred
+    /// external classic scripts in document order, before DOMContentLoaded.
     ///
     /// `load_external` resolves a `src=` script to its source text; returning
     /// `None` skips it, which is what a failed subresource fetch looks like to
@@ -315,8 +316,19 @@ impl FrameRealm {
             Err(error) => return vec![error],
         };
 
+        // Parser-prepared scripts must remain started if page code later moves
+        // their node or an ancestor. Keep data scripts eligible if their type
+        // is changed to JavaScript before insertion, as in Chrome.
+        if let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) {
+            state.borrow().already_started_scripts.borrow_mut().extend(scripts.iter()
+                .filter(|script| (script.is_classic() || script.type_attribute == "module")
+                    && (!script.src.is_empty() || !script.text.trim().is_empty()))
+                .map(|script| script.nid));
+        }
         let mut problems = Vec::new();
-        for (index, script) in scripts.iter().enumerate() {
+        let parser_scripts = scripts.iter().enumerate().filter(|(_, script)| !script.is_deferred());
+        let deferred_scripts = scripts.iter().enumerate().filter(|(_, script)| script.is_deferred());
+        for (index, script) in parser_scripts.chain(deferred_scripts) {
             if !script.is_classic() {
                 if script.type_attribute == "module" {
                     problems.push(format!("frame module script {index} skipped: not supported"));
@@ -388,8 +400,11 @@ impl FrameRealm {
         Ok(nodes.into_iter().filter_map(|id| {
             let text = dom.text_content(id);
             dom.with_node(id, |node| DocumentScript {
+                nid: id,
                 src: node.get_attribute("src").unwrap_or("").to_string(),
                 type_attribute: node.get_attribute("type").unwrap_or("").to_lowercase(),
+                defer: node.get_attribute("defer").is_some(),
+                async_script: node.get_attribute("async").is_some(),
                 text,
             })
         }).collect())
@@ -397,12 +412,19 @@ impl FrameRealm {
 }
 
 struct DocumentScript {
+    nid: NodeId,
     src: String,
     type_attribute: String,
+    defer: bool,
+    async_script: bool,
     text: String,
 }
 
 impl DocumentScript {
+    fn is_deferred(&self) -> bool {
+        self.is_classic() && !self.src.is_empty() && self.defer && !self.async_script
+    }
+
     /// An empty type, or a JavaScript MIME type, is a classic script. Anything
     /// else is data or a module.
     fn is_classic(&self) -> bool {
@@ -900,6 +922,28 @@ mod tests {
         assert_eq!(frame.evaluate(&mut parent, "window.dynamicScriptRuns").unwrap().as_i64(), Some(1));
     }
 
+    #[test]
+    fn moving_parsed_frame_script_subtree_does_not_rerun_script() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/",
+            r#"<html><head><script id="data" type="text/plain">
+                window.dataRuns = (window.dataRuns || 0) + 1;
+            </script></head><body><div id="container"><script>
+                window.runs = (window.runs || 0) + 1;
+            </script></div></body></html>"#,
+        ).expect("frame realm");
+        assert!(frame.run_document_scripts(&mut parent, |_| None).is_empty());
+        frame.execute_script(&mut parent, r#"
+            document.body.appendChild(document.getElementById('container'));
+            const data = document.getElementById('data');
+            data.type = 'text/javascript';
+            document.body.appendChild(data);
+        "#).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "[window.runs, window.dataRuns]").unwrap(),
+            serde_json::json!([1, 1]));
+    }
+
     /// The capability the frame realm exists for: scripts that arrived with the
     /// frame's document run, in order, against the frame's own DOM.
     #[test]
@@ -951,6 +995,81 @@ mod tests {
             parent.evaluate("document.body.innerHTML").unwrap(),
             serde_json::json!("")
         );
+    }
+
+    #[test]
+    fn frame_runs_deferred_external_scripts_after_parser_scripts() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/",
+            r#"<html><head>
+               <script defer src="/first.js"></script>
+               <script>var fixtureConfig = {enabled: true}; window.log = ['inline'];
+                 document.addEventListener('DOMContentLoaded', () => window.log.push('ready'));</script>
+               <script defer src="/second.js"></script>
+               <script src="/blocking.js"></script>
+               <script defer>window.log.push('inline-defer');</script>
+               </head><body></body></html>"#,
+        ).expect("frame realm");
+        let problems = frame.run_document_scripts(&mut parent, |url| match url {
+            "https://child.example/first.js" => Some("const enabled = window.fixtureConfig.enabled; window.log.push(enabled ? 'defer1' : 'wrong');".into()),
+            "https://child.example/second.js" => Some("window.log.push('defer2');".into()),
+            "https://child.example/blocking.js" => Some("window.log.push('blocking');".into()),
+            _ => None,
+        });
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        frame.dispatch_load_events(&mut parent).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, "window.log").unwrap(),
+            serde_json::json!(["inline", "blocking", "inline-defer", "defer1", "defer2", "ready"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_canvas_2d_uses_the_frame_document() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/",
+            "<html><body></body></html>",
+        ).expect("frame realm");
+        let pixels = frame.evaluate(&mut parent, r#"(() => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1; canvas.height = 1;
+            document.body.appendChild(canvas);
+            const context = canvas.getContext('2d');
+            if (!context) return null;
+            context.fillStyle = '#ff0000';
+            context.fillRect(0, 0, 1, 1);
+            return Array.from(context.getImageData(0, 0, 1, 1).data);
+        })()"#).unwrap();
+        assert_eq!(pixels, serde_json::json!([255, 0, 0, 255]));
+        let state = frame.realms.borrow().by_frame_id(1).unwrap();
+        assert_eq!(state.borrow().canvas_surfaces.len(), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_canvas_backing_budget_is_shared_and_released() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let first = FrameRealm::new(&mut parent, 1, 0, "https://first.example/", "<html></html>").unwrap();
+        let second = FrameRealm::new(&mut parent, 2, 0, "https://second.example/", "<html></html>").unwrap();
+        for frame in [&first, &second] {
+            assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+                const canvas = document.createElement('canvas');
+                canvas.width = 1; canvas.height = 1;
+                return !!canvas.getContext('2d');
+            })()"#).unwrap(), serde_json::json!(true));
+        }
+        let first_state = first.realms.borrow().by_frame_id(1).unwrap();
+        let second_state = second.realms.borrow().by_frame_id(2).unwrap();
+        let budget = first_state.borrow().canvas_bytes.clone();
+        assert!(Rc::ptr_eq(&budget, &second_state.borrow().canvas_bytes));
+        assert_eq!(budget.get(), 8);
+        drop(first_state);
+        drop(second_state);
+        drop(first);
+        assert_eq!(budget.get(), 4);
+        drop(second);
+        assert_eq!(budget.get(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
