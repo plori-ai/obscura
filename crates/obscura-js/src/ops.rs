@@ -358,6 +358,8 @@ pub struct ObscuraState {
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
     pub referrer: String,
+    /// Last-Modified of this document response, if one was supplied.
+    pub document_last_modified: Option<String>,
     pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
@@ -422,7 +424,7 @@ pub struct ObscuraState {
     // `op_frame_document_ready` queues here and the Page drains it between
     // event loop turns. Same shape as `pending_binding_calls`.
     pub pending_frames: Vec<PendingFrame>,
-    /// Total URL and HTML bytes held by `pending_frames`.
+    /// Total URL, HTML, and response metadata bytes held by `pending_frames`.
     pub pending_frame_bytes: usize,
     pub frame_id_counter: u32,
     /// Which frame this state belongs to; 0 is the page's own realm.
@@ -580,6 +582,7 @@ pub struct PendingFrame {
     pub frame_id: u32,
     pub url: String,
     pub html: String,
+    pub last_modified: Option<String>,
     pub viewport_width: u64,
     pub viewport_height: u64,
     /// The frame that holds this one; 0 when the page does.
@@ -655,6 +658,7 @@ impl ObscuraState {
             title: String::new(),
             media_preferences: Rc::new(Cell::new((false, false))),
             referrer: String::new(),
+            document_last_modified: None,
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
@@ -2478,6 +2482,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .unwrap_or("\"\"".into())
         }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
+        "document_last_modified" => serde_json::to_string(&gs.document_last_modified).unwrap_or("null".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_content_type" => {
             serde_json::to_string(&gs.content_type).unwrap_or("\"text/html\"".into())
@@ -6649,6 +6654,7 @@ fn op_frame_document_ready(
     state: &OpState,
     #[string] url: &str,
     #[string] html: &str,
+    #[string] last_modified: &str,
     #[number] viewport_width: u64,
     #[number] viewport_height: u64,
     owner_node: u32,
@@ -6660,7 +6666,7 @@ fn op_frame_document_ready(
     let parent_frame_id = parent.borrow().frame_id;
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
-    let bytes = url.len().saturating_add(html.len());
+    let bytes = url.len().saturating_add(html.len()).saturating_add(last_modified.len());
     if gs.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
         || gs.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
     {
@@ -6681,6 +6687,7 @@ fn op_frame_document_ready(
         frame_id,
         url: url.to_string(),
         html: html.to_string(),
+        last_modified: (!last_modified.is_empty()).then(|| last_modified.to_string()),
         viewport_width,
         viewport_height,
         parent_frame_id,
@@ -6838,6 +6845,7 @@ fn op_initial_frame(
             parent_frame_id,
             url: frame_url.to_string(),
             html: String::new(),
+            last_modified: None,
             viewport_width: 300,
             viewport_height: 150,
         });

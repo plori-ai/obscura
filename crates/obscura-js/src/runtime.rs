@@ -1408,6 +1408,11 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().referrer = referrer.to_string();
     }
 
+    /// Set the response's Last-Modified header for the current document.
+    pub fn set_document_last_modified(&self, value: Option<&str>) {
+        self.state.borrow_mut().document_last_modified = value.map(str::to_owned);
+    }
+
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
         self.state.borrow_mut().blocked_urls = patterns;
     }
@@ -9456,6 +9461,21 @@ mod tests {
             detached,
             serde_json::json!(["Detached title", "  Detached   title  ", ""])
         );
+    }
+
+    #[test]
+    fn document_last_modified_uses_document_response_or_current_time() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/.test(document.lastModified)"#).unwrap(), serde_json::json!(true));
+        rt.set_document_last_modified(Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+        let result = rt.evaluate(r#"(() => {
+            const d = new Date('Wed, 21 Oct 2015 07:28:00 GMT');
+            const p = n => String(n).padStart(2, '0');
+            return document.lastModified === `${p(d.getMonth()+1)}/${p(d.getDate())}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(true));
+        rt.set_document_last_modified(Some("invalid date"));
+        assert_eq!(rt.evaluate(r#"/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/.test(document.lastModified)"#).unwrap(), serde_json::json!(true));
     }
 
     #[test]

@@ -5330,7 +5330,8 @@ class Element extends Node {
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
+          loadedUrl, html, response.headers?.['last-modified'] || '',
+          Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = el._iframeOpaque ? null : new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = el._iframeOpaque ? _remoteWindow(el._frameId) : new _IframeWindow(el._iframeDoc, loadedUrl);
@@ -6609,6 +6610,15 @@ class Document extends Node {
     this._effectiveDomain = candidate;
   }
   get referrer() { return this._detached ? "" : (_domParse("document_referrer") ?? ""); }
+  get lastModified() {
+    const get = _documentRealmMember(this, 'lastModified');
+    if (get) return Reflect.apply(get, this, []);
+    const value = this._detached ? null : _domParse('document_last_modified');
+    const parsed = value ? Date.parse(value) : NaN;
+    const d = new Date(Number.isFinite(parsed) ? parsed : Date.now());
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getMonth() + 1)}/${p(d.getDate())}/${String(d.getFullYear()).padStart(4, '0')} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
   get location() { return this._detached ? null : globalThis.location; }
   set location(url) {
     if (this._detached) return;
