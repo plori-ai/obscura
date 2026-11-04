@@ -16738,20 +16738,302 @@ globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { construct
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
 globalThis.MediaStreamTrack = class MediaStreamTrack { constructor(){this.kind='';this.enabled=true;this.readyState='live';} stop(){} clone(){return new MediaStreamTrack();} };
+const _rtcStates = new WeakMap();
+const _rtcAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function _rtcRandom(length) {
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(bytes, b => _rtcAlphabet[b & 63]).join('');
+}
+function _rtcSessionId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  bytes[0] &= 127;
+  let value = 0n;
+  for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+  return String(value);
+}
+function _rtcHandler(target, type, value) {
+  const state = _rtcStates.get(target);
+  const old = state.handlers[type];
+  if (old) _eventTargetRemove(target, type, old);
+  state.handlers[type] = typeof value === 'function' ? value : null;
+  if (state.handlers[type]) _eventTargetAdd(target, type, state.handlers[type]);
+}
+function _rtcEvent(target, type, candidate) {
+  const event = type === 'icecandidate'
+    ? new RTCPeerConnectionIceEvent(type, { candidate }) : new Event(type);
+  globalThis.__obscura_markTrusted(event);
+  _eventTargetDispatch(target, event);
+}
+function _rtcMediaLines(media, hasAudio) {
+  if (media.kind === 'audio') return [
+    'm=audio 9 UDP/TLS/RTP/SAVPF 111 63 9 0 8 13 110 126',
+    'a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level',
+    'a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time',
+    'a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01',
+    'a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid',
+    'a=rtcp-mux', 'a=rtcp-rsize', 'a=rtcp-xr:rcvr-rtt=all',
+    ...[111,63,9,0,8,13,110,126].map(id => `a=rtcp-fb:${id} rrtr`),
+    'a=rtpmap:111 opus/48000/2', 'a=rtcp-fb:111 transport-cc',
+    'a=fmtp:111 minptime=10;useinbandfec=1', 'a=rtpmap:63 red/48000/2',
+    'a=fmtp:63 111/111', 'a=rtpmap:9 G722/8000', 'a=rtpmap:0 PCMU/8000',
+    'a=rtpmap:8 PCMA/8000', 'a=rtpmap:13 CN/8000',
+    'a=rtpmap:110 telephone-event/48000', 'a=rtpmap:126 telephone-event/8000',
+  ];
+  const codecs = [
+    [96, 'VP8', null, 97], [98, 'VP9', 'profile-id=0', 99],
+    [100, 'VP9', 'profile-id=2', 101], [35, 'VP9', 'profile-id=1', 36],
+    [37, 'VP9', 'profile-id=3', 38],
+    [102, 'H264', 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f', 103],
+    [104, 'H264', 'level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f', 107],
+    [108, 'H264', 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f', 109],
+    [114, 'H264', 'level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f', 115],
+    [116, 'H264', 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f', 117],
+    [39, 'H264', 'level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=4d001f', 40],
+    [41, 'H264', 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=f4001f', 42],
+    [43, 'H264', 'level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=f4001f', 44],
+    [45, 'AV1', 'level-idx=5;profile=0;tier=0', 46], [47, 'AV1', 'level-idx=5;profile=1;tier=0', 48],
+  ];
+  const payloads = codecs.flatMap(([id, , , rtx]) => [id, rtx]).concat([118, 119, 120, 49]);
+  const lines = [
+    `m=video 9 UDP/TLS/RTP/SAVPF ${payloads.join(' ')}`,
+    `a=extmap:${hasAudio ? 14 : 1} urn:ietf:params:rtp-hdrext:toffset`,
+    'a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time',
+    `a=extmap:${hasAudio ? 13 : 3} urn:3gpp:video-orientation`,
+    `a=extmap:${hasAudio ? 3 : 4} http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01`,
+    'a=extmap:5 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay',
+    'a=extmap:6 http://www.webrtc.org/experiments/rtp-hdrext/video-content-type',
+    'a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/video-timing',
+    'a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/color-space',
+    `a=extmap:${hasAudio ? 4 : 9} urn:ietf:params:rtp-hdrext:sdes:mid`,
+    'a=extmap:10 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id',
+    'a=extmap:11 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id',
+    'a=rtcp-mux', 'a=rtcp-rsize', 'a=rtcp-xr:rcvr-rtt=all',
+    ...payloads.map(id => `a=rtcp-fb:${id} rrtr`),
+  ];
+  for (const [id, codec, format, rtx] of codecs) {
+    lines.push(`a=rtpmap:${id} ${codec}/90000`,
+      ...['goog-remb', 'transport-cc', 'ccm fir', 'nack', 'nack pli'].map(feedback => `a=rtcp-fb:${id} ${feedback}`));
+    if (format) lines.push(`a=fmtp:${id} ${format}`);
+    lines.push(`a=rtpmap:${rtx} rtx/90000`, `a=fmtp:${rtx} apt=${id}`);
+  }
+  lines.push('a=rtpmap:118 red/90000', 'a=rtpmap:119 rtx/90000', 'a=fmtp:119 apt=118',
+    'a=rtpmap:120 ulpfec/90000', 'a=rtpmap:49 flexfec-03/90000', 'a=rtcp-fb:49 goog-remb',
+    'a=rtcp-fb:49 transport-cc', 'a=fmtp:49 repair-window=10000000');
+  return lines;
+}
+function _rtcOffer(state, options) {
+  if (!state.certificate) {
+    const raw = __obscuraCore.ops.op_rtc_certificate();
+    if (!raw) throw new DOMException('Failed to generate certificate', 'OperationError');
+    state.certificate = JSON.parse(raw);
+  }
+  if (!state.ice || options?.iceRestart) state.ice = { ufrag: _rtcRandom(4), pwd: _rtcRandom(24) };
+  const lines = ['v=0', `o=- ${state.sessionId} 2 IN IP4 127.0.0.1`, 's=-', 't=0 0'];
+  if (state.media.length) lines.push(`a=group:BUNDLE ${state.media.map((_, i) => i).join(' ')}`);
+  lines.push('a=extmap-allow-mixed', 'a=msid-semantic: WMS');
+  state.media.forEach((media, i) => {
+    const data = media.kind === 'application';
+    const extra = data ? ['m=application 9 UDP/DTLS/SCTP webrtc-datachannel']
+      : _rtcMediaLines(media, state.media.some(entry => entry.kind === 'audio'));
+    lines.push(extra[0], 'c=IN IP4 0.0.0.0');
+    if (!data) lines.push('a=rtcp:9 IN IP4 0.0.0.0');
+    lines.push(`a=ice-ufrag:${state.ice.ufrag}`, `a=ice-pwd:${state.ice.pwd}`,
+      'a=ice-options:trickle', `a=fingerprint:sha-256 ${state.certificate.fingerprint}`,
+      'a=setup:actpass', `a=mid:${i}`);
+    if (data) lines.push('a=sctp-port:5000', 'a=max-message-size:262144');
+    else {
+      const mux = extra.indexOf('a=rtcp-mux');
+      const direction = media.transceiver.direction;
+      lines.push(...extra.slice(1, mux), `a=${direction}`);
+      if (direction === 'sendrecv' || direction === 'sendonly') lines.push(`a=msid:- ${media.trackId}`);
+      lines.push(...extra.slice(mux));
+      if (direction === 'sendrecv' || direction === 'sendonly') {
+        lines.push(`a=ssrc:${media.ssrc} cname:${media.cname}`, `a=ssrc:${media.ssrc} msid:- ${media.trackId}`);
+      }
+    }
+  });
+  return { type: 'offer', sdp: lines.join('\r\n') + '\r\n' };
+}
+function _rtcScheduleNegotiation(pc) {
+  const state = _rtcStates.get(pc);
+  if (state.negotiationQueued) return;
+  state.negotiationQueued = true;
+  setTimeout(() => {
+    state.negotiationQueued = false;
+    if (!state.closed && state.signalingState === 'stable') _rtcEvent(pc, 'negotiationneeded');
+  }, 0);
+}
 globalThis.RTCPeerConnection = class RTCPeerConnection {
-  constructor(){this.localDescription=null;this.remoteDescription=null;this.iceConnectionState='new';this.iceGatheringState='new';this.signalingState='stable';this.connectionState='new';}
-  createOffer(){return Promise.resolve({type:'offer',sdp:''});}
-  createAnswer(){return Promise.resolve({type:'answer',sdp:''});}
-  setLocalDescription(){return Promise.resolve();}
-  setRemoteDescription(){return Promise.resolve();}
-  addIceCandidate(){return Promise.resolve();}
-  close(){}
-  createDataChannel(){return {close(){},send(){},addEventListener(){},removeEventListener(){}};}
-  addEventListener(){} removeEventListener(){}
+  constructor(configuration = {}) {
+    _rtcStates.set(this, { handlers: {}, media: [], channels: [], sessionId: _rtcSessionId(),
+      ice: null, certificate: null, local: null, remote: null, signalingState: 'stable',
+      iceConnectionState: 'new', iceGatheringState: 'new', connectionState: 'new',
+      configuration, negotiationQueued: false, closed: false, generation: 0 });
+  }
+  get localDescription() { return _rtcStates.get(this).local; }
+  get pendingLocalDescription() { const s = _rtcStates.get(this); return s.signalingState === 'have-local-offer' ? s.local : null; }
+  get currentLocalDescription() { return null; }
+  get remoteDescription() { return _rtcStates.get(this).remote; }
+  get iceConnectionState() { return _rtcStates.get(this).iceConnectionState; }
+  get iceGatheringState() { return _rtcStates.get(this).iceGatheringState; }
+  get signalingState() { return _rtcStates.get(this).signalingState; }
+  get connectionState() { return _rtcStates.get(this).connectionState; }
+  async createOffer(options = {}) {
+    const s = _rtcStates.get(this);
+    if (s.closed) throw new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError');
+    for (const [key, kind] of [['offerToReceiveAudio', 'audio'], ['offerToReceiveVideo', 'video']]) {
+      if (options?.[key] && !s.media.some(media => media.kind === kind)) {
+        this.addTransceiver(kind, { direction: 'recvonly' });
+      }
+    }
+    return _rtcOffer(s, options);
+  }
+  async createAnswer() { throw new DOMException('No remote offer is set.', 'InvalidStateError'); }
+  async setLocalDescription(description) {
+    const s = _rtcStates.get(this);
+    if (s.closed) throw new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError');
+    if (s.signalingState !== 'stable' && s.signalingState !== 'have-local-offer') {
+      throw new DOMException('Invalid signaling state', 'InvalidStateError');
+    }
+    const offer = description == null ? _rtcOffer(s, {}) : description;
+    if (offer.type !== 'offer' || typeof offer.sdp !== 'string' || !offer.sdp.startsWith('v=0\r\n')) {
+      throw new DOMException('Invalid session description', 'OperationError');
+    }
+    s.local = new RTCSessionDescription({ type: 'offer', sdp: offer.sdp });
+    s.media.forEach((media, index) => { if (media.transceiver) media.transceiver.mid = String(index); });
+    s.signalingState = 'have-local-offer';
+    _rtcEvent(this, 'signalingstatechange');
+    if (!s.media.length) return;
+    const generation = ++s.generation;
+    setTimeout(() => {
+      if (s.closed || generation !== s.generation) return;
+      s.iceGatheringState = 'gathering';
+      _rtcEvent(this, 'icegatheringstatechange');
+      // There is no socket or mDNS responder: this is signaling-only ICE.
+      const id = crypto.randomUUID();
+      const portBytes = crypto.getRandomValues(new Uint16Array(1));
+      const port = 1024 + portBytes[0] % (65536 - 1024);
+      const candidate = new RTCIceCandidate({
+        candidate: `candidate:1 1 udp 2113937151 ${id}.local ${port} typ host generation 0 network-cost 999`,
+        sdpMid: '0', sdpMLineIndex: 0, usernameFragment: s.ice?.ufrag || null,
+      });
+      const firstEnd = s.local.sdp.indexOf('\r\nm=', s.local.sdp.indexOf('\r\nm=') + 1);
+      const insertAt = firstEnd < 0 ? s.local.sdp.length : firstEnd + 2;
+      s.local.sdp = s.local.sdp.slice(0, insertAt) + `a=${candidate.candidate}\r\n` + s.local.sdp.slice(insertAt);
+      _rtcEvent(this, 'icecandidate', candidate);
+      if (s.closed || generation !== s.generation) return;
+      s.iceGatheringState = 'complete';
+      _rtcEvent(this, 'icegatheringstatechange');
+      if (s.closed || generation !== s.generation) return;
+      _rtcEvent(this, 'icecandidate', null);
+    }, 0);
+  }
+  async setRemoteDescription() { throw new DOMException('Remote negotiation is not supported.', 'NotSupportedError'); }
+  async addIceCandidate() { throw new DOMException('Remote negotiation is not supported.', 'NotSupportedError'); }
+  close() {
+    const s = _rtcStates.get(this);
+    if (s.closed) return;
+    s.closed = true; s.generation++; s.certificate = null;
+    s.signalingState = 'closed'; s.iceConnectionState = 'closed'; s.connectionState = 'closed';
+    for (const channel of s.channels) _rtcCloseChannel(channel, true);
+  }
+  createDataChannel(label, options = {}) {
+    const s = _rtcStates.get(this);
+    if (s.closed) throw new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError');
+    if (!s.media.some(m => m.kind === 'application')) s.media.push({ kind: 'application' });
+    const channel = new RTCDataChannel(String(label), options);
+    s.channels.push(channel); _rtcScheduleNegotiation(this);
+    return channel;
+  }
+  addTransceiver(trackOrKind, init = {}) {
+    const s = _rtcStates.get(this);
+    if (s.closed) throw new DOMException('The RTCPeerConnection is closed.', 'InvalidStateError');
+    const kind = typeof trackOrKind === 'string' ? trackOrKind : trackOrKind?.kind;
+    if (kind !== 'audio' && kind !== 'video') throw new TypeError('Invalid transceiver kind');
+    if (s.media.length >= 128) throw new DOMException('Too many transceivers', 'OperationError');
+    const direction = init.direction || 'sendrecv';
+    if (!['sendrecv', 'sendonly', 'recvonly', 'inactive'].includes(direction)) throw new TypeError('Invalid transceiver direction');
+    const transceiver = { mid: null, direction, currentDirection: null, sender: { track: typeof trackOrKind === 'string' ? null : trackOrKind }, receiver: { track: { kind } }, stop() { this.direction = 'stopped'; } };
+    const ssrc = crypto.getRandomValues(new Uint32Array(1))[0];
+    const entry = { kind, direction, transceiver, trackId: crypto.randomUUID(), ssrc, cname: _rtcRandom(16) };
+    const dataIndex = s.local ? -1 : s.media.findIndex(media => media.kind === 'application');
+    if (dataIndex < 0) s.media.push(entry); else s.media.splice(dataIndex, 0, entry);
+    _rtcScheduleNegotiation(this);
+    return transceiver;
+  }
+  getTransceivers() { return _rtcStates.get(this).media.map(m => m.transceiver).filter(Boolean); }
+  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
+  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
   getStats(){return Promise.resolve(new Map());}
 };
-globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
-globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
+for (const type of ['negotiationneeded','signalingstatechange','icegatheringstatechange','icecandidate','iceconnectionstatechange','connectionstatechange','datachannel']) {
+  Object.defineProperty(RTCPeerConnection.prototype, 'on' + type, {
+    configurable: true, enumerable: true,
+    get() { return _rtcStates.get(this).handlers[type] || null; },
+    set(value) { _rtcHandler(this, type, value); },
+  });
+}
+const _rtcChannelHandlers = new WeakMap();
+function _rtcCloseChannel(channel, fromPeer = false) {
+  const state = _rtcChannelHandlers.get(channel);
+  if (channel.readyState === 'closed' || channel.readyState === 'closing' || state.closingQueued) return;
+  state.closingQueued = true;
+  if (!fromPeer) channel.readyState = 'closing';
+  setTimeout(() => {
+    if (channel.readyState === 'closed') return;
+    channel.readyState = 'closed';
+    _rtcEvent(channel, 'close');
+  }, 0);
+}
+globalThis.RTCDataChannel = class RTCDataChannel {
+  constructor(label, options = {}) {
+    this.label = label; this.ordered = options.ordered !== false; this.readyState = 'connecting';
+    this.id = options.id ?? null; this.protocol = options.protocol || ''; this.negotiated = !!options.negotiated;
+    this.maxPacketLifeTime = options.maxPacketLifeTime ?? null; this.maxRetransmits = options.maxRetransmits ?? null;
+    this.binaryType = 'arraybuffer'; this.bufferedAmount = 0; this.bufferedAmountLowThreshold = 0;
+    _rtcChannelHandlers.set(this, {});
+  }
+  close() { _rtcCloseChannel(this); }
+  send() { if (this.readyState !== 'open') throw new DOMException('RTCDataChannel is not open', 'InvalidStateError'); }
+  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
+  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+};
+for (const type of ['open', 'close', 'error', 'message', 'bufferedamountlow']) {
+  Object.defineProperty(RTCDataChannel.prototype, 'on' + type, {
+    configurable: true, enumerable: true,
+    get() { return _rtcChannelHandlers.get(this)[type] || null; },
+    set(value) {
+      const handlers = _rtcChannelHandlers.get(this);
+      if (handlers[type]) _eventTargetRemove(this, type, handlers[type]);
+      handlers[type] = typeof value === 'function' ? value : null;
+      if (handlers[type]) _eventTargetAdd(this, type, handlers[type]);
+    },
+  });
+}
+globalThis.RTCSessionDescription = class RTCSessionDescription {
+  constructor(d = {}) { this.type = d.type; this.sdp = d.sdp || ''; }
+  toJSON() { return { type: this.type, sdp: this.sdp }; }
+};
+globalThis.RTCPeerConnectionIceEvent = class RTCPeerConnectionIceEvent extends Event {
+  constructor(type, options = {}) { super(type, options); this.candidate = options.candidate ?? null; this.url = options.url ?? null; }
+};
+globalThis.RTCIceCandidate = class RTCIceCandidate {
+  constructor(d = {}) {
+    this.candidate=d.candidate||''; this.sdpMid=d.sdpMid??null; this.sdpMLineIndex=d.sdpMLineIndex??null; this.usernameFragment=d.usernameFragment??null;
+    const parts = this.candidate.trim().split(/\s+/);
+    const valid = parts.length >= 8 && parts[0].startsWith('candidate:') && parts[6] === 'typ';
+    this.foundation = valid ? parts[0].slice(10) : null;
+    this.component = valid ? (parts[1] === '1' ? 'rtp' : parts[1] === '2' ? 'rtcp' : null) : null;
+    this.protocol = valid ? parts[2].toLowerCase() : null;
+    this.priority = valid ? Number(parts[3]) : null;
+    this.address = valid ? parts[4] : null;
+    this.port = valid ? Number(parts[5]) : null;
+    this.type = valid ? parts[7] : null;
+  }
+  toJSON() { return { candidate: this.candidate, sdpMid: this.sdpMid, sdpMLineIndex: this.sdpMLineIndex, usernameFragment: this.usernameFragment }; }
+};
 
 /* INDEXED_DB */
 
@@ -16761,7 +17043,16 @@ globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candida
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
-_markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
+_markNative(RTCPeerConnection); _markNative(RTCDataChannel); _markNative(RTCPeerConnectionIceEvent);
+_markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
+for (const name of ['createOffer', 'createAnswer', 'setLocalDescription', 'setRemoteDescription',
+                    'addIceCandidate', 'close', 'createDataChannel', 'addTransceiver', 'getTransceivers',
+                    'addEventListener', 'removeEventListener', 'dispatchEvent', 'getStats']) {
+  _markNative(RTCPeerConnection.prototype[name]);
+}
+for (const name of ['close', 'send', 'addEventListener', 'removeEventListener', 'dispatchEvent']) {
+  _markNative(RTCDataChannel.prototype[name]);
+}
 
 // Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
 // so native Intl.DateTimeFormat and Date report the same zone. No JS override:
@@ -16803,7 +17094,8 @@ const _gpu = {
   requestAdapter() { return Promise.resolve(null); },
   getPreferredCanvasFormat: _markNative(function getPreferredCanvasFormat() {
     if (this !== _gpu) throw new TypeError('Illegal invocation');
-    return 'rgba8unorm';
+    const platform = globalThis.__obscura_ua_platform || 'Windows';
+    return platform === 'Linux' || platform === 'Android' ? 'rgba8unorm' : 'bgra8unorm';
   }),
 };
 navigator.gpu = _gpu;

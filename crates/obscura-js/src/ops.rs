@@ -4909,6 +4909,21 @@ mod tests {
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
 
+    #[test]
+    fn rtc_certificate_fingerprint_matches_der_and_varies() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let first: serde_json::Value = serde_json::from_str(&super::generate_rtc_certificate().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&super::generate_rtc_certificate().unwrap()).unwrap();
+        let cert = super::BASE64.decode(first["certificate"].as_str().unwrap()).unwrap();
+        let key = super::BASE64.decode(first["privateKey"].as_str().unwrap()).unwrap();
+        let expected = sha2::Sha256::digest(&cert).iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":");
+        assert_eq!(first["fingerprint"], expected);
+        assert_eq!(cert.first(), Some(&0x30));
+        assert_eq!(key.first(), Some(&0x30));
+        assert_ne!(first["fingerprint"], second["fingerprint"]);
+    }
+
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
     #[test]
@@ -6961,6 +6976,27 @@ fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8>
     }
 }
 
+/// Lazily mint an ECDSA certificate for a peer connection. Keep this op
+/// panic-safe because it runs inside V8's FFI frame.
+#[op2]
+#[string]
+fn op_rtc_certificate() -> String {
+    std::panic::catch_unwind(generate_rtc_certificate).ok().flatten().unwrap_or_default()
+}
+
+fn generate_rtc_certificate() -> Option<String> {
+    use sha2::Digest as _;
+    let generated = rcgen::generate_simple_self_signed(Vec::<String>::new()).ok()?;
+    let digest = sha2::Sha256::digest(generated.cert.der().as_ref());
+    let fingerprint = digest.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":");
+    Some(serde_json::json!({
+        "fingerprint": fingerprint,
+        "certificate": BASE64.encode(generated.cert.der().as_ref()),
+        "privateKey": BASE64.encode(generated.key_pair.serialize_der()),
+    }).to_string())
+}
+
+
 // ---------------------------------------------------------------------------
 // WebCrypto (crypto.subtle) secret-key primitives.
 //
@@ -7851,6 +7887,7 @@ pub fn build_extension() -> Extension {
         op_posted_task(),
         op_posted_task_generation(),
         op_binding_called(),
+        op_rtc_certificate(),
         op_subtle_digest(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),
