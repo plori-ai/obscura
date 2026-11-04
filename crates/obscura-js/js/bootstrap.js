@@ -5347,7 +5347,8 @@ class Element extends Node {
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
+          loadedUrl, html, response.headers?.['last-modified'] || '',
+          Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = el._iframeOpaque ? null : new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = el._iframeOpaque ? _remoteWindow(el._frameId) : new _IframeWindow(el._iframeDoc, loadedUrl);
@@ -6626,6 +6627,15 @@ class Document extends Node {
     this._effectiveDomain = candidate;
   }
   get referrer() { return this._detached ? "" : (_domParse("document_referrer") ?? ""); }
+  get lastModified() {
+    const get = _documentRealmMember(this, 'lastModified');
+    if (get) return Reflect.apply(get, this, []);
+    const value = this._detached ? null : _domParse('document_last_modified');
+    const parsed = value ? Date.parse(value) : NaN;
+    const d = new Date(Number.isFinite(parsed) ? parsed : Date.now());
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getMonth() + 1)}/${p(d.getDate())}/${String(d.getFullYear()).padStart(4, '0')} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
   get location() { return this._detached ? null : globalThis.location; }
   set location(url) {
     if (this._detached) return;
@@ -8462,10 +8472,25 @@ globalThis.navigator = {
     new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
     new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
   ]);
+  // Chrome exposes the PDF MIME types on each plugin, with each type pointing
+  // back to the plugin that supplied it. A plugin lookup creates a fresh
+  // MimeType wrapper; the navigator-wide array below keeps its own objects.
+  for (const plugin of _plugins) {
+    for (const [index, type] of ['application/pdf', 'text/pdf'].entries()) {
+      const get = () => new MimeType(type, 'Portable Document Format', 'pdf', plugin);
+      Object.defineProperty(plugin, index, { get, enumerable: true, configurable: true });
+      Object.defineProperty(plugin, type, { get, enumerable: false, configurable: true });
+    }
+    plugin.length = 2;
+    Object.defineProperty(_plugins, plugin.name, { value: plugin, configurable: true });
+  }
   var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
+    new MimeType("application/pdf", "Portable Document Format", "pdf", _plugins[0]),
+    new MimeType("text/pdf", "Portable Document Format", "pdf", _plugins[0]),
   ]);
+  for (const mime of _mimeTypes) {
+    Object.defineProperty(_mimeTypes, mime.type, { value: mime, configurable: true });
+  }
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
@@ -15951,6 +15976,7 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     delete child.Deno;
     for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
                        '__obscura_ua_platform_version', '__obscura_stealth',
+                       '__obscura_screen_w', '__obscura_screen_h', '__obscura_screen_emulated',
                        '__obscura_geo_lat', '__obscura_geo_lon']) {
       if (globalThis[name] !== undefined) child[name] = globalThis[name];
     }
@@ -19305,7 +19331,7 @@ globalThis.__obscura_init = (function() {
     _realmFrameId);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  _fpSeed = __obscuraCore.ops.op_fingerprint_seed(Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0), _realmFrameId);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive

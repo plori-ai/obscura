@@ -48,6 +48,13 @@ impl Drop for FrameRealm {
 }
 
 impl FrameRealm {
+    /// Preserve the response metadata before any frame preload or author script runs.
+    pub fn set_document_last_modified(&self, value: Option<&str>) {
+        if let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) {
+            state.borrow_mut().document_last_modified = value.map(str::to_owned);
+        }
+    }
+
     /// Builds a frame realm around an already-fetched document.
     ///
     /// The frame inherits the page's browser identity and its shared resources,
@@ -1044,6 +1051,38 @@ mod tests {
         assert_eq!(pixels, serde_json::json!([255, 0, 0, 255]));
         let state = frame.realms.borrow().by_frame_id(1).unwrap();
         assert_eq!(state.borrow().canvas_surfaces.len(), 1);
+    }
+
+    #[test]
+    fn frame_last_modified_uses_its_own_response() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent.set_document_last_modified(Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/", "<html></html>").unwrap();
+        frame.set_document_last_modified(Some("Thu, 22 Oct 2015 07:28:00 GMT"));
+        let value = frame.evaluate(&mut parent, r#"(() => {
+            const d = new Date('Thu, 22 Oct 2015 07:28:00 GMT');
+            const p = n => String(n).padStart(2, '0');
+            return document.lastModified === `${p(d.getMonth()+1)}/${p(d.getDate())}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!(true));
+    }
+
+    #[test]
+    fn frames_share_the_page_device_fingerprint() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent.set_screen_size_override(Some((1440.0, 900.0)), true);
+        let properties = "[navigator.hardwareConcurrency, navigator.deviceMemory, screen.width, screen.height, screen.availWidth, screen.availHeight]";
+        let expected = parent.evaluate(properties).unwrap();
+        for (id, url) in [(1, "https://parent.example/child"), (2, "https://other.example/child")] {
+            let frame = FrameRealm::new(&mut parent, id, 0, url, "<html></html>").unwrap();
+            assert_eq!(frame.evaluate(&mut parent, properties).unwrap(), expected);
+        }
+        assert_eq!(parent.evaluate(r#"(() => {
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const child = frame.contentWindow;
+            return [child.navigator.hardwareConcurrency, child.navigator.deviceMemory,
+                child.screen.width, child.screen.height, child.screen.availWidth, child.screen.availHeight];
+        })()"#).unwrap(), expected);
     }
 
     #[cfg(feature = "render")]

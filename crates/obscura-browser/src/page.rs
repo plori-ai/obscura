@@ -1262,6 +1262,7 @@ impl Page {
                     return true;
                 }
             };
+            realm.set_document_last_modified(frame.last_modified.as_deref());
             // Discover author scripts before preload code can mutate the frame
             // DOM, preserving the existing preparation order.
             let urls = match self.js.as_mut() {
@@ -3686,6 +3687,9 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        if let Some(js) = &self.js {
+            js.set_document_last_modified(response.headers.get("last-modified").map(String::as_str));
+        }
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Install fetched CSS in native DOM state. Cross-origin bytes must not
@@ -7107,6 +7111,41 @@ mod tests {
 
     fn storage_page(name: &str, context: std::sync::Arc<crate::BrowserContext>) -> super::Page {
         super::Page::new(name.to_string(), context)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_last_modified_follows_each_navigation_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                let child = String::from_utf8_lossy(&bytes[..count]).starts_with("GET /child ");
+                let (body, modified) = if child {
+                    ("<html><body><script>window.frameAtParse = document.lastModified</script></body></html>", "Thu, 22 Oct 2015 07:28:00 GMT")
+                } else {
+                    ("<html><body><script>window.topAtParse = document.lastModified</script><iframe src='/child'></iframe></body></html>", "Wed, 21 Oct 2015 07:28:00 GMT")
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nLast-Modified: {modified}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "last-modified".into(), None, false, None, None, true,
+        ));
+        let mut page = storage_page("last-modified", context);
+        page.navigate(&base).await.unwrap();
+        for _ in 0..30 {
+            page.advance_frames().await;
+            if let Some(js) = page.js.as_mut() { js.run_event_loop_bounded(20).await.unwrap(); }
+            if !page.frame_urls().is_empty() { break; }
+        }
+        assert_eq!(page.evaluate_script("new Date(window.topAtParse).toISOString()").unwrap(), serde_json::json!("2015-10-21T07:28:00.000Z"));
+        assert_eq!(page.evaluate_in_frame(0, "new Date(window.frameAtParse).toISOString()").unwrap(), serde_json::json!("2015-10-22T07:28:00.000Z"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

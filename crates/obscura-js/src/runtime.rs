@@ -1001,12 +1001,15 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 10] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
             "__obscura_stealth",
+            "__obscura_screen_w",
+            "__obscura_screen_h",
+            "__obscura_screen_emulated",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
         ];
@@ -1406,6 +1409,11 @@ impl ObscuraJsRuntime {
     /// referrer semantics.
     pub fn set_referrer(&self, referrer: &str) {
         self.state.borrow_mut().referrer = referrer.to_string();
+    }
+
+    /// Set the response's Last-Modified header for the current document.
+    pub fn set_document_last_modified(&self, value: Option<&str>) {
+        self.state.borrow_mut().document_last_modified = value.map(str::to_owned);
     }
 
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
@@ -9480,6 +9488,21 @@ mod tests {
             detached,
             serde_json::json!(["Detached title", "  Detached   title  ", ""])
         );
+    }
+
+    #[test]
+    fn document_last_modified_uses_document_response_or_current_time() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/.test(document.lastModified)"#).unwrap(), serde_json::json!(true));
+        rt.set_document_last_modified(Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+        let result = rt.evaluate(r#"(() => {
+            const d = new Date('Wed, 21 Oct 2015 07:28:00 GMT');
+            const p = n => String(n).padStart(2, '0');
+            return document.lastModified === `${p(d.getMonth()+1)}/${p(d.getDate())}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(true));
+        rt.set_document_last_modified(Some("invalid date"));
+        assert_eq!(rt.evaluate(r#"/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/.test(document.lastModified)"#).unwrap(), serde_json::json!(true));
     }
 
     #[test]
@@ -20121,6 +20144,22 @@ mod tests {
         assert_eq!(out["consumed"], true);
         assert_eq!(out["doubleThrew"], true);
         assert_eq!(out["nullBody"], true);
+    }
+
+    #[test]
+    fn navigator_pdf_plugins_expose_their_mime_types() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const plugins = navigator.plugins, types = navigator.mimeTypes;
+            return [plugins.length, types.length,
+              Array.from(plugins, p => [p.length, plugins[p.name] === p,
+                Array.from(p, m => [m.type, m.enabledPlugin === p]),
+                p.namedItem('application/pdf').type, p[0] !== p[0]]),
+              Array.from(types, m => [m.type, m.enabledPlugin === plugins[0], types[m.type] === m])];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([5, 2,
+            vec![serde_json::json!([2, true, [["application/pdf", true], ["text/pdf", true]], "application/pdf", true]); 5],
+            [["application/pdf", true, true], ["text/pdf", true, true]]]));
     }
 
     #[test]
