@@ -353,6 +353,7 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        self.fetch_intercept.sessions_by_page.remove(id);
         self.preload_scripts.retain(|(script_id, _)|
             self.preload_script_pages.get(script_id).is_none_or(|owner| owner != id));
         self.preload_script_pages.retain(|_, owner| owner != id);

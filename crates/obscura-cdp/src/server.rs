@@ -1494,6 +1494,11 @@ fn emit_intercepted_request(
             let page = ctx.pages.iter().find(|page| page.id == intercepted.page_id)?;
             let (session_id, _) = ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)?;
             Some((page.frame_id.as_str(), Some(session_id.clone())))
+        })
+        .map(|(frame_id, session_id)| {
+            let owner = ctx.fetch_intercept.sessions_by_page.get(&intercepted.page_id)
+                .cloned().or(session_id);
+            (frame_id, owner)
         });
     let observers = route.as_ref().map_or_else(Vec::new, |(_, session_id)| {
         crate::domains::page::network_observer_sessions(ctx, &intercepted.page_id, session_id)
@@ -2497,6 +2502,33 @@ mod tests {
         assert_eq!(paused.len(), 1);
         assert!(paused.contains_key("fetch-1"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fetch_pause_goes_to_enabling_session_including_during_navigation() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page = ctx.create_page();
+        ctx.sessions.insert("driver".into(), page.clone());
+        ctx.sessions.insert("fetch-owner".into(), page.clone());
+        ctx.fetch_intercept.sessions_by_page.insert(page.clone(), "fetch-owner".into());
+        for navigating in [false, true] {
+            let (resolver, _resolution) = tokio::sync::oneshot::channel();
+            let request = obscura_js::ops::InterceptedRequest {
+                request_id: "fetch-owner-test".into(), page_id: page.clone(),
+                url: "https://example.test/x".into(), method: "GET".into(),
+                headers: Default::default(), resource_type: "XHR".into(), resolver,
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut paused = HashMap::new();
+            let route = navigating.then(|| (page.as_str(), "frame-1", Some("driver".into())));
+            super::emit_intercepted_request(request, &ctx, route, &tx, &mut paused);
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(serde_json::from_str::<serde_json::Value>(&event).unwrap());
+            }
+            let pause = events.iter().find(|event| event["method"] == "Fetch.requestPaused").unwrap();
+            assert_eq!(pause["sessionId"], "fetch-owner");
+        }
     }
 
     #[test]
