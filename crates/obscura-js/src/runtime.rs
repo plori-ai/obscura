@@ -6103,6 +6103,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_messages_are_trusted_message_events_in_both_directions() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-message-events", r#"
+            globalThis.__workerMessageEvent = null;
+            const source = `onmessage = event => {
+                postMessage([event instanceof MessageEvent, event.type, event.isTrusted,
+                    event.origin, event.source, event.lastEventId, event.ports.length, event.data]);
+            };`;
+            const worker = new Worker(URL.createObjectURL(new Blob([source])));
+            worker.onmessage = event => {
+                __workerMessageEvent = [event instanceof MessageEvent, event.type, event.isTrusted,
+                    event.origin, event.source, event.lastEventId, event.ports.length, event.data];
+                worker.terminate();
+            };
+            worker.postMessage('hello');
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__workerMessageEvent").unwrap(), serde_json::json!([
+            true, "message", true, "", null, "", 0,
+            [true, "message", true, "", null, "", 0, "hello"]
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_onmessage_bindings_do_not_mutate_window() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script("worker-onmessage-bindings", r#"
@@ -22089,6 +22113,31 @@ mod tests {
                 "invalidFetchRejected": true,
             })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn about_blank_frame_fetch_uses_inherited_origin() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        });
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url(&format!("{base}/page"));
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        let result = rt.call_function_on_for_cdp(&format!(r#"async () => {{
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            return await frame.contentWindow.fetch({:?}, {{method:'POST'}})
+                .then(r => r.text(), e => String(e));
+        }}"#, format!("{base}/resource")), None, &[], true, true).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("ok")));
     }
 
     #[tokio::test(flavor = "current_thread")]

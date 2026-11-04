@@ -8792,7 +8792,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
-  const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
+  const pageOrigin = _realmOrigin();
   const initSignal = init.signal;
   const inputSignal = initSignal !== undefined ? initSignal : (request ? request.signal : null);
   if (inputSignal != null && !_abortSignalState(inputSignal)) {
@@ -17013,7 +17013,8 @@ globalThis.Worker = class Worker {
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
       postMessage: (msg) => {
         if (worker._terminated) return;
-        const evt = { data: msg };
+        const evt = new MessageEvent('message', { data: msg });
+        _trustedEvents.add(evt);
         if (worker.onmessage) worker.onmessage(evt);
         const ls = worker._listeners['message'] || [];
         for (const h of ls) h(evt);
@@ -17086,7 +17087,8 @@ globalThis.Worker = class Worker {
       if (worker._terminated || !worker._scope) return;
       const scope = worker._scope;
       try {
-        const event = { data };
+        const event = new MessageEvent('message', { data });
+        _trustedEvents.add(event);
         if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
         const evs = (scope._ev && scope._ev['message']) || [];
         for (const handler of evs.slice()) handler.call(scope, event);
