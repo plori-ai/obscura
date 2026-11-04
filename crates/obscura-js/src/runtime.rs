@@ -18247,6 +18247,56 @@ mod tests {
         assert_eq!(value["attribute"], "color: red;");
     }
 
+    #[test]
+    fn style_declaration_preserves_important_priority_and_reflection() {
+        let mut rt = setup_runtime("<html><body><div id='target'></div></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const style = document.getElementById('target').style;
+            style.setProperty('visibility', 'hidden', 'IMPORTANT');
+            const first = [style.visibility, style.getPropertyPriority('visibility'), style.cssText];
+            style.setProperty('visibility', 'visible', 'invalid');
+            const invalid = [style.visibility, style.getPropertyPriority('visibility')];
+            style.setProperty('visibility', 'visible');
+            const normal = [style.visibility, style.getPropertyPriority('visibility')];
+            style.cssText = 'color: red !important; visibility: visible; color: blue;';
+            const parsed = [style.cssText, style.color, style.getPropertyPriority('color')];
+            const removed = style.removeProperty('color');
+            const after = style.getPropertyPriority('color'), attribute = document.getElementById('target').getAttribute('style');
+            style.cssText = 'visibility: hidden !/**/important /*c*/';
+            const commented = [style.cssText, style.getPropertyPriority('visibility')];
+            style.setProperty('--Foo', 'bar', 'important');
+            const custom = [style.getPropertyValue('--Foo'), style.getPropertyPriority('--Foo'), style.getPropertyPriority('--foo')];
+            style.setProperty('VISIBILITY', 'visible', 'important');
+            const uppercase = [style.getPropertyValue('visibility'), style.getPropertyPriority('VISIBILITY')];
+            return JSON.stringify({first, invalid, normal, parsed, removed, after, attribute, commented, custom, uppercase});
+        })()"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({
+            "first": ["hidden", "important", "visibility: hidden !important;"],
+            "invalid": ["hidden", "important"], "normal": ["visible", ""],
+            "parsed": ["visibility: visible; color: red !important;", "red", "important"],
+            "removed": "red", "after": "", "attribute": "visibility: visible;",
+            "commented": ["visibility: hidden !important;", "important"], "custom": ["bar", "important", ""],
+            "uppercase": ["visible", "important"]
+        }));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn inline_important_priority_is_used_by_the_author_cascade() {
+        let mut rt = setup_runtime("<style>#target { visibility: visible !important }</style><div id='target'></div>");
+        let value = rt.evaluate(r#"(() => {
+            const el = document.getElementById('target');
+            el.style.setProperty('visibility', 'hidden', 'important');
+            const important = getComputedStyle(el).visibility;
+            el.style.setProperty('visibility', 'hidden');
+            const normal = getComputedStyle(el).visibility;
+            el.style.setProperty('visibility', 'hidden', 'important');
+            return [important, normal, getComputedStyle(el).visibility];
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!(["hidden", "visible", "hidden"]));
+    }
+
     // #1168: `Option` is a legacy factory function like `Image`. WPForms does
     // `new Option().style`, so the result must be a real <option> element.
     #[test]
