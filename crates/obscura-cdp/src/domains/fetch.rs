@@ -67,6 +67,9 @@ pub async fn handle(
         "enable" => {
             if let Some(patterns) = params.get("patterns").and_then(Value::as_array) {
                 for pattern in patterns {
+                    if let Some(stage) = pattern.get("requestStage").and_then(Value::as_str) {
+                        if !matches!(stage, "Request" | "Response") { return Err("Unknown Fetch request stage".into()); }
+                    }
                     if let Some(kind) = pattern.get("resourceType").and_then(Value::as_str) {
                         if !matches!(kind, "Document" | "Stylesheet" | "Image" | "Media" | "Font" | "Script"
                             | "TextTrack" | "XHR" | "Fetch" | "Prefetch" | "EventSource" | "WebSocket"
@@ -76,31 +79,24 @@ pub async fn handle(
                     }
                 }
             }
-            if params.get("patterns").and_then(Value::as_array).is_some_and(|patterns|
-                patterns.iter().any(|pattern| pattern.get("requestStage").and_then(Value::as_str) == Some("Response"))) {
-                return Err("Fetch response-stage interception is not implemented".into());
+            let mut request_patterns = Vec::new();
+            let mut response_patterns = Vec::new();
+            if let Some(patterns) = params.get("patterns").and_then(Value::as_array) {
+                for pattern in patterns {
+                    let parsed = obscura_js::ops::CdpRequestPattern {
+                        url_pattern: pattern.get("urlPattern").and_then(Value::as_str).unwrap_or("*").to_string(),
+                        resource_type: pattern.get("resourceType").and_then(Value::as_str).map(str::to_string),
+                    };
+                    if pattern.get("requestStage").and_then(Value::as_str) == Some("Response") {
+                        response_patterns.push(parsed);
+                    } else { request_patterns.push(parsed); }
+                }
+            } else {
+                request_patterns.push(obscura_js::ops::CdpRequestPattern { url_pattern: "*".into(), resource_type: None });
             }
-            let patterns = params
-                .get("patterns")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .map(|p| {
-                            p.get("urlPattern")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("*").to_string()
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec!["*".to_string()]);
-
-            let cdp_patterns = std::sync::Arc::new(params.get("patterns").and_then(Value::as_array)
-                .map(|arr| arr.iter().map(|p| obscura_js::ops::CdpRequestPattern {
-                    url_pattern: p.get("urlPattern").and_then(Value::as_str).unwrap_or("*").to_string(),
-                    resource_type: p.get("resourceType").and_then(Value::as_str).map(str::to_string),
-                }).collect::<Vec<_>>()).unwrap_or_else(|| vec![obscura_js::ops::CdpRequestPattern {
-                    url_pattern: "*".into(), resource_type: None,
-                }]));
+            let patterns = request_patterns.iter().map(|pattern| pattern.url_pattern.clone()).collect::<Vec<_>>();
+            let cdp_patterns = std::sync::Arc::new(request_patterns);
+            let response_patterns = (!response_patterns.is_empty()).then(|| std::sync::Arc::new(response_patterns));
 
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.clone();
@@ -114,6 +110,7 @@ pub async fn handle(
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns = patterns.clone();
                 page.cdp_request_patterns = Some(cdp_patterns);
+                page.cdp_response_patterns = response_patterns;
                 page.set_handle_auth_requests(params.get("handleAuthRequests").and_then(Value::as_bool).unwrap_or(false));
                 if let Some(tx) = tx_clone {
                     page.set_intercept_tx(tx);
@@ -139,6 +136,7 @@ pub async fn handle(
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns.clear();
                 page.cdp_request_patterns = None;
+                page.cdp_response_patterns = None;
                 page.set_handle_auth_requests(false);
                 page.enable_intercept(false);
             }
@@ -236,7 +234,7 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => Err("Fetch response-stage interception is not implemented".into()),
+        "getResponseBody" => Err("No response-stage request with the given id".into()),
         "takeResponseBodyAsStream" => {
             // Hand the client a streaming handle for a large response body so it
             // can pull it in chunks via IO.read and free it with IO.close,
@@ -307,11 +305,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_stage_is_rejected_without_enabling_request_interception() {
+    async fn response_stage_patterns_do_not_enable_request_stage_pauses() {
         let mut ctx = CdpContext::new();
-        assert!(handle("enable", &json!({"patterns": [{"urlPattern": "*", "requestStage": "Response"}]}),
-            &mut ctx, &None).await.is_err());
-        assert!(!ctx.fetch_intercept.enabled);
+        let page = ctx.create_page();
+        let session = Some("response-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page.clone());
+        handle("enable", &json!({"patterns": [{"urlPattern": "*", "requestStage": "Response"}]}),
+            &mut ctx, &session).await.unwrap();
+        assert!(ctx.fetch_intercept.enabled);
+        assert!(ctx.get_page(&page).unwrap().cdp_request_patterns.as_deref().unwrap().is_empty());
+        assert_eq!(ctx.get_page(&page).unwrap().cdp_response_patterns.as_deref().unwrap().len(), 1);
         assert!(handle("getResponseBody", &json!({"requestId": "missing"}), &mut ctx, &None).await.is_err());
     }
 

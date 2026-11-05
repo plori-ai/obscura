@@ -20,6 +20,7 @@ render = ["dep:obscura-render", "obscura-render/paint"]
 deno_core = "0.412"
 
 [dependencies]
+async-trait = "0.1"
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 deno_core = "0.412"

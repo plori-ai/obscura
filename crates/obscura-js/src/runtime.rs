@@ -1555,6 +1555,10 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cdp_request_patterns = patterns;
     }
 
+    pub fn set_cdp_response_patterns(&self, patterns: Option<std::sync::Arc<Vec<crate::ops::CdpRequestPattern>>>) {
+        self.state.borrow_mut().cdp_response_patterns = patterns;
+    }
+
     pub fn set_handle_auth_requests(&self, enabled: bool) {
         self.state.borrow_mut().handle_auth_requests = enabled;
     }
@@ -2375,6 +2379,8 @@ impl ObscuraJsRuntime {
         let interception = if state.intercept_enabled {
             state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
         } else { None };
+        let response_config = state.cdp_response_patterns.as_ref().and_then(|patterns| state.intercept_tx.as_ref()
+            .map(|tx| (tx.clone(), state.intercept_page_id.clone(), patterns.clone())));
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
@@ -2389,6 +2395,7 @@ impl ObscuraJsRuntime {
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let interception = interception.clone();
+                let response_config = response_config.clone();
                 let initiator = initiator.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
@@ -2446,7 +2453,7 @@ impl ObscuraJsRuntime {
                             let (resolver, resolution) = tokio::sync::oneshot::channel();
                             if intercept_tx.send(crate::ops::InterceptedRequest {
                                 request_id: id.clone(), page_id, url: raw.clone(), method: "GET".into(),
-                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), auth_challenge: None, resolver,
+                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), network_id: None, auth_challenge: None, response: None, resolver,
                             }).is_ok() {
                                 request_id = Some(id);
                                 match resolution.await {
@@ -2482,8 +2489,18 @@ impl ObscuraJsRuntime {
                             }
                         }
                     }
+                    let response_hook = response_config.map(|(tx, page_id, patterns)| crate::ops::CdpResponseHook {
+                        tx, page_id, request_id: request_id.clone().unwrap_or_else(crate::ops::next_subresource_interception_id),
+                        resource_type: if is_font { "Font" } else { "Image" }.into(), request_headers: Default::default(),
+                        patterns, request_was_paused: request_id.is_some(),
+                        fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), max_body_bytes: request.max_response_bytes, sequence: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    });
                     #[cfg(feature = "stealth")]
-                    let response = match (stealth_client, http_client) {
+                    let response = if let Some(hook) = &response_hook { match (&stealth_client, &http_client) {
+                        (Some(client), _) => client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref(), hook).await.ok(),
+                        (None, Some(client)) => client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref(), hook).await.ok(),
+                        (None, None) => None,
+                    }} else { match (stealth_client, http_client) {
                         (Some(stealth_client), _) if request_id.is_some() => stealth_client
                             .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         (Some(stealth_client), _) => stealth_client
@@ -2505,9 +2522,11 @@ impl ObscuraJsRuntime {
                             .await
                             .ok(),
                         (None, None) => None,
-                    };
+                    }};
                     #[cfg(not(feature = "stealth"))]
-                    let response = match http_client {
+                    let response = if let Some(hook) = &response_hook {
+                        if let Some(client) = &http_client { client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref(), hook).await.ok() } else { None }
+                    } else { match http_client {
                         Some(http_client) if request_id.is_some() => http_client
                             .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         Some(http_client) => http_client
@@ -2519,7 +2538,10 @@ impl ObscuraJsRuntime {
                             .await
                             .ok(),
                         None => None,
-                    };
+                    }};
+                    if let Some(hook) = &response_hook {
+                        if hook.fired.load(std::sync::atomic::Ordering::Relaxed) { request_id = Some(hook.request_id.clone()); }
+                    }
                     crate::ops::RenderResourceLoad {
                         generation,
                         url: raw,
@@ -23765,6 +23787,71 @@ mod tests {
         };
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, fail) })
             .await.expect("intercepted request completes");
+        assert_eq!(result.unwrap().value.unwrap(), "TypeError");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_stage_pauses_each_fetch_redirect() {
+        assert_response_stage_pauses_each_fetch_redirect(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_response_stage_pauses_each_fetch_redirect() {
+        assert_response_stage_pauses_each_fetch_redirect(true).await;
+    }
+
+    async fn assert_response_stage_pauses_each_fetch_redirect(stealth: bool) {
+        let mut rt = redirect_chain_runtime(2);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_page_id("response-fetch");
+        rt.set_cdp_response_patterns(Some(std::sync::Arc::new(vec![crate::ops::CdpRequestPattern {
+            url_pattern: "*".into(), resource_type: Some("XHR".into()),
+        }])));
+        let load = rt.call_function_on_for_cdp("async () => (await fetch('/hop/1')).text()", None, &[], true, true);
+        let answer = async {
+            let mut statuses = Vec::new();
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let request = rx.recv().await.unwrap();
+                statuses.push(request.response.as_ref().unwrap().status);
+                ids.push((request.request_id.clone(), request.network_id.clone()));
+                request.resolver.send(crate::ops::InterceptResolution::ContinueResponse { status: None, headers: None }).unwrap();
+            }
+            (statuses, ids)
+        };
+        let (result, (statuses, ids)) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, answer) })
+            .await.expect("redirect response pauses complete");
+        assert_eq!(statuses, vec![302, 200]);
+        assert_ne!(ids[0].0, ids[1].0);
+        assert_eq!(ids[0].1, ids[1].1);
+        assert_eq!(result.unwrap().value.unwrap(), "arrived");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failing_response_stage_rejects_fetch_as_type_error() {
+        let mut rt = redirect_chain_runtime(1);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_cdp_response_patterns(Some(std::sync::Arc::new(vec![crate::ops::CdpRequestPattern {
+            url_pattern: "*".into(), resource_type: None,
+        }])));
+        let load = rt.call_function_on_for_cdp("async () => fetch('/hop/0').then(() => 'ok', error => error.name)", None, &[], true, true);
+        let answer = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.response.as_ref().unwrap().status, 200);
+            request.resolver.send(crate::ops::InterceptResolution::Fail { reason: "Failed".into() }).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, answer) })
+            .await.expect("failed response pause completes");
         assert_eq!(result.unwrap().value.unwrap(), "TypeError");
     }
 

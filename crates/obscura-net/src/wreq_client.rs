@@ -24,6 +24,8 @@ use crate::client::{
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
+#[cfg(feature = "stealth")]
+use crate::interceptor::ResponseInterceptor;
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
 /// host *string*, so on its own it lets a public name that resolves inward
@@ -333,7 +335,7 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request(url, request, callbacks, "GET", None, None).await
+        self.fetch_request::<false>(url, request, callbacks, "GET", None, None, None).await
     }
 
     /// Continue a navigation without changing another page's headers or pool.
@@ -341,7 +343,7 @@ impl StealthHttpClient {
         &self, url: &Url, method: &str, body: Option<Vec<u8>>,
         headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request(url, ResourceRequest::navigation(), callbacks, method, body, headers).await
+        self.fetch_request::<false>(url, ResourceRequest::navigation(), callbacks, method, body, headers, None).await
     }
 
     /// Continue a subresource with request-local interception overrides.
@@ -349,12 +351,20 @@ impl StealthHttpClient {
         &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
         headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request(url, request, callbacks, method, body, headers).await
+        self.fetch_request::<false>(url, request, callbacks, method, body, headers, None).await
     }
 
-    async fn fetch_request(
+    pub async fn fetch_resource_request_with_response_hook(
+        &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>, hook: &dyn ResponseInterceptor,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request::<true>(url, request, callbacks, method, body, headers, Some(hook)).await
+    }
+
+    async fn fetch_request<const RESPONSE_HOOK: bool>(
         &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>,
         method: &str, mut body: Option<Vec<u8>>, mut request_headers: Option<HashMap<String, String>>,
+        response_hook: Option<&dyn ResponseInterceptor>,
     ) -> Result<Response, ObscuraNetError> {
         if request.offline && matches!(url.scheme(), "http" | "https") {
             return Err(ObscuraNetError::Network("net::ERR_INTERNET_DISCONNECTED".into()));
@@ -484,7 +494,7 @@ impl StealthHttpClient {
                     ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
                 })?;
 
-            let status = resp.status();
+            let mut status = resp.status();
             validate_wreq_cors_response(
                 &request,
                 &current_url,
@@ -509,12 +519,33 @@ impl StealthHttpClient {
                 );
             }
 
+            let mut response = Some(resp);
+            let mut intercepted_body = None;
+            if RESPONSE_HOOK {
+                let hook = response_hook.ok_or_else(|| ObscuraNetError::Network("response hook unavailable".into()))?;
+                let original = response.take().ok_or_else(|| ObscuraNetError::Network("response unavailable".into()))?;
+                let body_url = current_url.clone();
+                let max_bytes = request.max_response_bytes;
+                let body = Box::pin(async move {
+                    read_wreq_body_limited(original, &body_url, max_bytes).await.map_err(|error| error.to_string())
+                });
+                let intercepted = hook.intercept_response(&current_url, method.as_str(), status.as_u16(), response_headers, body).await
+                    .map_err(ObscuraNetError::Network)?;
+                status = wreq::StatusCode::from_u16(intercepted.status)
+                    .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+                response_headers = intercepted.headers;
+                intercepted_body = Some(intercepted.body);
+            }
+
             if status.is_redirection() {
-                if let Some(location) = resp.headers().get("location") {
-                    let location_str = location.to_str().map_err(|_| {
-                        ObscuraNetError::Network("Invalid redirect Location".into())
-                    })?;
-                    let next_url = current_url.join(location_str).map_err(|e| {
+                let location = match &response {
+                    Some(response) => response.headers().get("location")
+                        .map(|value| value.to_str().map(str::to_string)
+                            .map_err(|_| ObscuraNetError::Network("Invalid redirect Location".into()))).transpose()?,
+                    None => response_headers.get("location").cloned(),
+                };
+                if let Some(location_str) = location {
+                    let next_url = current_url.join(&location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
@@ -540,8 +571,12 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
-                .await?;
+            let body = if let Some(body) = intercepted_body {
+                body.await.map_err(ObscuraNetError::Network)?
+            } else {
+                read_wreq_body_limited(response.ok_or_else(|| ObscuraNetError::Network("response unavailable".into()))?,
+                    &current_url, request.max_response_bytes).await?
+            };
             drop(in_flight);
 
             let response = Response {

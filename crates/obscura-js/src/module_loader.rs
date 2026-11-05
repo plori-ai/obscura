@@ -278,9 +278,11 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let interception = if state.intercept_enabled {
                     state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
                 } else { None };
+                let response_config = state.cdp_response_patterns.as_ref().and_then(|patterns| state.intercept_tx.as_ref()
+                    .map(|tx| (tx.clone(), state.intercept_page_id.clone(), patterns.clone())));
                 Ok((client, stealth, state.callbacks.clone(), interception,
                     state.network_offline.load(std::sync::atomic::Ordering::Relaxed),
-                    state.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed)))
+                    state.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed), response_config))
             })(),
             None => self
                 .standalone_client
@@ -290,7 +292,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None, None, false, false)
+                    (client, stealth, None, None, false, false, None)
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
@@ -318,7 +320,7 @@ impl ModuleLoader for ObscuraModuleLoader {
             }
 
             match page_network {
-                Ok((client, stealth, callbacks, interception, offline, cache_disabled)) => {
+                Ok((client, stealth, callbacks, interception, offline, cache_disabled, response_config)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
@@ -356,7 +358,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                             let (resolver, resolution) = tokio::sync::oneshot::channel();
                             if tx.send(crate::ops::InterceptedRequest { request_id: request_id.clone(), page_id,
                                 url: url.clone(), method: "GET".into(), headers: Default::default(),
-                                resource_type: "Script".into(), auth_challenge: None, resolver }).is_ok() {
+                                resource_type: "Script".into(), network_id: None, auth_challenge: None, response: None, resolver }).is_ok() {
                                 intercepted = true;
                                 if let Some(event) = network_guard.as_mut().and_then(|guard| guard.event.as_mut()) {
                                     event.intercepted = true;
@@ -383,12 +385,29 @@ impl ModuleLoader for ObscuraModuleLoader {
                                         if let Some(guard) = &mut network_guard { guard.event = None; }
                                         return Err(io_err(reason));
                                     }
+                                    crate::ops::InterceptResolution::ContinueResponse { .. } | crate::ops::InterceptResolution::FulfillResponse { .. } => {
+                                        return Err(io_err("invalid request-stage interception resolution".into()));
+                                    }
                                 }
                             }
                         }
                     }
+                    let response_hook = response_config.map(|(tx, page_id, patterns)| crate::ops::CdpResponseHook {
+                        tx, page_id, request_id: request_id.clone(), resource_type: "Script".into(),
+                        request_headers: Default::default(), patterns, request_was_paused: intercepted,
+                        fired: Arc::new(std::sync::atomic::AtomicBool::new(false)), max_body_bytes: request.max_response_bytes, sequence: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    });
                     #[cfg(feature = "stealth")]
-                    let resp = if let Some(response) = synthetic { response } else { match stealth {
+                    let resp = if let Some(response) = synthetic { response } else if let Some(hook) = &response_hook {
+                        let result = if let Some(stealth) = stealth {
+                            stealth.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"),
+                                changed_body, changed_headers, callbacks.as_deref(), hook).await
+                        } else {
+                            client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"),
+                                changed_body, changed_headers, callbacks.as_deref(), hook).await
+                        };
+                        result.map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+                    } else { match stealth {
                         Some(stealth) if intercepted => stealth.fetch_resource_request(&target, request,
                             changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await,
                         Some(stealth) => stealth
@@ -412,7 +431,11 @@ impl ModuleLoader for ObscuraModuleLoader {
                     }
                     .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))? };
                     #[cfg(not(feature = "stealth"))]
-                    let resp = if let Some(response) = synthetic { response } else {
+                    let resp = if let Some(response) = synthetic { response } else if let Some(hook) = &response_hook {
+                        client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"),
+                            changed_body, changed_headers, callbacks.as_deref(), hook).await
+                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+                    } else {
                         let _ = &stealth;
                         if intercepted { client.fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"),
                             changed_body, changed_headers, callbacks.as_deref()).await }
@@ -425,6 +448,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .await }
                             .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
                     };
+                    intercepted |= response_hook.as_ref().is_some_and(|hook| hook.fired.load(std::sync::atomic::Ordering::Relaxed));
                     // A response (including the blocked-tracker sentinel) is
                     // not a transport failure, even if evaluation later fails.
                     if let Some(guard) = &mut network_guard { guard.event = None; }

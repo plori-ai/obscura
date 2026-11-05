@@ -13,7 +13,7 @@ use tokio::sync::{RwLock, watch};
 use url::Url;
 
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
-use crate::interceptor::{InterceptAction, RequestInterceptor};
+use crate::interceptor::{InterceptAction, RequestInterceptor, ResponseInterceptor};
 
 fn configured_root_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
@@ -1441,7 +1441,7 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None).await
+        self.fetch_request_uncached::<false>(initial_method, url, initial_body, callbacks, request, None, None).await
     }
 
     /// A navigation continued by an interceptor uses request-local overrides.
@@ -1451,7 +1451,7 @@ impl ObscuraHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
-        self.fetch_request_uncached(method, url, body, callbacks, ResourceRequest::navigation(), headers).await
+        self.fetch_request_uncached::<false>(method, url, body, callbacks, ResourceRequest::navigation(), headers, None).await
     }
 
     /// Continue a subresource with request-local interception overrides.
@@ -1461,13 +1461,22 @@ impl ObscuraHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
-        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+        self.fetch_request_uncached::<false>(method, url, body, callbacks, request, headers, None).await
     }
 
-    async fn fetch_request_uncached(
+    pub async fn fetch_resource_request_with_response_hook(
+        &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>, hook: &dyn ResponseInterceptor,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes()).map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached::<true>(method, url, body, callbacks, request, headers, Some(hook)).await
+    }
+
+    async fn fetch_request_uncached<const RESPONSE_HOOK: bool>(
         &self, initial_method: Method, url: &Url, initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
         mut request_headers: Option<HashMap<String, String>>,
+        response_hook: Option<&dyn ResponseInterceptor>,
     ) -> Result<Response, ObscuraNetError> {
         if request.offline && matches!(url.scheme(), "http" | "https") {
             return Err(ObscuraNetError::Network("net::ERR_INTERNET_DISCONNECTED".into()));
@@ -1680,7 +1689,7 @@ impl ObscuraHttpClient {
                 ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
 
-            let status = resp.status();
+            let mut status = resp.status();
             validate_reqwest_cors_response(
                 &request,
                 &current_url,
@@ -1705,12 +1714,33 @@ impl ObscuraHttpClient {
                 );
             }
 
+            let mut response = Some(resp);
+            let mut intercepted_body = None;
+            if RESPONSE_HOOK {
+                let hook = response_hook.ok_or_else(|| ObscuraNetError::Network("response hook unavailable".into()))?;
+                let original = response.take().ok_or_else(|| ObscuraNetError::Network("response unavailable".into()))?;
+                let body_url = current_url.clone();
+                let max_bytes = request.max_response_bytes;
+                let body = Box::pin(async move {
+                    read_reqwest_body_limited(original, &body_url, max_bytes).await.map_err(|error| error.to_string())
+                });
+                let intercepted = hook.intercept_response(&current_url, method.as_str(), status.as_u16(), response_headers, body).await
+                    .map_err(ObscuraNetError::Network)?;
+                status = reqwest::StatusCode::from_u16(intercepted.status)
+                    .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+                response_headers = intercepted.headers;
+                intercepted_body = Some(intercepted.body);
+            }
+
             if status.is_redirection() {
-                if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
-                    let location_str = location.to_str().map_err(|_| {
-                        ObscuraNetError::Network("Invalid redirect Location header".into())
-                    })?;
-                    let next_url = current_url.join(location_str).map_err(|e| {
+                let location = match &response {
+                    Some(response) => response.headers().get(reqwest::header::LOCATION)
+                        .map(|value| value.to_str().map(str::to_string)
+                            .map_err(|_| ObscuraNetError::Network("Invalid redirect Location header".into()))).transpose()?,
+                    None => response_headers.get("location").cloned(),
+                };
+                if let Some(location_str) = location {
+                    let next_url = current_url.join(&location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
@@ -1738,12 +1768,12 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
-                resp,
-                &current_url,
-                request.max_response_bytes,
-            )
-            .await?;
+            let body_bytes = if let Some(body) = intercepted_body {
+                body.await.map_err(ObscuraNetError::Network)?
+            } else {
+                read_reqwest_body_limited(response.ok_or_else(|| ObscuraNetError::Network("response unavailable".into()))?,
+                    &current_url, request.max_response_bytes).await?
+            };
             drop(in_flight);
 
             let response = Response {
