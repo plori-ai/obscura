@@ -262,14 +262,18 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
     // Cookies and Web Storage are written on every navigation; this covers the
     // writes an agent makes after a page has settled, on the way out.
     let mut runtime_pump_armed = false;
+    // MCP stdio transport: newline-delimited JSON (one message per line). The
+    // buffer outlives each select: when a page turn wins the race in the middle
+    // of a message longer than the reader's buffer, read_until keeps the bytes
+    // read so far here and the next iteration continues the same message.
+    // read_line is not cancel safe and dropped them, so the request was lost.
+    let mut pending: Vec<u8> = Vec::new();
 
     loop {
-        // MCP stdio transport: newline-delimited JSON (one message per line)
-        let mut line = String::new();
         let n = if runtime_pump_armed {
             tokio::select! {
                 biased;
-                read = reader.read_line(&mut line) => Some(read?),
+                read = reader.read_until(b'\n', &mut pending) => Some(read?),
                 pump_result = state.page_mut().run_autonomous_event_loop_turn() => {
                     let pump_result = match pump_result {
                         Ok(reached_idle) => state.finish_active_page_turn(reached_idle).await,
@@ -286,7 +290,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
                 }
             }
         } else {
-            Some(reader.read_line(&mut line).await?)
+            Some(reader.read_until(b'\n', &mut pending).await?)
         };
         let Some(n) = n else {
             continue;
@@ -295,6 +299,8 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             state.context.save_storage();
             return Ok(());
         }
+        let line = String::from_utf8_lossy(&pending).into_owned();
+        pending.clear();
 
         let trimmed = line.trim();
         if trimmed.is_empty() {

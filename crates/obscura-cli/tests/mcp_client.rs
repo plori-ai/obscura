@@ -480,3 +480,55 @@ fn test_close_resets_state() {
     let snap = c.tool("browser_snapshot", serde_json::json!({}));
     assert!(snap["result"]["isError"].is_null());
 }
+
+/// A request longer than the server's read buffer arrives in several reads. While
+/// a page has timers, the server races reading stdin against running the page, and
+/// the part of a request read before a page turn won must not be lost: the request
+/// would never get a reply. forge's page description script (about 8 KiB as JSON)
+/// hung this way on pages with busy timers.
+#[cfg(unix)]
+#[test]
+fn large_request_split_across_reads_survives_page_tasks() {
+    let mut c = McpClient::spawn();
+    let pid = c.child.id();
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&done);
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..300 {
+            if watchdog_done.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // A lost request leaves the client blocked on a reply that never comes.
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    });
+    c.tool(
+        "browser_navigate",
+        serde_json::json!({"url": "data:text/html,<title>busy</title><script>setInterval(() => { document.title = 'busy ' + Date.now(); }, 1)</script>"}),
+    );
+    for round in 1..=5 {
+        let id = c.next_id;
+        c.next_id += 1;
+        let expression = format!("/*{}*/ 'ok-{round}'", "x".repeat(40_000));
+        let mut body = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "browser_evaluate", "arguments": {"expression": expression}},
+        }))
+        .unwrap();
+        body.push('\n');
+        let (head, tail) = body.as_bytes().split_at(body.len() / 2);
+        c.stdin.write_all(head).unwrap();
+        c.stdin.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        c.stdin.write_all(tail).unwrap();
+        c.stdin.flush().unwrap();
+        let resp = c.read_msg();
+        assert_eq!(resp["id"], id, "reply to another request: {resp}");
+        assert_eq!(content_text(&resp), format!("ok-{round}"));
+    }
+    done.store(true, Ordering::Release);
+    watchdog.join().unwrap();
+}
