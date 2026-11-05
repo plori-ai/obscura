@@ -1665,6 +1665,12 @@ pub struct LayoutStyle {
     /// modern web rely on it for depth, and without it those elements paint
     /// flat. See [`BoxShadow`] and `paint::paint_box_shadow`.
     pub box_shadow: Option<BoxShadow>,
+    /// Inherited text shadows. An empty list represents the explicit `none`.
+    pub text_shadow: Option<std::sync::Arc<[TextShadow]>>,
+    /// Gaussian standard deviations for a supported filter list. Relative
+    /// lengths resolve against the element font and viewport at paint time.
+    /// `Some` with zero radii still establishes a stacking context.
+    pub filter_blur: Option<Box<[Dimension]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1838,6 +1844,15 @@ pub struct BoxShadow {
     pub spread: f32,
     pub color: [u8; 4],
     pub inset: bool,
+}
+
+/// A text-shadow layer; omitted color means the used text color.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextShadow {
+    pub offset_x: Dimension,
+    pub offset_y: Dimension,
+    pub blur: Dimension,
+    pub color: Option<[u8; 4]>,
 }
 
 /// `object-fit` for replaced elements (`<img>`): how the image's intrinsic

@@ -1942,7 +1942,20 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "rotate" => parse_individual_rotate(style, value),
         "scale" => parse_individual_scale(style, value),
         "filter" => {
-            set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, non_none_value(value))
+            if let Some(blur) = parse_blur_filter(value) {
+                set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, blur.is_some());
+                style.filter_blur = blur;
+            } else {
+                // A later recognized CSS filter function replaces a
+                // prior blur even though that other effect is not painted yet.
+                let lower = value.trim().to_ascii_lowercase();
+                if ["brightness(", "contrast(", "grayscale(", "opacity(", "drop-shadow(",
+                    "saturate(", "sepia(", "invert(", "hue-rotate(", "url("]
+                    .iter().any(|prefix| lower.starts_with(prefix)) && lower.ends_with(')') {
+                    style.filter_blur = None;
+                }
+                set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, non_none_value(value));
+            }
         }
         "backdrop-filter" | "-webkit-backdrop-filter" => set_containing_block_trigger(
             style,
@@ -1977,6 +1990,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         ),
         "box-shadow" | "-webkit-box-shadow" => {
             style.box_shadow = parse_box_shadow(value, style.color, style.color_scheme_dark);
+        }
+        "text-shadow" => {
+            if let Some(shadows) = parse_text_shadow(value, style.color_scheme_dark) {
+                style.text_shadow = Some(shadows);
+            }
         }
         _ => {}
     }
@@ -2298,6 +2316,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "content-visibility"
             | "box-shadow"
             | "-webkit-box-shadow"
+            | "text-shadow"
     );
     if !known {
         return false;
@@ -2396,7 +2415,9 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
         // bookkeeping. Advertising an effect that is not painted is worse
         // than a conservative false result because feature queries commonly
         // use them to select the only visible implementation of an effect.
-        "filter" | "backdrop-filter" | "-webkit-backdrop-filter" | "perspective" => {
+        "filter" => parse_blur_filter(value).is_some(),
+        "text-shadow" => parse_text_shadow(value, false).is_some(),
+        "backdrop-filter" | "-webkit-backdrop-filter" | "perspective" => {
             value.eq_ignore_ascii_case("none")
         }
         "contain" => value.eq_ignore_ascii_case("none"),
@@ -8782,6 +8803,72 @@ fn parse_background_position(value: &str) -> crate::BackgroundPosition {
 }
 
 /// Parse a `box-shadow` value into its first layer:
+fn parse_text_shadow(value: &str, dark_scheme: bool) -> Option<std::sync::Arc<[crate::TextShadow]>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") { return Some(std::sync::Arc::from([])); }
+    let mut shadows = Vec::new();
+    for layer in split_top_level(value, ',') {
+        let mut lengths = Vec::new();
+        let mut color = None;
+        let mut saw_color = false;
+        for token in split_ws_paren(layer.trim()) {
+            let length = dimension_value(token);
+            if !matches!(length, crate::Dimension::Auto | crate::Dimension::Percent(_)) {
+                lengths.push(length);
+            } else if !saw_color && token.eq_ignore_ascii_case("currentcolor") {
+                saw_color = true;
+            } else if !saw_color {
+                color = Some(parse_color_for_scheme(token, dark_scheme)?);
+                saw_color = true;
+            } else {
+                return None;
+            }
+        }
+        if !(2..=3).contains(&lengths.len()) || lengths.iter().any(|length| match length {
+            crate::Dimension::Px(v) | crate::Dimension::Em(v) | crate::Dimension::Ex(v)
+            | crate::Dimension::Rem(v) | crate::Dimension::Vw(v) | crate::Dimension::Vh(v)
+            | crate::Dimension::Vmin(v) | crate::Dimension::Vmax(v) => !v.is_finite(),
+            _ => true,
+        }) { return None; }
+        let blur = lengths.get(2).copied().unwrap_or(crate::Dimension::Px(0.0));
+        let blur_value = match blur {
+            crate::Dimension::Px(v) | crate::Dimension::Em(v) | crate::Dimension::Ex(v)
+            | crate::Dimension::Rem(v) | crate::Dimension::Vw(v) | crate::Dimension::Vh(v)
+            | crate::Dimension::Vmin(v) | crate::Dimension::Vmax(v) => v,
+            _ => return None,
+        };
+        if !blur_value.is_finite() || blur_value < 0.0 { return None; }
+        shadows.push(crate::TextShadow { offset_x: lengths[0], offset_y: lengths[1], blur, color });
+    }
+    (!shadows.is_empty()).then(|| shadows.into())
+}
+
+/// Parse a list of Gaussian blur filters. Consecutive blurs combine by adding
+/// their variances. Unsupported filter functions remain outside this subset.
+fn parse_blur_filter(value: &str) -> Option<Option<Box<[crate::Dimension]>>> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.eq_ignore_ascii_case("none") { return Some(None); }
+    let mut rest = value.as_str();
+    let mut radii = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix("blur(")?;
+        let end = rest.find(')')?;
+        let inner = rest[..end].trim();
+        let radius = if inner.is_empty() { crate::Dimension::Px(0.0) } else { dimension_value(inner) };
+        let amount = match radius {
+            crate::Dimension::Px(v) | crate::Dimension::Em(v) | crate::Dimension::Ex(v)
+            | crate::Dimension::Rem(v) | crate::Dimension::Vw(v) | crate::Dimension::Vh(v)
+            | crate::Dimension::Vmin(v) | crate::Dimension::Vmax(v) => v,
+            _ => return None,
+        };
+        if !amount.is_finite() || amount < 0.0 { return None; }
+        if inner.parse::<f32>().ok().is_some_and(|v| v != 0.0) { return None; }
+        radii.push(radius);
+        rest = rest[end + 1..].trim_start();
+    }
+    (!radii.is_empty()).then(|| Some(radii.into_boxed_slice()))
+}
+
 /// `[inset]? <offset-x> <offset-y> <blur>? <spread>? <color>?`. The `inset`
 /// keyword and the color may each lead or trail the lengths; comma-separated
 /// multiples are accepted but only the first layer is stored. `current_color`
@@ -8969,7 +9056,12 @@ mod tests {
         for value in ["normal", "break-all", "keep-all", "break-word"] {
             assert!(supports_declaration("word-break", value), "{value}");
         }
-        for property in ["filter", "backdrop-filter", "-webkit-backdrop-filter"] {
+        assert!(supports_declaration("filter", "blur(2px)"));
+        assert!(supports_declaration("filter", "blur(0.5em) blur(1rem)"));
+        assert!(supports_declaration("filter", "blur(1px)blur(2px)"));
+        assert!(!supports_declaration("filter", "blur(-2px)"));
+        assert!(!supports_declaration("filter", "blur(5%)"));
+        for property in ["backdrop-filter", "-webkit-backdrop-filter"] {
             assert!(supports_declaration(property, "none"), "{property}");
             assert!(!supports_declaration(property, "blur(2px)"), "{property}");
         }
@@ -8991,6 +9083,20 @@ mod tests {
         assert!(!supports_declaration("display", "grid;"));
         assert!(!supports_declaration("color", "red !important"));
         assert!(!supports_declaration("display", "banana"));
+    }
+
+    #[test]
+    fn text_shadow_parses_multiple_layers_and_none() {
+        let style = compute_style("div", Some("text-shadow:2px 3px 4px rgba(255,0,0,.5), -1px 0 currentColor"));
+        let shadows = style.text_shadow.unwrap();
+        assert_eq!(shadows.len(), 2);
+        assert_eq!(shadows[0].offset_x, crate::Dimension::Px(2.0));
+        assert_eq!(shadows[0].blur, crate::Dimension::Px(4.0));
+        assert_eq!(shadows[0].color, Some([255, 0, 0, 128]));
+        assert_eq!(shadows[1].offset_x, crate::Dimension::Px(-1.0));
+        assert_eq!(shadows[1].color, None);
+        assert!(compute_style("div", Some("text-shadow:none")).text_shadow.unwrap().is_empty());
+        assert!(!supports_declaration("text-shadow", "1px 2px -3px red"));
     }
 
     #[test]

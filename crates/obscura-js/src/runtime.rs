@@ -12068,12 +12068,10 @@ mod tests {
                 ])"#,
             )
             .unwrap();
-        assert_eq!(
-            result,
-            serde_json::json!(
-                "[false,false,false,false,false,true,true,true,false,false,false,true,false,true,true,false,false,true,false,true,false,true,false,true,true,true,false,false,true]"
-            )
-        );
+        let filter = if cfg!(feature = "render") { "true" } else { "false" };
+        assert_eq!(result, serde_json::json!(format!(
+            "[false,false,false,false,false,true,true,true,false,false,false,true,false,true,true,false,false,true,false,true,{filter},true,false,true,true,true,false,false,true]"
+        )));
     }
 
     #[test]

@@ -5485,6 +5485,31 @@ fn layout_dom_once(
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
     let mut engine =
         crate::inline::TextEngine::new_with_web_fonts_and_emoji(fonts, needs_emoji_font);
+    #[cfg(feature = "paint")]
+    {
+        let mut fallback_candidates = HashSet::new();
+        // Text in a shadow root is absent from DOM descendants but does
+        // contribute to the flattened tree that layout and painting use.
+        let rendered = tree.has_shadow_roots().then(|| rendered_descendants(tree, tree.document()));
+        for id in rendered.as_ref().unwrap_or(&descendants) {
+            tree.with_node(*id, |node| {
+                let obscura_dom::tree::NodeData::Text { contents } = &node.data else { return };
+                if contents.is_ascii() { return; }
+                let mut ancestor = rendered_parent(tree, *id);
+                while let Some(parent) = ancestor {
+                    if styles.get(&parent).is_some_and(|style| style.display == crate::Display::None) { return; }
+                    ancestor = rendered_parent(tree, parent);
+                }
+                crate::inline::collect_fallback_candidates(contents, &mut fallback_candidates);
+            });
+        }
+        for style in styles.values().filter(|style| style.display != crate::Display::None) {
+            for content in [style.before_content.as_deref(), style.after_content.as_deref()].into_iter().flatten() {
+                crate::inline::collect_fallback_candidates(content, &mut fallback_candidates);
+            }
+        }
+        engine.ensure_system_fallback(fallback_candidates);
+    }
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first
@@ -5554,6 +5579,7 @@ fn layout_dom_once(
             word_break: crate::WordBreak,
             text_wrap_style: crate::TextWrapStyle,
             text_transform: crate::TextTransform,
+            text_shadow: Option<Arc<[crate::TextShadow]>>,
             italic: bool,
             box_sizing: crate::BoxSizing,
             border_collapse: bool,
@@ -5619,6 +5645,7 @@ fn layout_dom_once(
                     word_break: crate::WordBreak::Normal,
                     text_wrap_style: crate::TextWrapStyle::Auto,
                     text_transform: crate::TextTransform::None,
+                    text_shadow: None,
                     italic: false,
                     box_sizing: crate::BoxSizing::ContentBox,
                     border_collapse: false,
@@ -5775,6 +5802,9 @@ fn layout_dom_once(
                     }
                     if let Some(value) = style.text_transform {
                         inh.text_transform = value;
+                    }
+                    if let Some(value) = &style.text_shadow {
+                        inh.text_shadow = Some(Arc::clone(value));
                     }
                     if let Some(value) = style.font_style_italic {
                         inh.italic = value;
@@ -5950,6 +5980,16 @@ fn layout_dom_once(
                 // em in non-font-size properties is relative to this element's
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
+                if let Some(shadows) = style.text_shadow.as_mut() {
+                    for shadow in Arc::make_mut(shadows) {
+                        shadow.offset_x = shadow.offset_x.resolve(em_px, root_fs, vw, vh);
+                        shadow.offset_y = shadow.offset_y.resolve(em_px, root_fs, vw, vh);
+                        shadow.blur = shadow.blur.resolve(em_px, root_fs, vw, vh);
+                    }
+                    inh.text_shadow = style.text_shadow.clone();
+                } else {
+                    style.text_shadow = inh.text_shadow.clone();
+                }
                 crate::style::set_grid_calc_context(style, em_px, root_fs, vw, vh);
                 if let Some(expression) = style.letter_spacing_expression.as_deref() {
                     style.letter_spacing = crate::style::resolve_contextual_length(
@@ -6381,6 +6421,7 @@ fn layout_dom_once(
                 let host_word_break = style.word_break;
                 let host_text_wrap_style = style.text_wrap_style;
                 let host_transform = style.text_transform;
+                let host_text_shadow = style.text_shadow.clone();
                 let host_italic = style.font_style_italic;
                 let host_text_align = style.text_align;
                 let host_text_indent = style.text_indent;
@@ -6610,6 +6651,15 @@ fn layout_dom_once(
                     }
                     if pseudo.text_transform.is_none() {
                         pseudo.text_transform = host_transform;
+                    }
+                    if let Some(shadows) = pseudo.text_shadow.as_mut() {
+                        for shadow in Arc::make_mut(shadows) {
+                            shadow.offset_x = shadow.offset_x.resolve(pseudo_em, root_fs, vw, vh);
+                            shadow.offset_y = shadow.offset_y.resolve(pseudo_em, root_fs, vw, vh);
+                            shadow.blur = shadow.blur.resolve(pseudo_em, root_fs, vw, vh);
+                        }
+                    } else {
+                        pseudo.text_shadow = host_text_shadow.clone();
                     }
                     if pseudo.font_style_italic.is_none() {
                         pseudo.font_style_italic = host_italic;
