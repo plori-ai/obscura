@@ -3765,13 +3765,15 @@ fn stacking_z_index(
 fn filter_blur_radius(style: &crate::LayoutStyle, root_font_size: f32, viewport: (f32, f32)) -> f32 {
     let Some(radii) = style.filter_blur.as_ref() else { return 0.0 };
     let font_size = style.font_size.unwrap_or(16.0);
-    let variance = radii.iter().fold(0.0f64, |sum, radius| {
+    let value = radii.iter().fold(0.0f64, |sum, radius| {
         match radius.resolve(font_size, root_font_size, viewport.0 / 100.0, viewport.1 / 100.0) {
-            crate::Dimension::Px(value) if value.is_finite() => sum + f64::from(value).powi(2),
+            crate::Dimension::Px(value) if value.is_finite() => {
+                if style.filter_color_ops.is_some() { sum + f64::from(value) } else { sum + f64::from(value).powi(2) }
+            }
             _ => sum,
         }
     });
-    variance.sqrt().min(f64::from(f32::MAX)) as f32
+    (if style.filter_color_ops.is_some() { value } else { value.sqrt() }).min(f64::from(f32::MAX)) as f32
 }
 
 /// Whether this box participates in the float painting band of its current
@@ -4173,7 +4175,7 @@ fn paint_laid_dom_scrolled(
                 .styles
                 .get(&nid)
                 .is_some_and(|style| style.opacity.is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0)
-                    || filter_blur_radius(style, root_font_size, viewport) > 0.0);
+                    || filter_blur_radius(style, root_font_size, viewport) > 0.0 || style.filter_color_ops.is_some());
         let is_transform_root = suppress_transform_for != Some(nid)
             && laid.styles.get(&nid).is_some_and(has_authored_transform);
         let z = (suppress_stacking_for != Some(nid))
@@ -4589,7 +4591,9 @@ fn paint_laid_dom_scrolled(
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
         let blur = filter_blur_radius(style, root_font_size, viewport);
-        if suppress_opacity_for != Some(nid) && (own_opacity < 1.0 || blur > 0.0) {
+        let filter_color_ops = style.filter_color_ops.clone();
+        let filter_font_size = style.font_size.unwrap_or(16.0);
+        if suppress_opacity_for != Some(nid) && (own_opacity < 1.0 || blur > 0.0 || filter_color_ops.is_some()) {
             opacity_subtree_skip.insert(nid);
             opacity_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
             if own_opacity <= 0.0 {
@@ -4646,7 +4650,25 @@ fn paint_laid_dom_scrolled(
                 print_economy,
                 canvas_background,
             )?;
-            let (layer, content_x, content_y) = if blur > 0.0 {
+            let (layer, content_x, content_y) = if let Some(operations) = filter_color_ops.as_ref() {
+                // Mixed lists must retain their authored order. Crop once with
+                // enough margin for every blur, then apply the whole list to
+                // that surface instead of repeatedly processing the viewport.
+                let padding = ((blur * raster_scale * 3.0).ceil() + 2.0) as usize;
+                let Some((mut layer, content_x, content_y)) = crop_isolated_layer(layer, padding) else { continue };
+                for operation in operations.iter().copied() {
+                    if let crate::FilterOperation::Blur(radius) = operation {
+                        if let crate::Dimension::Px(value) = radius.resolve(
+                            filter_font_size, root_font_size, viewport.0 / 100.0, viewport.1 / 100.0,
+                        ) {
+                            gaussian_blur_pixmap(&mut layer, value * raster_scale);
+                        }
+                    } else {
+                        apply_filter_color(&mut layer, operation);
+                    }
+                }
+                (layer, content_x, content_y)
+            } else if blur > 0.0 {
                 let Some(result) = blur_isolated_layer(layer, blur * raster_scale) else { continue };
                 result
             } else { (layer, 0, 0) };
@@ -6838,9 +6860,36 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
     ]
 }
 
-/// Blur only the nontransparent part of an isolated surface and its kernel
-/// margin. Small filtered elements should not blur a whole viewport.
-fn blur_isolated_layer(mut layer: Pixmap, sigma: f32) -> Option<(Pixmap, u32, u32)> {
+fn apply_filter_color(pixmap: &mut Pixmap, operation: crate::FilterOperation) {
+    use crate::FilterOperation as Op;
+    for pixel in pixmap.pixels_mut() {
+        let alpha = f32::from(pixel.alpha());
+        if alpha == 0.0 { continue; }
+        let (mut r, mut g, mut b, mut a) = (
+            f32::from(pixel.red()), f32::from(pixel.green()), f32::from(pixel.blue()), alpha,
+        );
+        match operation {
+            Op::Brightness(v) => { let v = v.min(65536.0); r *= v; g *= v; b *= v; }
+            Op::Contrast(v) => {
+                let v = v.min(65536.0);
+                let bias = alpha * 0.5 * (1.0 - v);
+                r = r * v + bias; g = g * v + bias; b = b * v + bias;
+            }
+            Op::Grayscale(v) => {
+                let gray = r * 0.2126 + g * 0.7152 + b * 0.0722;
+                r += (gray - r) * v; g += (gray - g) * v; b += (gray - b) * v;
+            }
+            Op::Opacity(v) => { r *= v; g *= v; b *= v; a *= v; }
+            Op::Blur(_) => continue,
+        }
+        let a = a.round().clamp(0.0, 255.0) as u8;
+        let component = |v: f32| v.round().clamp(0.0, f32::from(a)) as u8;
+        *pixel = tiny_skia::PremultipliedColorU8::from_rgba(component(r), component(g), component(b), a).unwrap_or(*pixel);
+    }
+}
+
+/// Crop an isolated surface around its nontransparent content and a margin.
+fn crop_isolated_layer(layer: Pixmap, padding: usize) -> Option<(Pixmap, u32, u32)> {
     let (width, height) = (layer.width() as usize, layer.height() as usize);
     let (mut left, mut top, mut right, mut bottom) = (width, height, 0usize, 0usize);
     for (y, row) in layer.pixels().chunks_exact(width).enumerate() {
@@ -6853,13 +6902,11 @@ fn blur_isolated_layer(mut layer: Pixmap, sigma: f32) -> Option<(Pixmap, u32, u3
         }
     }
     if right <= left || bottom <= top { return None; }
-    let padding = ((sigma.max(0.0) * 3.0).ceil() + 2.0) as usize;
     left = left.saturating_sub(padding);
     top = top.saturating_sub(padding);
     right = right.saturating_add(padding).min(width);
     bottom = bottom.saturating_add(padding).min(height);
     if left == 0 && top == 0 && right == width && bottom == height {
-        gaussian_blur_pixmap(&mut layer, sigma);
         return Some((layer, 0, 0));
     }
     let (crop_width, crop_height) = (right - left, bottom - top);
@@ -6868,8 +6915,16 @@ fn blur_isolated_layer(mut layer: Pixmap, sigma: f32) -> Option<(Pixmap, u32, u3
         let start = (top + y) * width + left;
         row.copy_from_slice(&layer.pixels()[start..start + crop_width]);
     }
-    gaussian_blur_pixmap(&mut crop, sigma);
     Some((crop, left as u32, top as u32))
+}
+
+/// Blur only the nontransparent part of an isolated surface and its kernel
+/// margin. Small filtered elements should not blur a whole viewport.
+fn blur_isolated_layer(layer: Pixmap, sigma: f32) -> Option<(Pixmap, u32, u32)> {
+    let padding = ((sigma.max(0.0) * 3.0).ceil() + 2.0) as usize;
+    let (mut layer, left, top) = crop_isolated_layer(layer, padding)?;
+    gaussian_blur_pixmap(&mut layer, sigma);
+    Some((layer, left, top))
 }
 
 /// Approximate a Gaussian using three separable box filters. Work is linear in
@@ -12728,6 +12783,37 @@ mod tests {
     }
 
     #[test]
+    fn cropped_mixed_filters_match_the_full_surface() {
+        let mut layer = Pixmap::new(128, 96).unwrap();
+        for y in 30..43 {
+            for x in 37..54 {
+                let alpha = ((x * 13 + y * 17) % 256) as u8;
+                layer.pixels_mut()[(y * 128 + x) as usize] =
+                    tiny_skia::PremultipliedColorU8::from_rgba(alpha / 2, 0, 0, alpha).unwrap();
+            }
+        }
+        let run = |layer: &mut Pixmap| {
+            apply_filter_color(layer, crate::FilterOperation::Brightness(1.5));
+            gaussian_blur_pixmap(layer, 2.0);
+            apply_filter_color(layer, crate::FilterOperation::Contrast(0.5));
+            gaussian_blur_pixmap(layer, 3.4);
+            apply_filter_color(layer, crate::FilterOperation::Opacity(0.75));
+        };
+        let mut reference = layer.clone();
+        run(&mut reference);
+        let (mut actual, left, top) = crop_isolated_layer(layer, 19).unwrap();
+        run(&mut actual);
+        for y in 0u32..96 {
+            for x in 0u32..128 {
+                let got = x.checked_sub(left).zip(y.checked_sub(top))
+                    .and_then(|(x, y)| (x < actual.width() && y < actual.height()).then(|| actual.pixel(x, y)).flatten())
+                    .unwrap_or(tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
+                assert_eq!(got, reference.pixel(x, y).unwrap(), "x={x} y={y}");
+            }
+        }
+    }
+
+    #[test]
     fn cropped_filter_blur_matches_full_surface() {
         for sigma in [0.5, 2.0, 8.0, 15.0] {
             let mut layer = Pixmap::new(128, 96).unwrap();
@@ -12786,6 +12872,27 @@ mod tests {
         assert!(scaled.pixel(0, 80).unwrap().red() < 225, "offscreen blur at 2x");
         assert_eq!(scaled.pixel(78, 80).unwrap().red(), 255, "scaled ancestor clip");
         assert!(scaled.pixel(80, 80).unwrap().red() < 225, "blur inside scaled ancestor clip");
+    }
+
+    #[test]
+    fn color_filters_apply_in_order_and_opacity_is_a_group() {
+        let tree = parse_html(r#"<html style="background:white"><body style="margin:0">
+            <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:rgb(100,150,200);filter:brightness(.5)"></div>
+            <div style="position:absolute;left:25px;top:0;width:20px;height:20px;background:rgb(100,150,200);filter:grayscale(1)"></div>
+            <div style="position:absolute;left:50px;top:0;width:20px;height:20px;background:rgb(100,150,200);filter:brightness(2) contrast(.5)"></div>
+            <div style="position:absolute;left:75px;top:0;width:20px;height:20px;background:rgb(100,150,200);filter:contrast(.5) brightness(2)"></div>
+            <div style="position:absolute;left:100px;top:0;width:20px;height:20px;background:red;filter:opacity(.5)">
+              <div style="position:absolute;left:10px;top:0;width:10px;height:20px;background:blue"></div>
+            </div>
+            </body></html>"#);
+        let pixmap = paint_dom(&tree, (125.0, 30.0), None).expect("paint");
+        let p = pixmap.pixel(10, 10).unwrap();
+        assert!((p.red(), p.green(), p.blue()) == (50, 75, 100), "brightness={p:?}");
+        let p = pixmap.pixel(35, 10).unwrap();
+        assert!((p.red() as i32 - 143).abs() <= 1 && p.red() == p.green() && p.green() == p.blue(), "grayscale={p:?}");
+        assert_ne!(pixmap.pixel(60, 10), pixmap.pixel(85, 10), "filter order must matter");
+        let p = pixmap.pixel(115, 10).unwrap();
+        assert!((p.red() as i32 - 127).abs() <= 2 && (p.green() as i32 - 127).abs() <= 2 && p.blue() >= 253, "opacity group={p:?}");
     }
 
     #[test]

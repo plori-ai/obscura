@@ -1669,6 +1669,8 @@ pub struct LayoutStyle {
     /// lengths resolve against the element font and viewport at paint time.
     /// `Some` with zero radii still establishes a stacking context.
     pub filter_blur: Option<Box<[Dimension]>>,
+    /// Ordered operations when a filter list includes a color adjustment.
+    pub filter_color_ops: Option<Box<[FilterOperation]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1851,6 +1853,16 @@ pub struct TextShadow {
     pub offset_y: Dimension,
     pub blur: Dimension,
     pub color: Option<[u8; 4]>,
+}
+
+/// Supported operations in an ordered CSS filter list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FilterOperation {
+    Blur(Dimension),
+    Brightness(f32),
+    Contrast(f32),
+    Grayscale(f32),
+    Opacity(f32),
 }
 
 /// `object-fit` for replaced elements (`<img>`): how the image's intrinsic
