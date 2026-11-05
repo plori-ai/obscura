@@ -1942,19 +1942,20 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "rotate" => parse_individual_rotate(style, value),
         "scale" => parse_individual_scale(style, value),
         "filter" => {
-            if let Some(blur) = parse_blur_filter(value) {
+            if let Some((blur, color_ops)) = parse_filter_list(value) {
                 set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, blur.is_some());
                 style.filter_blur = blur;
+                style.filter_color_ops = color_ops;
             } else {
                 // A later recognized CSS filter function replaces a
                 // prior blur even though that other effect is not painted yet.
                 let lower = value.trim().to_ascii_lowercase();
-                if ["brightness(", "contrast(", "grayscale(", "opacity(", "drop-shadow(",
-                    "saturate(", "sepia(", "invert(", "hue-rotate(", "url("]
+                if ["drop-shadow(", "saturate(", "sepia(", "invert(", "hue-rotate(", "url("]
                     .iter().any(|prefix| lower.starts_with(prefix)) && lower.ends_with(')') {
                     style.filter_blur = None;
+                    style.filter_color_ops = None;
+                    set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, true);
                 }
-                set_containing_block_trigger(style, crate::CB_TRIGGER_FILTER, non_none_value(value));
             }
         }
         "backdrop-filter" | "-webkit-backdrop-filter" => set_containing_block_trigger(
@@ -2411,11 +2412,8 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
         "clip-path" | "-webkit-clip-path" => {
             value.eq_ignore_ascii_case("none") || parse_clip_path_polygon(value).is_some()
         }
-        // These properties currently participate only in containing-block
-        // bookkeeping. Advertising an effect that is not painted is worse
-        // than a conservative false result because feature queries commonly
-        // use them to select the only visible implementation of an effect.
-        "filter" => parse_blur_filter(value).is_some(),
+        // Advertise only the filter functions actually painted by the engine.
+        "filter" => parse_filter_list(value).is_some(),
         "text-shadow" => parse_text_shadow(value, false).is_some(),
         "backdrop-filter" | "-webkit-backdrop-filter" | "perspective" => {
             value.eq_ignore_ascii_case("none")
@@ -8869,6 +8867,46 @@ fn parse_blur_filter(value: &str) -> Option<Option<Box<[crate::Dimension]>>> {
     (!radii.is_empty()).then(|| Some(radii.into_boxed_slice()))
 }
 
+fn parse_filter_list(value: &str) -> Option<(Option<Box<[crate::Dimension]>>, Option<Box<[crate::FilterOperation]>>)> {
+    if let Some(blur) = parse_blur_filter(value) { return Some((blur, None)); }
+    let value = value.trim().to_ascii_lowercase();
+    let mut rest = value.as_str();
+    let mut radii = Vec::new();
+    let mut operations = Vec::new();
+    let mut has_color = false;
+    while !rest.is_empty() {
+        let open = rest.find('(')?;
+        let close = rest.find(')')?;
+        if close < open { return None; }
+        let name = &rest[..open];
+        let argument = rest[open + 1..close].trim();
+        let op = if name == "blur" {
+            let token = &rest[..=close];
+            let blur = parse_blur_filter(token)??;
+            let radius = *blur.first()?;
+            radii.push(radius);
+            crate::FilterOperation::Blur(radius)
+        } else {
+            let amount = if argument.is_empty() { 1.0 } else if let Some(percent) = argument.strip_suffix('%') {
+                percent.trim().parse::<f32>().ok()? / 100.0
+            } else { argument.parse::<f32>().ok()? };
+            if !amount.is_finite() || amount < 0.0 { return None; }
+            has_color = true;
+            match name {
+                "brightness" => crate::FilterOperation::Brightness(amount),
+                "contrast" => crate::FilterOperation::Contrast(amount),
+                "grayscale" => crate::FilterOperation::Grayscale(amount.min(1.0)),
+                "opacity" => crate::FilterOperation::Opacity(amount.min(1.0)),
+                _ => return None,
+            }
+        };
+        operations.push(op);
+        rest = rest[close + 1..].trim_start();
+    }
+    if !has_color { return None; }
+    Some((Some(radii.into_boxed_slice()), Some(operations.into_boxed_slice())))
+}
+
 /// `[inset]? <offset-x> <offset-y> <blur>? <spread>? <color>?`. The `inset`
 /// keyword and the color may each lead or trail the lengths; comma-separated
 /// multiples are accepted but only the first layer is stored. `current_color`
@@ -9049,6 +9087,21 @@ mod tests {
         assert!(supports_declaration("table-layout", "fixed"));
         assert!(supports_declaration("table-layout", "auto"));
         assert!(!supports_declaration("table-layout", "fixed-ish"));
+    }
+
+    #[test]
+    fn color_filters_parse_in_order_and_ignore_invalid_declarations() {
+        use crate::FilterOperation as Op;
+        let style = compute_style("div", Some("filter:brightness(150%) contrast(.5) grayscale() opacity(25%) blur(2px)"));
+        assert_eq!(style.filter_color_ops.as_deref(), Some(&[
+            Op::Brightness(1.5), Op::Contrast(0.5), Op::Grayscale(1.0), Op::Opacity(0.25), Op::Blur(crate::Dimension::Px(2.0)),
+        ][..]));
+        assert!(supports_declaration("filter", "contrast(80%) brightness(2)"));
+        assert!(!supports_declaration("filter", "opacity(-1)"));
+        assert!(!supports_declaration("filter", "grayscale(2px)"));
+        let style = compute_style("div", Some("filter:brightness(2);filter:contrast(-1)"));
+        assert_eq!(style.filter_color_ops.as_deref(), Some(&[Op::Brightness(2.0)][..]));
+        assert!(compute_style("div", Some("filter:brightness(2);filter:none")).filter_color_ops.is_none());
     }
 
     #[test]
