@@ -356,6 +356,9 @@ impl StealthHttpClient {
         &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>,
         method: &str, mut body: Option<Vec<u8>>, mut request_headers: Option<HashMap<String, String>>,
     ) -> Result<Response, ObscuraNetError> {
+        if request.offline && matches!(url.scheme(), "http" | "https") {
+            return Err(ObscuraNetError::Network("net::ERR_INTERNET_DISCONNECTED".into()));
+        }
         let mut method = wreq::Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         validate_url(url, self.allow_private_network)?;
@@ -462,6 +465,9 @@ impl StealthHttpClient {
                 req = req.body(bytes.clone());
             }
             drop(extra_headers);
+            if request.cache_disabled {
+                req = req.header("cache-control", "no-cache").header("pragma", "no-cache");
+            }
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
                     callbacks.fire_request(&request_info).await;

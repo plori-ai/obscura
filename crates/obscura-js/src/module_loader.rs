@@ -278,7 +278,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let interception = if state.intercept_enabled {
                     state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
                 } else { None };
-                Ok((client, stealth, state.callbacks.clone(), interception))
+                Ok((client, stealth, state.callbacks.clone(), interception,
+                    state.network_offline.load(std::sync::atomic::Ordering::Relaxed),
+                    state.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed)))
             })(),
             None => self
                 .standalone_client
@@ -288,7 +290,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None, None)
+                    (client, stealth, None, None, false, false)
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
@@ -316,7 +318,7 @@ impl ModuleLoader for ObscuraModuleLoader {
             }
 
             match page_network {
-                Ok((client, stealth, callbacks, interception)) => {
+                Ok((client, stealth, callbacks, interception, offline, cache_disabled)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
@@ -337,8 +339,10 @@ impl ModuleLoader for ObscuraModuleLoader {
                             timestamp: 0.0, error_text: None,
                         }),
                     });
-                    let request =
+                    let mut request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    request.offline = offline;
+                    request.cache_disabled = cache_disabled;
                     let mut target = requested.clone();
                     let mut intercepted = false;
                     let mut synthetic = None;

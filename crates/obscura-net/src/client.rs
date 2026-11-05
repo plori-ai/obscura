@@ -202,6 +202,9 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    /// Page-scoped CDP network emulation flags, captured when the request starts.
+    pub offline: bool,
+    pub cache_disabled: bool,
 }
 
 impl ResourceRequest {
@@ -213,6 +216,8 @@ impl ResourceRequest {
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
+            offline: false,
+            cache_disabled: false,
         }
     }
 
@@ -249,6 +254,8 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            offline: false,
+            cache_disabled: false,
         }
     }
 
@@ -270,6 +277,8 @@ impl ResourceRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024),
+            offline: false,
+            cache_disabled: false,
         }
     }
 
@@ -1234,7 +1243,7 @@ impl ObscuraHttpClient {
         body: &Option<Vec<u8>>,
         request: &ResourceRequest,
     ) -> Option<ResourceCacheKey> {
-        if *method != Method::GET
+        if request.cache_disabled || *method != Method::GET
             || body.is_some()
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
@@ -1460,6 +1469,9 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
         mut request_headers: Option<HashMap<String, String>>,
     ) -> Result<Response, ObscuraNetError> {
+        if request.offline && matches!(url.scheme(), "http" | "https") {
+            return Err(ObscuraNetError::Network("net::ERR_INTERNET_DISCONNECTED".into()));
+        }
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
 
@@ -1645,6 +1657,10 @@ impl ObscuraHttpClient {
             }
 
             drop(extra_headers);
+            if request.cache_disabled {
+                headers.insert(reqwest::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                headers.insert(reqwest::header::PRAGMA, HeaderValue::from_static("no-cache"));
+            }
             let default_form_type = method == Method::POST && !headers.contains_key(reqwest::header::CONTENT_TYPE);
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
@@ -2751,6 +2767,26 @@ mod ssrf_tests {
         assert_eq!(network_requests.load(Ordering::SeqCst), 1);
         assert_eq!(callback_requests.load(Ordering::SeqCst), 32);
         assert_eq!(callback_responses.load(Ordering::SeqCst), 32);
+    }
+
+    #[tokio::test]
+    async fn request_network_overrides_bypass_cache_and_block_transport() {
+        let (url, requests) = cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap();
+        client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        request.cache_disabled = true;
+        client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        request.offline = true;
+        let error = client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap_err();
+        assert!(error.to_string().contains("ERR_INTERNET_DISCONNECTED"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        request.cache_disabled = false;
+        assert_eq!(client.fetch_resource_with_callbacks(&url, request, None).await.unwrap().status, 200);
     }
 
     #[tokio::test]

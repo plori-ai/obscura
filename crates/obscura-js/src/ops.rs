@@ -441,6 +441,8 @@ pub struct ObscuraState {
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_enabled: bool,
     pub handle_auth_requests: bool,
+    pub network_offline: Arc<std::sync::atomic::AtomicBool>,
+    pub network_cache_disabled: Arc<std::sync::atomic::AtomicBool>,
     pub network_reporting_enabled: bool,
     pub extra_http_headers: HashMap<String, String>,
     /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
@@ -723,6 +725,8 @@ impl ObscuraState {
             blob_urls: HashMap::new(),
             intercept_enabled: false,
             handle_auth_requests: false,
+            network_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            network_cache_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             network_reporting_enabled: false,
             extra_http_headers: HashMap::new(),
             intercept_url_patterns: Vec::new(),
@@ -964,6 +968,20 @@ fn record_js_network_completion(
     });
 }
 
+fn record_js_network_completion_bytes(state: &RefCell<OpState>, event: JsNetworkEvent, body: &[u8]) {
+    let content_type = event.response_headers.get("content-type").map(|value| value.split(';').next().unwrap_or("").trim().to_ascii_lowercase());
+    let text_type = content_type.as_deref().is_some_and(|mime| mime.starts_with("text/")
+        || mime.contains("json") || mime.contains("javascript") || mime.contains("xml") || mime.contains("svg"));
+    let encoded = (content_type.is_some() && !text_type) || std::str::from_utf8(body).is_err();
+    let state_borrow = state.borrow();
+    let gs = state_borrow.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    record_network_completion(&mut gs, event, || StoredNetworkResponseBody {
+        body: if encoded { BASE64.encode(body) } else { String::from_utf8_lossy(body).into_owned() },
+        base64_encoded: encoded,
+    });
+}
+
 pub(crate) fn record_network_completion(
     gs: &mut ObscuraState,
     event: JsNetworkEvent,
@@ -1079,6 +1097,19 @@ pub(crate) struct FetchNetworkGuard {
     pub(crate) state: std::rc::Weak<RefCell<ObscuraState>>,
     pub(crate) event: Option<JsNetworkEvent>,
     pub(crate) cancel: Option<Rc<CancelHandle>>,
+}
+
+impl FetchNetworkGuard {
+    fn fail_with(&mut self, error: &str) {
+        let Some(mut event) = self.event.take() else { return; };
+        event.status = 0;
+        event.error_text = Some(error.to_string());
+        event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs_f64();
+        if let Some(state) = self.state.upgrade() {
+            if let Ok(mut state) = state.try_borrow_mut() { push_js_network_event(&mut state, event); }
+        }
+    }
 }
 
 impl Drop for FetchNetworkGuard {
@@ -4028,7 +4059,7 @@ async fn fetch_url_inner(
     );
 
     let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client,
-        network_reporting_enabled, extra_http_headers, reported_stealth_ua, auth_handler) = {
+        network_reporting_enabled, extra_http_headers, reported_stealth_ua, auth_handler, network_offline, network_cache_disabled) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -4098,6 +4129,8 @@ async fn fetch_url_inner(
             if gs.extra_http_headers.is_empty() { None } else { Some(gs.extra_http_headers.clone()) },
             reported_stealth_ua,
             auth_handler,
+            gs.network_offline.load(std::sync::atomic::Ordering::Relaxed),
+            gs.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed),
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -4273,6 +4306,11 @@ async fn fetch_url_inner(
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
 
+    if network_offline && url::Url::parse(&url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) {
+        network_guard.fail_with("net::ERR_INTERNET_DISCONNECTED");
+        return Err(deno_error::JsErrorBox::type_error("Failed to fetch"));
+    }
+
     let client = match &http_client {
         Some(client) => client.request_client().await,
         None => {
@@ -4291,8 +4329,13 @@ async fn fetch_url_inner(
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
     let replace_extra_headers = override_headers.is_some();
-    let custom_headers: std::collections::HashMap<String, String> =
+    let mut custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    if network_cache_disabled {
+        custom_headers.retain(|name, _| !name.eq_ignore_ascii_case("cache-control") && !name.eq_ignore_ascii_case("pragma"));
+        custom_headers.insert("cache-control".into(), "no-cache".into());
+        custom_headers.insert("pragma".into(), "no-cache".into());
+    }
     if network_reporting_enabled {
         if let Some(event) = &mut network_guard.event {
             event.request_headers = extra_http_headers.iter().filter(|_| !replace_extra_headers)
@@ -4732,7 +4775,7 @@ async fn fetch_url_inner(
                 event.response_headers = resp_headers; event.body_size = resp_bytes.len();
                 event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64();
-                record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+                record_js_network_completion_bytes(&state, event, &resp_bytes);
             }
         }
         network_guard.event = None;
@@ -5002,7 +5045,7 @@ async fn stealth_fetch_all(
             event.body_size = resp_bytes.len();
             event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs_f64();
-            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+            record_js_network_completion_bytes(&state, event, &resp_bytes);
         } else { network_guard.event = None; }
         Ok(resp_bytes)
     });
@@ -8872,6 +8915,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.offline = gs.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        request.cache_disabled = gs.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;

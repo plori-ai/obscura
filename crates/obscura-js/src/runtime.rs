@@ -1559,6 +1559,12 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().handle_auth_requests = enabled;
     }
 
+    pub fn set_network_overrides(&self, offline: std::sync::Arc<std::sync::atomic::AtomicBool>, cache_disabled: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let mut state = self.state.borrow_mut();
+        state.network_offline = offline;
+        state.network_cache_disabled = cache_disabled;
+    }
+
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
     /// loads honour them like the page's own subresource fetches do.
     #[cfg(feature = "render")]
@@ -2364,6 +2370,8 @@ impl ObscuraJsRuntime {
         }
         let initiator = initiator.expect("checked above");
         let callbacks = state.callbacks.clone();
+        let offline = state.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_disabled = state.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if state.intercept_enabled {
             state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
         } else { None };
@@ -2407,6 +2415,8 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.offline = offline;
+                    request.cache_disabled = cache_disabled;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
                             request.mode = RequestMode::Cors;
@@ -23692,6 +23702,56 @@ mod tests {
     #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_fetch_basic_auth_challenge_retries() { assert_fetch_basic_auth_challenge(true).await; }
+
+    async fn assert_fetch_binary_network_response_body(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let load = rt.call_function_on_for_cdp("async () => Array.from(new Uint8Array(await (await fetch('/binary')).arrayBuffer()))", None, &[], true, true);
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\0\xff\x80*").await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, serve) })
+            .await.expect("binary fetch completes");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!([0, 255, 128, 42]));
+        let event = rt.take_js_network_events().pop().unwrap();
+        let body = rt.get_network_response_body(&event.request_id).unwrap();
+        assert!(body.base64_encoded);
+        assert_eq!(body.body, "AP+AKg==");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_binary_network_response_body_is_lossless() { assert_fetch_binary_network_response_body(false).await; }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_binary_network_response_body_is_lossless() { assert_fetch_binary_network_response_body(true).await; }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offline_fetch_rejects_as_type_error_and_reports_network_failure() {
+        let mut rt = redirect_runtime_for_origin("http://127.0.0.1:9");
+        rt.set_network_overrides(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let result = rt.call_function_on_for_cdp("async () => fetch('/offline').then(() => 'ok', error => error.name)",
+            None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), "TypeError");
+        let event = rt.take_js_network_events().pop().unwrap();
+        assert_eq!(event.error_text.as_deref(), Some("net::ERR_INTERNET_DISCONNECTED"));
+    }
+
 
     #[tokio::test(flavor = "current_thread")]
     async fn subscribed_fetch_network_event_retains_explicit_request_headers() {

@@ -392,6 +392,9 @@ pub struct Page {
     pub intercept_enabled: bool,
     pub handle_auth_requests: bool,
     pub network_reporting_enabled: bool,
+    pub network_offline: Arc<std::sync::atomic::AtomicBool>,
+    pub network_cache_disabled: Arc<std::sync::atomic::AtomicBool>,
+    pub navigator_offline: bool,
     pub cdp_extra_headers: std::collections::HashMap<String, String>,
     pub cdp_full_extra_headers: std::collections::HashMap<String, String>,
     pub intercept_block_patterns: Vec<String>,
@@ -1220,6 +1223,9 @@ impl Page {
             intercept_enabled: false,
             handle_auth_requests: false,
             network_reporting_enabled: false,
+            network_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            network_cache_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            navigator_offline: false,
             cdp_extra_headers: std::collections::HashMap::new(),
             cdp_full_extra_headers: std::collections::HashMap::new(),
             intercept_block_patterns: Vec::new(),
@@ -1922,17 +1928,22 @@ impl Page {
             }
             Ok(InterceptResolution::Continue {url: rewrite, method: changed_method, headers, body: changed_body}) => {
                 let target = match rewrite { Some(value) => Url::parse(&value).map_err(|error| PageError::InvalidUrl(error.to_string()))?, None => url.clone() };
+                if self.network_offline.load(std::sync::atomic::Ordering::Relaxed) && matches!(target.scheme(), "http" | "https") {
+                    return Err(PageError::NetworkError("net::ERR_INTERNET_DISCONNECTED".into()));
+                }
                 if target.scheme() != url.scheme() {
                     return Err(PageError::NetworkError("Interception cannot change a navigation's URL scheme".into()));
                 }
                 let method = changed_method.as_deref().unwrap_or(method);
                 let body = changed_body.or_else(|| (!body.is_empty()).then(|| body.as_bytes().to_vec()));
+                let mut request = ResourceRequest::navigation();
+                request.cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
                 #[cfg(feature = "stealth")]
                 if let Some(client) = &self.stealth_client {
-                    return client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
+                    return client.fetch_resource_request(&target, request, method, body, headers, Some(&self.callbacks)).await
                         .map(Some).map_err(|error| PageError::NetworkError(error.to_string()));
                 }
-                self.http_client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
+                self.http_client.fetch_resource_request(&target, request, method, body, headers, Some(&self.callbacks)).await
                     .map_err(|error| PageError::NetworkError(error.to_string()))?
             }
             Ok(InterceptResolution::Fail {reason}) => {
@@ -1949,6 +1960,15 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        if self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut request = ResourceRequest::navigation();
+            request.cache_disabled = true;
+            #[cfg(feature = "stealth")]
+            if let Some(ref stealth) = self.stealth_client {
+                return stealth.fetch_resource_with_callbacks(url, request, Some(&self.callbacks)).await;
+            }
+            return self.http_client.fetch_resource_with_callbacks(url, request, Some(&self.callbacks)).await;
+        }
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
             // Pass the page callbacks so CDP Network events and
@@ -1993,12 +2013,14 @@ impl Page {
         headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
         headers.insert("Authorization".into(), authorization);
         let body = (!body.is_empty()).then(|| body.as_bytes().to_vec());
+        let mut request = ResourceRequest::navigation();
+        request.cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "stealth")]
         if let Some(client) = &self.stealth_client {
-            return client.fetch_navigation_request(&target, method, body, Some(headers), Some(&self.callbacks)).await
+            return client.fetch_resource_request(&target, request, method, body, Some(headers), Some(&self.callbacks)).await
                 .map_err(|error| PageError::NetworkError(error.to_string()));
         }
-        self.http_client.fetch_navigation_request(&target, method, body, Some(headers), Some(&self.callbacks)).await
+        self.http_client.fetch_resource_request(&target, request, method, body, Some(headers), Some(&self.callbacks)).await
             .map_err(|error| PageError::NetworkError(error.to_string()))
     }
     fn init_js(&mut self) {
@@ -2097,6 +2119,7 @@ impl Page {
 
         rt.set_intercept_page_id(&self.id);
         rt.set_network_reporting_enabled(self.network_reporting_enabled);
+        rt.set_network_overrides(self.network_offline.clone(), self.network_cache_disabled.clone());
         if !self.cdp_full_extra_headers.is_empty() { rt.set_extra_http_headers(self.cdp_full_extra_headers.clone()); }
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
@@ -2121,6 +2144,9 @@ impl Page {
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.set_frame_preload_scripts(&self.preload_scripts);
         rt.run_page_init();
+        if self.navigator_offline {
+            let _ = rt.execute_script("<network-offline>", "navigator.onLine = false;");
+        }
         rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -2228,6 +2254,8 @@ impl Page {
 
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
+        let offline = self.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
             tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), headers: self.cdp_extra_headers.clone(),
         }) } else { None };
@@ -2248,8 +2276,9 @@ impl Page {
                     let initiator = initiator.clone();
                     let interception = interception.clone();
                     async move {
-                        let request =
-                            ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        let mut request = ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        request.offline = offline;
+                        request.cache_disabled = cache_disabled;
                         if let Some(interception) = interception {
                             match interception.fetch(&requested_url, request.clone(), "Stylesheet", &client,
                                 #[cfg(feature = "stealth")] stealth_client.as_deref(), &callbacks).await {
@@ -2676,6 +2705,8 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
+        let offline = self.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
             tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), headers: self.cdp_extra_headers.clone(),
         }) } else { None };
@@ -2723,7 +2754,9 @@ impl Page {
                         };
                         return Some((idx, url, resp, None));
                     }
-                    let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    request.offline = offline;
+                    request.cache_disabled = cache_disabled;
                     if let Some(interception) = interception {
                         match interception.fetch(&parsed, request.clone(), "Script", &client,
                             #[cfg(feature = "stealth")] stealth_client.as_deref(), &cbs).await {
@@ -3761,10 +3794,16 @@ impl Page {
                 body: body_bytes,
                 redirected_from: Vec::new(),
             })
+        } else if self.network_offline.load(std::sync::atomic::Ordering::Relaxed) && matches!(url.scheme(), "http" | "https") {
+            Err(ObscuraNetError::Network("net::ERR_INTERNET_DISCONNECTED".into()))
         } else if method == "POST" {
-            self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
-                .await
+            if self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut request = ResourceRequest::navigation();
+                request.cache_disabled = true;
+                self.http_client.fetch_resource_request(&url, request, "POST", Some(body.as_bytes().to_vec()), None, Some(&self.callbacks)).await
+            } else {
+                self.http_client.post_form_with_callbacks(&url, body, Some(&self.callbacks)).await
+            }
         } else {
             self.do_fetch(&url).await
         }
@@ -5367,6 +5406,25 @@ impl Page {
         if let Some(js) = &self.js { js.set_network_reporting_enabled(enabled); }
     }
 
+    pub fn set_network_offline(&mut self, offline: bool) {
+        self.network_offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+        self.set_navigator_offline(offline);
+    }
+
+    pub fn set_navigator_offline(&mut self, offline: bool) {
+        let previous = std::mem::replace(&mut self.navigator_offline, offline);
+        if previous != offline {
+            if let Some(js) = &mut self.js {
+                let source = if offline {
+                    "navigator.onLine = false; dispatchEvent(new Event('offline'));"
+                } else {
+                    "navigator.onLine = true; dispatchEvent(new Event('online'));"
+                };
+                let _ = js.execute_script("<network-offline>", source);
+            }
+        }
+    }
+
     pub fn set_handle_auth_requests(&mut self, enabled: bool) {
         self.handle_auth_requests = enabled;
         if let Some(js) = &self.js { js.set_handle_auth_requests(enabled); }
@@ -5642,6 +5700,18 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn basic_navigation_challenge_retries_with_scoped_credentials() {
         assert_basic_navigation_challenge_retries_with_scoped_credentials(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offline_navigation_blocks_network_but_keeps_local_documents() {
+        let context = Arc::new(BrowserContext::with_storage_and_network("offline-navigation".into(), None, false, None, None, true));
+        let mut page = Page::new("offline-navigation".into(), context);
+        page.set_network_offline(true);
+        assert!(page.navigate("http://127.0.0.1:9/").await.unwrap_err().to_string().contains("ERR_INTERNET_DISCONNECTED"));
+        page.navigate("data:text/html,<p>local</p>").await.unwrap();
+        assert_eq!(page.evaluate("navigator.onLine"), serde_json::json!(false));
+        page.set_network_offline(false);
+        assert_eq!(page.evaluate("navigator.onLine"), serde_json::json!(true));
     }
 
     #[cfg(feature = "stealth")]
