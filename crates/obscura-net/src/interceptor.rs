@@ -51,3 +51,39 @@ pub trait ResponseInterceptor: Send + Sync {
     async fn intercept_response(&self, url: &url::Url, method: &str, status: u16,
         headers: HashMap<String, String>, body: ResponseBodyFuture) -> Result<ResponseInterception, String>;
 }
+
+/// Apply cookies introduced by a response-stage override. The transport has
+/// already applied the original response's cookies before the pause.
+pub fn apply_overridden_response_cookies(
+    jar: &crate::cookies::CookieJar,
+    url: &url::Url,
+    original: Option<&str>,
+    headers: &HashMap<String, String>,
+) {
+    let updated = headers.get("set-cookie").map(String::as_str);
+    if updated != original {
+        if let Some(cookies) = updated {
+            for cookie in cookies.split('\n') {
+                jar.set_cookie(cookie, url);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_cookie_tests {
+    use super::*;
+
+    #[test]
+    fn applies_each_cookie_introduced_by_response_override() {
+        let jar = crate::cookies::CookieJar::new();
+        let url = url::Url::parse("https://example.test/").unwrap();
+        jar.set_cookie("wire=1; Path=/", &url);
+        let headers = HashMap::from([("set-cookie".to_string(), "first=2; Path=/\nsecond=3; Path=/".to_string())]);
+        apply_overridden_response_cookies(&jar, &url, Some("wire=1; Path=/"), &headers);
+        let cookies = jar.get_cookie_header(&url);
+        for cookie in ["wire=1", "first=2", "second=3"] {
+            assert!(cookies.contains(cookie), "missing {cookie}: {cookies}");
+        }
+    }
+}

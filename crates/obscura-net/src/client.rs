@@ -1724,11 +1724,16 @@ impl ObscuraHttpClient {
                 let body = Box::pin(async move {
                     read_reqwest_body_limited(original, &body_url, max_bytes).await.map_err(|error| error.to_string())
                 });
+                let original_cookies = response_headers.get("set-cookie").cloned();
                 let intercepted = hook.intercept_response(&current_url, method.as_str(), status.as_u16(), response_headers, body).await
                     .map_err(ObscuraNetError::Network)?;
                 status = reqwest::StatusCode::from_u16(intercepted.status)
                     .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
                 response_headers = intercepted.headers;
+                if request.sends_credentials_to(&current_url) {
+                    crate::interceptor::apply_overridden_response_cookies(
+                        &self.cookie_jar, &current_url, original_cookies.as_deref(), &response_headers);
+                }
                 intercepted_body = Some(intercepted.body);
             }
 

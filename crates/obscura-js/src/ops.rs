@@ -4721,6 +4721,7 @@ async fn fetch_url_inner(
             }
             let body = Box::pin(async move { read_body_capped(resp, fetch_max_body_bytes()).await.map_err(|error| error.to_string()) });
             let current = url::Url::parse(&current_url).map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+            let original_cookies = headers.get("set-cookie").cloned();
             let response = match hook.intercept_response(&current, current_method.as_str(), status, headers, body).await {
                 Ok(response) => response,
                 Err(_) => {
@@ -4728,6 +4729,12 @@ async fn fetch_url_inner(
                     return Err(deno_error::JsErrorBox::type_error("Failed to fetch"));
                 }
             };
+            if credentials_allowed {
+                if let Some(jar) = &cookie_jar {
+                    obscura_net::interceptor::apply_overridden_response_cookies(
+                        jar, &current, original_cookies.as_deref(), &response.headers);
+                }
+            }
             if hook.fired.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(event) = &mut network_guard.event { event.intercepted = true; }
             }
@@ -5038,6 +5045,7 @@ async fn stealth_fetch_all(
             use obscura_net::interceptor::ResponseInterceptor as _;
             let original_body = r.body;
             let body = Box::pin(async move { original_body.await.map_err(|error| error.to_string()) });
+            let original_cookies = r.headers.get("set-cookie").cloned();
             let intercepted = match hook.intercept_response(&parsed_current, &current_method, r.status, r.headers, body).await {
                 Ok(response) => response,
                 Err(_) => {
@@ -5045,6 +5053,10 @@ async fn stealth_fetch_all(
                     return Err(deno_error::JsErrorBox::type_error("Failed to fetch"));
                 }
             };
+            if credentials_allowed {
+                obscura_net::interceptor::apply_overridden_response_cookies(
+                    &stealth.cookie_jar, &parsed_current, original_cookies.as_deref(), &intercepted.headers);
+            }
             if hook.fired.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(event) = &mut network_guard.event { event.intercepted = true; }
             }
