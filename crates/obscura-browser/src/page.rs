@@ -5415,6 +5415,24 @@ mod tests {
     }
 
     #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_client_hints_match_wire_chrome_version() {
+        let context = Arc::new(BrowserContext::with_options("stealth-hints".into(), None, true));
+        let mut page = Page::new("stealth-hints".into(), context);
+        page.url = Some(url::Url::parse("https://example.test/").unwrap());
+        page.dom = Some(parse_html("<html><body></body></html>"));
+        page.init_js();
+        page.evaluate_script(r#"navigator.userAgentData.getHighEntropyValues(['uaFullVersion', 'fullVersionList']).then(v => globalThis.hints = v)"#).unwrap();
+        page.js.as_mut().unwrap().run_event_loop_bounded(50).await.unwrap();
+        assert_eq!(page.evaluate_script(r#"[navigator.userAgent, navigator.userAgentData.brands, hints.uaFullVersion, hints.fullVersionList]"#).unwrap(), serde_json::json!([
+            obscura_net::STEALTH_USER_AGENT,
+            [{"brand":"Google Chrome","version":"149"},{"brand":"Chromium","version":"149"},{"brand":"Not)A;Brand","version":"24"}],
+            "149.0.0.0",
+            [{"brand":"Google Chrome","version":"149.0.0.0"},{"brand":"Chromium","version":"149.0.0.0"},{"brand":"Not)A;Brand","version":"24.0.0.0"}]
+        ]));
+    }
+
+    #[cfg(feature = "stealth")]
     #[test]
     fn stealth_navigator_uses_the_explicit_context_user_agent() {
         let context=std::sync::Arc::new(crate::BrowserContext::with_storage_and_network("stealth-identity".into(),None,true,Some("TestingUA/1.0".into()),None,false));
