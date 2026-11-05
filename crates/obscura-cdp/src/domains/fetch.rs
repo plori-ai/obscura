@@ -33,6 +33,7 @@ pub enum FetchResolution {
 pub struct FetchInterceptState {
     pub enabled: bool,
     pub patterns: Vec<String>,
+    pub cdp_request_patterns: Option<std::sync::Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
     pub sessions_by_page: HashMap<String, String>,
     pub paused: HashMap<String, PausedRequest>,
     request_counter: u64,
@@ -43,6 +44,7 @@ impl FetchInterceptState {
         FetchInterceptState {
             enabled: false,
             patterns: Vec::new(),
+            cdp_request_patterns: None,
             sessions_by_page: HashMap::new(),
             paused: HashMap::new(),
             request_counter: 0,
@@ -63,26 +65,45 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
-            if params.get("patterns").and_then(Value::as_array).is_some_and(|patterns|
-                patterns.iter().any(|pattern| pattern.get("requestStage").and_then(Value::as_str) == Some("Response"))) {
-                return Err("Fetch response-stage interception is not implemented".into());
+            if let Some(patterns) = params.get("patterns").and_then(Value::as_array) {
+                if patterns.is_empty() && params.get("handleAuthRequests").and_then(Value::as_bool).unwrap_or(false) {
+                    return Err("Can't specify empty patterns with handleAuth set".into());
+                }
+                for pattern in patterns {
+                    if let Some(stage) = pattern.get("requestStage").and_then(Value::as_str) {
+                        if !matches!(stage, "Request" | "Response") { return Err("Unknown Fetch request stage".into()); }
+                    }
+                    if let Some(kind) = pattern.get("resourceType").and_then(Value::as_str) {
+                        if !matches!(kind, "Document" | "Stylesheet" | "Image" | "Media" | "Font" | "Script"
+                            | "TextTrack" | "XHR" | "Fetch" | "Prefetch" | "EventSource" | "WebSocket"
+                            | "Manifest" | "SignedExchange" | "Ping" | "CSPViolationReport" | "Preflight" | "FedCM" | "Other") {
+                            return Err(format!("Unknown resource type in fetch filter: '{kind}'"));
+                        }
+                    }
+                }
             }
-            let patterns = params
-                .get("patterns")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|p| {
-                            p.get("urlPattern")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| vec!["*".to_string()]);
+            let mut request_patterns = Vec::new();
+            let mut response_patterns = Vec::new();
+            if let Some(patterns) = params.get("patterns").and_then(Value::as_array) {
+                for pattern in patterns {
+                    let parsed = obscura_js::ops::CdpRequestPattern {
+                        url_pattern: pattern.get("urlPattern").and_then(Value::as_str).unwrap_or("*").to_string(),
+                        resource_type: pattern.get("resourceType").and_then(Value::as_str).map(str::to_string),
+                    };
+                    if pattern.get("requestStage").and_then(Value::as_str) == Some("Response") {
+                        response_patterns.push(parsed);
+                    } else { request_patterns.push(parsed); }
+                }
+            } else {
+                request_patterns.push(obscura_js::ops::CdpRequestPattern { url_pattern: "*".into(), resource_type: None });
+            }
+            let patterns = request_patterns.iter().map(|pattern| pattern.url_pattern.clone()).collect::<Vec<_>>();
+            let cdp_patterns = std::sync::Arc::new(request_patterns);
+            let response_patterns = (!response_patterns.is_empty()).then(|| std::sync::Arc::new(response_patterns));
 
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.clone();
+            ctx.fetch_intercept.cdp_request_patterns = Some(cdp_patterns.clone());
             if let Some((session, page)) = session_id.as_ref()
                 .and_then(|session| ctx.sessions.get(session).map(|page| (session, page)))
             {
@@ -91,6 +112,9 @@ pub async fn handle(
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns = patterns.clone();
+                page.cdp_request_patterns = Some(cdp_patterns);
+                page.cdp_response_patterns = response_patterns;
+                page.set_handle_auth_requests(params.get("handleAuthRequests").and_then(Value::as_bool).unwrap_or(false));
                 if let Some(tx) = tx_clone {
                     page.set_intercept_tx(tx);
                 }
@@ -111,8 +135,12 @@ pub async fn handle(
             }
             ctx.fetch_intercept.enabled = false;
             ctx.fetch_intercept.patterns.clear();
+            ctx.fetch_intercept.cdp_request_patterns = None;
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns.clear();
+                page.cdp_request_patterns = None;
+                page.cdp_response_patterns = None;
+                page.set_handle_auth_requests(false);
                 page.enable_intercept(false);
             }
             let paused: Vec<_> = ctx.fetch_intercept.paused.drain().collect();
@@ -209,7 +237,7 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => Err("Fetch response-stage interception is not implemented".into()),
+        "getResponseBody" => Err("No response-stage request with the given id".into()),
         "takeResponseBodyAsStream" => {
             // Hand the client a streaming handle for a large response body so it
             // can pull it in chunks via IO.read and free it with IO.close,
@@ -252,6 +280,25 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    #[tokio::test]
+    async fn enable_preserves_resource_type_and_default_url_pattern() {
+        let mut ctx = CdpContext::new();
+        handle("enable", &json!({"patterns": [{"resourceType": "Image"}]}), &mut ctx, &None).await.unwrap();
+        let patterns = ctx.fetch_intercept.cdp_request_patterns.as_deref().unwrap();
+        assert_eq!(patterns[0].url_pattern, "*");
+        assert_eq!(patterns[0].resource_type.as_deref(), Some("Image"));
+        assert!(obscura_js::ops::matches_cdp_request_patterns(Some(patterns), "https://x/a", "Image"));
+        assert!(!obscura_js::ops::matches_cdp_request_patterns(Some(patterns), "https://x/a", "Script"));
+    }
+
+    #[tokio::test]
+    async fn empty_patterns_cannot_be_combined_with_authentication() {
+        let mut ctx = CdpContext::new();
+        assert!(handle("enable", &json!({"patterns": [], "handleAuthRequests": true}), &mut ctx, &None).await.is_err());
+        assert!(!ctx.fetch_intercept.enabled);
+        assert!(handle("enable", &json!({"patterns": [], "handleAuthRequests": false}), &mut ctx, &None).await.is_ok());
+    }
+
     fn pause(ctx: &mut CdpContext, id: &str) -> tokio::sync::oneshot::Receiver<FetchResolution> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ctx.fetch_intercept.paused.insert(
@@ -269,11 +316,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_stage_is_rejected_without_enabling_request_interception() {
+    async fn response_stage_patterns_do_not_enable_request_stage_pauses() {
         let mut ctx = CdpContext::new();
-        assert!(handle("enable", &json!({"patterns": [{"urlPattern": "*", "requestStage": "Response"}]}),
-            &mut ctx, &None).await.is_err());
-        assert!(!ctx.fetch_intercept.enabled);
+        let page = ctx.create_page();
+        let session = Some("response-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page.clone());
+        handle("enable", &json!({"patterns": [{"urlPattern": "*", "requestStage": "Response"}]}),
+            &mut ctx, &session).await.unwrap();
+        assert!(ctx.fetch_intercept.enabled);
+        assert!(ctx.get_page(&page).unwrap().cdp_request_patterns.as_deref().unwrap().is_empty());
+        assert_eq!(ctx.get_page(&page).unwrap().cdp_response_patterns.as_deref().unwrap().len(), 1);
         assert!(handle("getResponseBody", &json!({"requestId": "missing"}), &mut ctx, &None).await.is_err());
     }
 

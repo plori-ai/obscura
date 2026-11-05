@@ -19,6 +19,9 @@ struct NativeInterception {
     tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
     page_id: String,
     patterns: Vec<String>,
+    cdp_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
+    response_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
+    handle_auth: bool,
     headers: std::collections::HashMap<String, String>,
 }
 
@@ -28,44 +31,63 @@ impl NativeInterception {
         client: &ObscuraHttpClient,
         #[cfg(feature = "stealth")] stealth: Option<&obscura_net::StealthHttpClient>,
         callbacks: &CallbackRegistry,
-    ) -> Result<Option<(Response, String)>, String> {
-        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
-        if !matches!(url.scheme(), "http" | "https") || (!self.patterns.is_empty()
-            && !self.patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
-            return Ok(None);
-        }
+    ) -> Result<Option<(Response, String, bool)>, String> {
+        use obscura_js::ops::{CdpResponseHook, InterceptedRequest, InterceptResolution};
+        if !matches!(url.scheme(), "http" | "https") { return Ok(None); }
+        let request_matches = (self.patterns.is_empty() || self.patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str())))
+            && obscura_js::ops::matches_cdp_request_patterns(self.cdp_patterns.as_deref().map(Vec::as_slice), url.as_str(), kind);
+        if !request_matches && self.response_patterns.is_none() && !self.handle_auth { return Ok(None); }
         obscura_js::ops::validate_fetch_url(url, client.allow_private_network)?;
         let id = obscura_js::ops::next_subresource_interception_id();
-        let (resolver, resolution) = tokio::sync::oneshot::channel();
-        if self.tx.send(InterceptedRequest { request_id: id.clone(), page_id: self.page_id.clone(),
-            url: url.to_string(), method: "GET".into(), headers: self.headers.clone(),
-            resource_type: kind.into(), resolver }).is_err() { return Ok(None); }
-        let response = match resolution.await.map_err(|_| "interception cancelled".to_string())? {
-            InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
-                obscura_net::client::validate_intercepted_response(&request, url, &headers).map_err(|e| e.to_string())?;
-                let headers = obscura_net::client::normalize_intercepted_headers(headers);
-                let body = if body_base64.is_empty() { body.into_bytes() } else {
-                    BASE64.decode(body_base64).map_err(|e| e.to_string())?
-                };
-                if body.len() > request.max_response_bytes { return Err("fulfilled resource too large".into()); }
-                Response { url: url.clone(), status, headers, body, redirected_from: Vec::new() }
-            }
-            InterceptResolution::Fail { reason } => return Err(reason),
-            InterceptResolution::Continue { url: rewrite, method, headers, body } => {
-                let target = match rewrite { Some(url) => Url::parse(&url).map_err(|e| e.to_string())?, None => url.clone() };
-                obscura_js::ops::validate_fetch_url(&target, client.allow_private_network)?;
-                let method = method.as_deref().unwrap_or("GET");
-                #[cfg(feature = "stealth")]
-                if let Some(stealth) = stealth {
-                    let response = stealth.fetch_resource_request(&target, request, method, body, headers, Some(callbacks)).await
-                        .map_err(|e| e.to_string())?;
-                    return Ok(Some((response, id)));
+        let hook = if self.response_patterns.is_some() || self.handle_auth { Some(CdpResponseHook {
+            tx: self.tx.clone(), page_id: self.page_id.clone(), request_id: id.clone(), resource_type: kind.into(),
+            request_headers: self.headers.clone(), patterns: self.response_patterns.clone().unwrap_or_else(|| Arc::new(Vec::new())),
+            request_was_paused: request_matches, handle_auth: self.handle_auth,
+            fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_body_bytes: request.max_response_bytes, sequence: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }) } else { None };
+        let mut target = url.clone();
+        let mut changed_method = None;
+        let mut changed_headers = None;
+        let mut changed_body = None;
+        if request_matches {
+            let (resolver, resolution) = tokio::sync::oneshot::channel();
+            if self.tx.send(InterceptedRequest { request_id: id.clone(), page_id: self.page_id.clone(),
+                url: url.to_string(), method: "GET".into(), headers: self.headers.clone(),
+                resource_type: kind.into(), network_id: None, auth_challenge: None, response: None, resolver }).is_err() { return Ok(None); }
+            match resolution.await.map_err(|_| "interception cancelled".to_string())? {
+                InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
+                    obscura_net::client::validate_intercepted_response(&request, url, &headers).map_err(|e| e.to_string())?;
+                    let headers = obscura_net::client::normalize_intercepted_headers(headers);
+                    let body = if body_base64.is_empty() { body.into_bytes() } else { BASE64.decode(body_base64).map_err(|e| e.to_string())? };
+                    if body.len() > request.max_response_bytes { return Err("fulfilled resource too large".into()); }
+                    return Ok(Some((Response { url: url.clone(), status, headers, body, redirected_from: Vec::new() }, id, true)));
                 }
-                client.fetch_resource_request(&target, request, method, body, headers, Some(callbacks)).await
-                    .map_err(|e| e.to_string())?
+                InterceptResolution::Fail { reason } => return Err(reason),
+                InterceptResolution::ContinueResponse { .. } | InterceptResolution::FulfillResponse { .. } => return Err("invalid request-stage interception resolution".into()),
+                InterceptResolution::Continue { url: rewrite, method, headers, body } => {
+                    if let Some(rewrite) = rewrite { target = Url::parse(&rewrite).map_err(|e| e.to_string())?; }
+                    obscura_js::ops::validate_fetch_url(&target, client.allow_private_network)?;
+                    changed_method = method; changed_headers = headers; changed_body = body;
+                }
             }
-        };
-        Ok(Some((response, id)))
+        }
+        let method = changed_method.as_deref().unwrap_or("GET");
+        #[cfg(feature = "stealth")]
+        if let Some(stealth) = stealth {
+            let result = if let Some(hook) = &hook {
+                stealth.fetch_resource_request_with_response_hook(&target, request, method, changed_body, changed_headers, Some(callbacks), hook).await
+            } else { stealth.fetch_resource_request(&target, request, method, changed_body, changed_headers, Some(callbacks)).await };
+            let response = result.map_err(|error| error.to_string())?;
+            let emitted = request_matches || hook.as_ref().is_some_and(|hook| hook.fired.load(std::sync::atomic::Ordering::Relaxed));
+            return Ok(Some((response, id, emitted)));
+        }
+        let result = if let Some(hook) = &hook {
+            client.fetch_resource_request_with_response_hook(&target, request, method, changed_body, changed_headers, Some(callbacks), hook).await
+        } else { client.fetch_resource_request(&target, request, method, changed_body, changed_headers, Some(callbacks)).await };
+        let response = result.map_err(|error| error.to_string())?;
+        let emitted = request_matches || hook.as_ref().is_some_and(|hook| hook.fired.load(std::sync::atomic::Ordering::Relaxed));
+        Ok(Some((response, id, emitted)))
     }
 }
 
@@ -388,10 +410,16 @@ pub struct Page {
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
+    pub handle_auth_requests: bool,
     pub network_reporting_enabled: bool,
+    pub network_offline: Arc<std::sync::atomic::AtomicBool>,
+    pub network_cache_disabled: Arc<std::sync::atomic::AtomicBool>,
+    pub navigator_offline: bool,
     pub cdp_extra_headers: std::collections::HashMap<String, String>,
     pub cdp_full_extra_headers: std::collections::HashMap<String, String>,
     pub intercept_block_patterns: Vec<String>,
+    pub cdp_request_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
+    pub cdp_response_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
@@ -1214,10 +1242,16 @@ impl Page {
             response_body_order: std::collections::VecDeque::new(),
             network_event_counter: 0,
             intercept_enabled: false,
+            handle_auth_requests: false,
             network_reporting_enabled: false,
+            network_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            network_cache_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            navigator_offline: false,
             cdp_extra_headers: std::collections::HashMap::new(),
             cdp_full_extra_headers: std::collections::HashMap::new(),
             intercept_block_patterns: Vec::new(),
+            cdp_request_patterns: None,
+            cdp_response_patterns: None,
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
@@ -1874,18 +1908,33 @@ impl Page {
             .unwrap_or([255, 255, 255, 255])
     }
 
-    async fn intercept_navigation(&self, url: &Url, method: &str, body: &str) -> Result<Option<Response>, PageError> {
+    async fn intercept_navigation(&self, url: &Url, method: &str, body: &str) -> Result<Option<(Response, bool)>, PageError> {
         use obscura_js::ops::{InterceptedRequest, InterceptResolution};
-        if !self.intercept_enabled || !matches!(url.scheme(), "http" | "https")
-            || (!self.intercept_block_patterns.is_empty() && !self.intercept_block_patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
+        if !self.intercept_enabled || !matches!(url.scheme(), "http" | "https") {
             return Ok(None);
         }
+        let request_matches = (self.intercept_block_patterns.is_empty() || self.intercept_block_patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str())))
+            && obscura_js::ops::matches_cdp_request_patterns(self.cdp_request_patterns.as_deref().map(Vec::as_slice), url.as_str(), "Document");
+        if !request_matches && self.cdp_response_patterns.is_none() { return Ok(None); }
         let Some(tx) = &self.intercept_tx else { return Ok(None); };
         let request_headers = self.http_client.extra_headers.read().await.clone();
+        let request_id = format!("{}.{}", self.id, self.network_event_counter + 1);
+        let response_hook = self.cdp_response_patterns.as_ref().map(|patterns| obscura_js::ops::CdpResponseHook {
+            tx: tx.clone(), page_id: self.id.clone(), request_id: request_id.clone(), resource_type: "Document".into(),
+            request_headers: request_headers.clone(), patterns: patterns.clone(), request_was_paused: request_matches, handle_auth: false,
+            fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_body_bytes: ResourceRequest::navigation().max_response_bytes, sequence: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        });
+        if !request_matches {
+            let response = self.intercepted_navigation_transport(url, method,
+                (!body.is_empty()).then(|| body.as_bytes().to_vec()), None, response_hook.as_ref()).await?;
+            let fired = response_hook.as_ref().is_some_and(|hook| hook.fired.load(std::sync::atomic::Ordering::Relaxed));
+            return Ok(Some((response, fired)));
+        }
         let (resolver, resolution) = tokio::sync::oneshot::channel();
-        let request = InterceptedRequest {request_id: format!("{}.{}", self.id, self.network_event_counter + 1),
+        let request = InterceptedRequest {request_id,
             page_id: self.id.clone(), url: url.to_string(), method: method.into(), headers: request_headers.clone(),
-            resource_type: "Document".into(), resolver};
+            resource_type: "Document".into(), network_id: None, auth_challenge: None, response: None, resolver};
         if tx.send(request).is_err() { return Ok(None); }
         let response = match resolution.await {
             Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
@@ -1921,13 +1970,7 @@ impl Page {
                 }
                 let method = changed_method.as_deref().unwrap_or(method);
                 let body = changed_body.or_else(|| (!body.is_empty()).then(|| body.as_bytes().to_vec()));
-                #[cfg(feature = "stealth")]
-                if let Some(client) = &self.stealth_client {
-                    return client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
-                        .map(Some).map_err(|error| PageError::NetworkError(error.to_string()));
-                }
-                self.http_client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
-                    .map_err(|error| PageError::NetworkError(error.to_string()))?
+                self.intercepted_navigation_transport(&target, method, body, headers, response_hook.as_ref()).await?
             }
             Ok(InterceptResolution::Fail {reason}) => {
                 let mut error = String::from("net::ERR_");
@@ -1937,12 +1980,45 @@ impl Page {
                 }
                 return Err(PageError::NetworkError(error));
             }
+            Ok(InterceptResolution::ContinueResponse { .. } | InterceptResolution::FulfillResponse { .. }) => {
+                return Err(PageError::NetworkError("invalid request-stage interception resolution".into()));
+            }
             Err(_) => return Err(PageError::NetworkError("net::ERR_ABORTED".into())),
         };
-        Ok(Some(response))
+        Ok(Some((response, true)))
+    }
+
+    async fn intercepted_navigation_transport(&self, target: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<std::collections::HashMap<String, String>>, hook: Option<&obscura_js::ops::CdpResponseHook>,
+    ) -> Result<Response, PageError> {
+        if self.network_offline.load(std::sync::atomic::Ordering::Relaxed) && matches!(target.scheme(), "http" | "https") {
+            return Err(PageError::NetworkError("net::ERR_INTERNET_DISCONNECTED".into()));
+        }
+        let mut request = ResourceRequest::navigation();
+        request.cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            let result = if let Some(hook) = hook {
+                client.fetch_resource_request_with_response_hook(target, request, method, body, headers, Some(&self.callbacks), hook).await
+            } else { client.fetch_resource_request(target, request, method, body, headers, Some(&self.callbacks)).await };
+            return result.map_err(|error| PageError::NetworkError(error.to_string()));
+        }
+        let result = if let Some(hook) = hook {
+            self.http_client.fetch_resource_request_with_response_hook(target, request, method, body, headers, Some(&self.callbacks), hook).await
+        } else { self.http_client.fetch_resource_request(target, request, method, body, headers, Some(&self.callbacks)).await };
+        result.map_err(|error| PageError::NetworkError(error.to_string()))
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        if self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut request = ResourceRequest::navigation();
+            request.cache_disabled = true;
+            #[cfg(feature = "stealth")]
+            if let Some(ref stealth) = self.stealth_client {
+                return stealth.fetch_resource_with_callbacks(url, request, Some(&self.callbacks)).await;
+            }
+            return self.http_client.fetch_resource_with_callbacks(url, request, Some(&self.callbacks)).await;
+        }
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
             // Pass the page callbacks so CDP Network events and
@@ -1955,6 +2031,47 @@ impl Page {
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))
             .await
+    }
+
+    /// Allow CDP to answer an HTTP Basic challenge on a top-level navigation.
+    /// The credential is scoped to this retry and never stored on the client.
+    async fn authenticate_navigation(&self, response: Response, method: &str, body: &str) -> Result<Response, PageError> {
+        use obscura_js::ops::{AuthenticationChallenge, InterceptedRequest, InterceptResolution};
+        if !self.handle_auth_requests || response.status != 401 { return Ok(response); }
+        let Some(tx) = &self.intercept_tx else { return Ok(response); };
+        let Some(challenge) = response.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.as_str()) else { return Ok(response); };
+        let Some((scheme, parameters)) = challenge.split_once(' ') else { return Ok(response); };
+        if !scheme.eq_ignore_ascii_case("basic") { return Ok(response); }
+        let realm = parameters.split(',').filter_map(|part| part.trim().split_once('='))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("realm"))
+            .map(|(_, value)| value.trim().trim_matches('"').to_string()).unwrap_or_default();
+        let target = response.url.clone();
+        let headers = self.http_client.extra_headers.read().await.clone();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let intercepted = InterceptedRequest {
+            request_id: format!("{}.{}", self.id, self.network_event_counter + 1), page_id: self.id.clone(),
+            url: target.to_string(), method: method.into(), headers: headers.clone(), resource_type: "Document".into(),
+            network_id: None, auth_challenge: Some(AuthenticationChallenge { source: "Server".into(),
+                origin: target.origin().ascii_serialization(), scheme: "basic".into(), realm }), response: None, resolver,
+        };
+        if tx.send(intercepted).is_err() { return Ok(response); }
+        let Ok(InterceptResolution::Continue { headers: Some(credentials), .. }) = resolution.await else { return Ok(response); };
+        let Some(authorization) = credentials.iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.clone()) else { return Ok(response); };
+        let mut headers = headers;
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+        headers.insert("Authorization".into(), authorization);
+        let body = (!body.is_empty()).then(|| body.as_bytes().to_vec());
+        let mut request = ResourceRequest::navigation();
+        request.cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            return client.fetch_resource_request(&target, request, method, body, Some(headers), Some(&self.callbacks)).await
+                .map_err(|error| PageError::NetworkError(error.to_string()));
+        }
+        self.http_client.fetch_resource_request(&target, request, method, body, Some(headers), Some(&self.callbacks)).await
+            .map_err(|error| PageError::NetworkError(error.to_string()))
     }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
@@ -2053,6 +2170,7 @@ impl Page {
 
         rt.set_intercept_page_id(&self.id);
         rt.set_network_reporting_enabled(self.network_reporting_enabled);
+        rt.set_network_overrides(self.network_offline.clone(), self.network_cache_disabled.clone());
         if !self.cdp_full_extra_headers.is_empty() { rt.set_extra_http_headers(self.cdp_full_extra_headers.clone()); }
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
@@ -2062,7 +2180,10 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_handle_auth_requests(self.handle_auth_requests);
         rt.set_intercept_url_patterns(self.intercept_block_patterns.clone());
+        rt.set_cdp_request_patterns(self.cdp_request_patterns.clone());
+        rt.set_cdp_response_patterns(self.cdp_response_patterns.clone());
         #[cfg(feature = "render")]
         rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
@@ -2075,6 +2196,9 @@ impl Page {
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.set_frame_preload_scripts(&self.preload_scripts);
         rt.run_page_init();
+        if self.navigator_offline {
+            let _ = rt.execute_script("<network-offline>", "navigator.onLine = false;");
+        }
         rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -2182,8 +2306,10 @@ impl Page {
 
         let mut sheets = std::collections::HashMap::new();
         let mut aliases = std::collections::HashMap::new();
+        let offline = self.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), headers: self.cdp_extra_headers.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), response_patterns: self.cdp_response_patterns.clone(), handle_auth: self.handle_auth_requests, headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
@@ -2202,12 +2328,13 @@ impl Page {
                     let initiator = initiator.clone();
                     let interception = interception.clone();
                     async move {
-                        let request =
-                            ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        let mut request = ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        request.offline = offline;
+                        request.cache_disabled = cache_disabled;
                         if let Some(interception) = interception {
                             match interception.fetch(&requested_url, request.clone(), "Stylesheet", &client,
                                 #[cfg(feature = "stealth")] stealth_client.as_deref(), &callbacks).await {
-                                Ok(Some((response, id))) => return (key, requested_url, depth, Ok((response, Some(id)))),
+                                Ok(Some((response, id, emitted))) => return (key, requested_url, depth, Ok((response, Some((id, emitted))))),
                                 Ok(None) => {},
                                 Err(error) => return (key, requested_url, depth, Err(error)),
                             }
@@ -2254,8 +2381,8 @@ impl Page {
                     }
                 };
                 let response_url = response.url.clone();
-                if let Some(id) = intercepted_id {
-                    self.record_intercepted_resource(id, "Stylesheet", &response);
+                if let Some((id, emitted)) = intercepted_id {
+                    self.record_intercepted_resource(id, "Stylesheet", &response, emitted);
                 } else { self.record_network_event_with_body(
                     response_url.as_str(),
                     "GET",
@@ -2630,8 +2757,10 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
+        let offline = self.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), headers: self.cdp_extra_headers.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), response_patterns: self.cdp_response_patterns.clone(), handle_auth: self.handle_auth_requests, headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
@@ -2677,11 +2806,13 @@ impl Page {
                         };
                         return Some((idx, url, resp, None));
                     }
-                    let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    request.offline = offline;
+                    request.cache_disabled = cache_disabled;
                     if let Some(interception) = interception {
                         match interception.fetch(&parsed, request.clone(), "Script", &client,
                             #[cfg(feature = "stealth")] stealth_client.as_deref(), &cbs).await {
-                            Ok(Some((resp, id))) => return Some((idx, url, resp, Some(id))),
+                            Ok(Some((resp, id, emitted))) => return Some((idx, url, resp, Some((id, emitted)))),
                             Ok(None) => {},
                             Err(error) => { tracing::warn!("Failed to fetch script {}: {}", url, error); return None; }
                         }
@@ -2722,12 +2853,12 @@ impl Page {
             }
         };
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response, Option<String>)> =
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response, Option<(String, bool)>)> =
             std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp, intercepted_id)) = result {
                 if !script_response_is_executable(resp.status) {
-                    if let Some(id) = intercepted_id { self.record_intercepted_resource(id, "Script", &resp); }
+                    if let Some((id, emitted)) = intercepted_id { self.record_intercepted_resource(id, "Script", &resp, emitted); }
                     else { self.record_network_event_with_body(
                         &url,
                         "GET",
@@ -2865,12 +2996,12 @@ impl Page {
         let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
-             fetched_script: Option<(String, String, obscura_net::Response, Option<String>)>| {
+             fetched_script: Option<(String, String, obscura_net::Response, Option<(String, bool)>)>| {
                 if script.src.is_some() {
                     if let Some((url, code, resp, intercepted_id)) = fetched_script {
                         tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                         let execution_url = resp.url.to_string();
-                        if let Some(id) = intercepted_id { page.record_intercepted_resource(id, "Script", &resp); }
+                        if let Some((id, emitted)) = intercepted_id { page.record_intercepted_resource(id, "Script", &resp, emitted); }
                         else { page.record_network_event_with_body(
                             &url,
                             "GET",
@@ -3700,8 +3831,8 @@ impl Page {
         let intercepted = self.intercept_navigation(&url, method, body).await.map_err(|error| {
             self.lifecycle = LifecycleState::Failed; error
         })?;
-        let was_intercepted = intercepted.is_some();
-        let response = if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
+        let was_intercepted = intercepted.as_ref().is_some_and(|(_, fired)| *fired);
+        let response = if let Some((response, _)) = intercepted { Ok(response) } else if url.scheme() == "data" {
             let content_type = url_str
                 .strip_prefix("data:")
                 .and_then(|s| s.split(',').next())
@@ -3720,10 +3851,16 @@ impl Page {
                 body: body_bytes,
                 redirected_from: Vec::new(),
             })
+        } else if self.network_offline.load(std::sync::atomic::Ordering::Relaxed) && matches!(url.scheme(), "http" | "https") {
+            Err(ObscuraNetError::Network("net::ERR_INTERNET_DISCONNECTED".into()))
         } else if method == "POST" {
-            self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
-                .await
+            if self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut request = ResourceRequest::navigation();
+                request.cache_disabled = true;
+                self.http_client.fetch_resource_request(&url, request, "POST", Some(body.as_bytes().to_vec()), None, Some(&self.callbacks)).await
+            } else {
+                self.http_client.post_form_with_callbacks(&url, body, Some(&self.callbacks)).await
+            }
         } else {
             self.do_fetch(&url).await
         }
@@ -3731,6 +3868,9 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        let response_paused = self.cdp_response_patterns.as_deref().is_some_and(|patterns|
+            obscura_js::ops::matches_cdp_request_patterns(Some(patterns), response.url.as_str(), "Document"));
+        let response = if response_paused { response } else { self.authenticate_navigation(response, method, body).await? };
         self.navigation_timing.record("responseEnd");
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
@@ -4867,11 +5007,11 @@ impl Page {
         self.store_response_body(request_id, body, base64_encoded);
     }
 
-    fn record_intercepted_resource(&mut self, request_id: String, resource_type: &str, response: &Response) {
+    fn record_intercepted_resource(&mut self, request_id: String, resource_type: &str, response: &Response, emitted: bool) {
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_secs_f64();
         self.network_events.push(NetworkEvent {
-            request_id: request_id.clone(), intercepted: true, url: response.url.to_string(), method: "GET".into(),
+            request_id: request_id.clone(), intercepted: emitted, url: response.url.to_string(), method: "GET".into(),
             resource_type: resource_type.into(), status: response.status, headers: Default::default(),
             response_headers: Arc::new(response.headers.clone()), body_size: response.body.len(), timestamp, error_text: None,
         });
@@ -5328,6 +5468,30 @@ impl Page {
         if let Some(js) = &self.js { js.set_network_reporting_enabled(enabled); }
     }
 
+    pub fn set_network_offline(&mut self, offline: bool) {
+        self.network_offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+        self.set_navigator_offline(offline);
+    }
+
+    pub fn set_navigator_offline(&mut self, offline: bool) {
+        let previous = std::mem::replace(&mut self.navigator_offline, offline);
+        if previous != offline {
+            if let Some(js) = &mut self.js {
+                let source = if offline {
+                    "navigator.onLine = false; dispatchEvent(new Event('offline'));"
+                } else {
+                    "navigator.onLine = true; dispatchEvent(new Event('online'));"
+                };
+                let _ = js.execute_script("<network-offline>", source);
+            }
+        }
+    }
+
+    pub fn set_handle_auth_requests(&mut self, enabled: bool) {
+        self.handle_auth_requests = enabled;
+        if let Some(js) = &self.js { js.set_handle_auth_requests(enabled); }
+    }
+
     pub fn set_cdp_extra_headers(&mut self, headers: std::collections::HashMap<String, String>) {
         self.cdp_extra_headers = headers.iter().filter(|(name, _)| !matches!(name.to_ascii_lowercase().as_str(),
             "cookie" | "origin" | "host" | "content-length" | "connection" | "accept-encoding"))
@@ -5344,6 +5508,8 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
             js.set_intercept_url_patterns(self.intercept_block_patterns.clone());
+            js.set_cdp_request_patterns(self.cdp_request_patterns.clone());
+            js.set_cdp_response_patterns(self.cdp_response_patterns.clone());
             // `Fetch.enable` assigns the patterns right before this call;
             // the renderer's loads follow the same interception policy.
             #[cfg(feature = "render")]
@@ -5521,7 +5687,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], headers: Default::default() };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, response_patterns: None, handle_auth: false, headers: Default::default() };
         let (result, (), wire) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
                 interception.fetch(&original, request, "Script", &client,
@@ -5557,6 +5723,84 @@ mod tests {
         assert!(wire.ends_with(&[0, 128, 255]));
     }
 
+    async fn assert_parser_resource_authentication(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Url::parse(&format!("http://{}/app.js", listener.local_addr().unwrap())).unwrap();
+        let redirected = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_url = format!("http://{}/final", redirected.local_addr().unwrap());
+        let other_origin = tokio::spawn(async move {
+            let (mut socket, _) = redirected.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            assert!(!String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("authorization:"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        });
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                if attempt == 0 {
+                    assert!(!headers.contains("authorization:"));
+                    socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"static\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(headers.contains("authorization: basic dxnlcjpwyxnz"));
+                    let reply = format!("HTTP/1.1 302 Found\r\nLocation: {redirect_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let jar = Arc::new(obscura_net::CookieJar::new());
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+        #[cfg(feature = "stealth")]
+        let stealth_client = stealth.then(|| obscura_net::StealthHttpClient::with_proxy(jar, None, true));
+        #[cfg(not(feature = "stealth"))]
+        let _ = (stealth, jar);
+        let callbacks = CallbackRegistry::new();
+        let request = ResourceRequest::subresource(ResourceType::Script, &target);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: Vec::new(),
+            cdp_patterns: Some(Arc::new(Vec::new())), response_patterns: None, handle_auth: true, headers: Default::default() };
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(interception.fetch(&target, request, "Script", &client,
+                #[cfg(feature = "stealth")] stealth_client.as_ref(), &callbacks), async {
+                let request = rx.recv().await.unwrap();
+                assert_eq!(request.resource_type, "Script");
+                assert_eq!(request.auth_challenge.as_ref().unwrap().realm, "static");
+                request.resolver.send(InterceptResolution::Continue { url: None, method: None,
+                    headers: Some([("Authorization".into(), "Basic dXNlcjpwYXNz".into())].into()), body: None }).unwrap();
+            })
+        }).await.expect("resource challenge must complete");
+        assert_eq!(response.unwrap().unwrap().0.body, b"ok");
+        assert!(client.extra_headers.read().await.is_empty());
+        server.await.unwrap();
+        other_origin.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_resource_authentication_retries_with_scoped_credentials() {
+        assert_parser_resource_authentication(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_parser_resource_authentication_retries_with_scoped_credentials() {
+        assert_parser_resource_authentication(true).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn continued_parser_resource_rejects_private_url_rewrite() {
         use obscura_js::ops::InterceptResolution;
@@ -5566,7 +5810,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], headers: Default::default() };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, response_patterns: None, handle_auth: false, headers: Default::default() };
         let (result, ()) = tokio::join!(
             interception.fetch(&original, request, "Script", &client,
                 #[cfg(feature = "stealth")] None, &callbacks),
@@ -5639,6 +5883,116 @@ mod tests {
         assert_eq!(page.title,"continued");
         assert_eq!(page.url_string(),"http://127.0.0.1:9/original","a network rewrite does not rewrite the document URL");
         assert!(page.http_client.extra_headers.read().await.is_empty(),"per-request headers cannot leak to another page");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basic_navigation_challenge_retries_with_scoped_credentials() {
+        assert_basic_navigation_challenge_retries_with_scoped_credentials(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offline_navigation_blocks_network_but_keeps_local_documents() {
+        let context = Arc::new(BrowserContext::with_storage_and_network("offline-navigation".into(), None, false, None, None, true));
+        let mut page = Page::new("offline-navigation".into(), context);
+        page.set_network_offline(true);
+        assert!(page.navigate("http://127.0.0.1:9/").await.unwrap_err().to_string().contains("ERR_INTERNET_DISCONNECTED"));
+        page.navigate("data:text/html,<p>local</p>").await.unwrap();
+        assert_eq!(page.evaluate("navigator.onLine"), serde_json::json!(false));
+        page.set_network_offline(false);
+        assert_eq!(page.evaluate("navigator.onLine"), serde_json::json!(true));
+    }
+
+    async fn assert_response_stage_pauses_before_navigation_body(stealth: bool) {
+        use obscura_js::ops::{CdpRequestPattern, InterceptResolution};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/response", listener.local_addr().unwrap());
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 20\r\nConnection: close\r\n\r\n").await.unwrap();
+            wait.await.unwrap();
+            socket.write_all(b"<title>hello</title>").await.unwrap();
+        };
+        let context = Arc::new(BrowserContext::with_storage_and_network("response-stage".into(), None, stealth, None, None, true));
+        let mut page = Page::new("response-stage".into(), context);
+        let mut requests = page.enable_interception();
+        page.cdp_request_patterns = Some(Arc::new(Vec::new()));
+        page.cdp_response_patterns = Some(Arc::new(vec![CdpRequestPattern { url_pattern: "*".into(), resource_type: None }]));
+        let answer = async {
+            let request = requests.recv().await.unwrap();
+            let response = request.response.as_ref().expect("response stage");
+            assert_eq!(response.status, 200);
+            release.send(()).unwrap();
+            assert_eq!(response.body.bytes().await.unwrap().as_slice(), b"<title>hello</title>");
+            request.resolver.send(InterceptResolution::ContinueResponse { status: Some(201),
+                headers: Some([("content-type".into(), "text/html".into())].into()) }).unwrap();
+        };
+        let (result, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(page.navigate(&url), serve, answer)
+        }).await.expect("response pause must occur before the server sends the body");
+        result.unwrap();
+        assert_eq!(page.title, "hello");
+        assert_eq!(page.network_events.last().unwrap().status, 201);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_stage_pauses_before_navigation_body() { assert_response_stage_pauses_before_navigation_body(false).await; }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_response_stage_pauses_before_navigation_body() { assert_response_stage_pauses_before_navigation_body(true).await; }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn basic_navigation_challenge_retries_with_scoped_credentials_in_stealth() {
+        assert_basic_navigation_challenge_retries_with_scoped_credentials(true).await;
+    }
+
+    async fn assert_basic_navigation_challenge_retries_with_scoped_credentials(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/auth", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                if attempt == 0 {
+                    assert!(!headers.contains("authorization:"));
+                    socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(headers.contains("authorization: basic dxnlcjpwyxnz"));
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<title>hello</title>").await.unwrap();
+                }
+            }
+        });
+        let context = Arc::new(BrowserContext::with_storage_and_network("auth-navigation".into(), None, stealth, None, None, true));
+        let mut page = Page::new("auth-navigation".into(), context);
+        let mut requests = page.enable_interception();
+        page.cdp_request_patterns = Some(Arc::new(Vec::new()));
+        page.handle_auth_requests = true;
+        let (result, ()) = tokio::join!(page.navigate(&url), async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+            let challenge = request.auth_challenge.as_ref().expect("authentication challenge");
+            assert_eq!(challenge.scheme, "basic");
+            assert_eq!(challenge.realm, "fixture");
+            request.resolver.send(InterceptResolution::Continue { url: None, method: None,
+                headers: Some([("Authorization".into(), "Basic dXNlcjpwYXNz".into())].into()), body: None }).unwrap();
+        });
+        result.unwrap();
+        server.await.unwrap();
+        assert_eq!(page.title, "hello");
+        assert!(page.http_client.extra_headers.read().await.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
@@ -1472,6 +1472,8 @@ struct PausedIntercept {
     main_document: bool,
     resource_type: String,
     session_id: Option<String>,
+    auth_required: bool,
+    response_body: Option<Arc<obscura_net::interceptor::HeldResponseBody>>,
 }
 
 fn resume_pauses_on_disable(text: &str, paused: &mut HashMap<String, PausedIntercept>) {
@@ -1506,7 +1508,7 @@ fn emit_intercepted_request(
     // have requests queued on the same channel, so never infer their owner.
     let loader = navigating_page.as_ref()
         .filter(|(page_id, _, _)| is_main_document_intercept(&intercepted, page_id))
-        .map(|_| intercepted.request_id.clone());
+        .map(|_| intercepted.network_id.clone().unwrap_or_else(|| intercepted.request_id.clone()));
     let route = navigating_page
         .filter(|(page_id, _, _)| *page_id == intercepted.page_id)
         .map(|(_, frame_id, session_id)| (frame_id, session_id))
@@ -1540,6 +1542,57 @@ fn emit_routed_intercepted_request(
         });
         return;
     };
+    if let Some(challenge) = &intercepted.auth_challenge {
+        let event = json!({
+            "method": "Fetch.authRequired", "sessionId": session_id,
+            "params": {
+                "requestId": intercepted.request_id, "frameId": frame_id,
+                "request": {"url": intercepted.url, "method": intercepted.method, "headers": intercepted.headers},
+                "resourceType": crate::domains::page::cdp_resource_type(&intercepted.resource_type),
+                "authChallenge": {"source": challenge.source, "origin": challenge.origin,
+                    "scheme": challenge.scheme, "realm": challenge.realm}
+            }
+        });
+        let _ = reply_tx.send(event.to_string());
+        intercepted_paused.insert(intercepted.request_id, PausedIntercept {
+            resolver: intercepted.resolver, main_document: loader.is_some(),
+            resource_type: intercepted.resource_type, session_id, auth_required: true,
+            response_body: None,
+        });
+        return;
+    }
+    if let Some(response) = intercepted.response {
+        let network_id = intercepted.network_id.as_deref().unwrap_or(&intercepted.request_id);
+        if response.emit_request_event {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            let request_event = json!({"method": "Network.requestWillBeSent", "sessionId": session_id,
+                "params": {"requestId": network_id, "loaderId": loader.unwrap_or(""),
+                    "documentURL": if loader.is_some() { intercepted.url.as_str() } else { "" },
+                    "request": {"url": intercepted.url, "method": intercepted.method, "headers": intercepted.headers},
+                    "timestamp": now, "wallTime": now, "initiator": {"type": "script"},
+                    "type": intercepted.resource_type, "frameId": frame_id}});
+            let _ = reply_tx.send(request_event.to_string());
+            for observer in observers {
+                let mut event = request_event.clone();
+                event["sessionId"] = json!(observer);
+                let _ = reply_tx.send(event.to_string());
+            }
+        }
+        let response_headers: Vec<_> = response.headers.iter().map(|(name, value)| json!({"name": name, "value": value})).collect();
+        let event = json!({
+            "method": "Fetch.requestPaused", "sessionId": session_id,
+            "params": {"requestId": intercepted.request_id, "networkId": network_id,
+                "frameId": frame_id, "resourceType": crate::domains::page::cdp_resource_type(&intercepted.resource_type),
+                "request": {"url": intercepted.url, "method": intercepted.method, "headers": intercepted.headers},
+                "responseStatusCode": response.status, "responseHeaders": response_headers}
+        });
+        let _ = reply_tx.send(event.to_string());
+        intercepted_paused.insert(intercepted.request_id, PausedIntercept {
+            resolver: intercepted.resolver, main_document: loader.is_some(), resource_type: intercepted.resource_type,
+            session_id, auth_required: false, response_body: Some(response.body),
+        });
+        return;
+    }
     tracing::info!(
         "INTERCEPTION: requestPaused for {} {} (sending to client)",
         intercepted.method,
@@ -1595,7 +1648,7 @@ fn emit_routed_intercepted_request(
     });
     let _ = reply_tx.send(request_paused.to_string());
     intercepted_paused.insert(intercepted.request_id, PausedIntercept {
-        resolver: intercepted.resolver, main_document: loader.is_some(), resource_type: intercepted.resource_type, session_id,
+        resolver: intercepted.resolver, main_document: loader.is_some(), resource_type: intercepted.resource_type, session_id, auth_required: false, response_body: None,
     });
 }
 
@@ -1806,19 +1859,70 @@ fn handle_fetch_resolution(
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
-        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest") {
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.continueResponse" | "Fetch.fulfillRequest" | "Fetch.failRequest" | "Fetch.continueWithAuth" | "Fetch.getResponseBody") {
             return false;
         }
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
         if intercepted_paused.contains_key(request_id) {
+            let pause = &intercepted_paused[request_id];
+            let response_stage = pause.response_body.is_some();
+            if pause.session_id != req.session_id || pause.auth_required != (method == "Fetch.continueWithAuth")
+                || (matches!(method, "Fetch.getResponseBody" | "Fetch.continueResponse") && !response_stage) {
+                let resp = crate::types::CdpResponse::error(req.id, -32602,
+                    "request is not paused for this operation or session".into(), req.session_id);
+                if let Ok(json) = serde_json::to_string(&resp) { let _ = reply_tx.send(json); }
+                return true;
+            }
+            if method == "Fetch.getResponseBody" {
+                let Some(body) = pause.response_body.clone() else { return false; };
+                let reply_tx = reply_tx.clone();
+                tokio::spawn(async move {
+                    let response = match body.bytes().await {
+                        Ok(bytes) => crate::types::CdpResponse::success(req.id, json!({"body": BASE64.encode(bytes.as_ref()), "base64Encoded": true}), req.session_id),
+                        Err(error) => crate::types::CdpResponse::error(req.id, -32000, error, req.session_id),
+                    };
+                    if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+                });
+                return true;
+            }
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             // Build the resolution before taking the pause. A malformed command
             // is answered with an error and the request stays paused, so a
             // corrected answer on the same requestId still drives the fetch --
             // taking the pause first would wedge the request on a client typo.
             let resolution = match method {
+                "Fetch.continueResponse" => {
+                    let status = req.params.get("responseCode").and_then(|value| value.as_u64()).map(|value| value as u16);
+                    let headers = req.params.get("responseHeaders").and_then(Value::as_array).map(|arr| {
+                        let mut headers = HashMap::new();
+                        for header in arr {
+                            let (Some(name), Some(value)) = (header.get("name").and_then(Value::as_str), header.get("value").and_then(Value::as_str)) else { continue; };
+                            obscura_net::client::merge_response_header(&mut headers, name.to_ascii_lowercase(), value.to_string());
+                        }
+                        headers
+                    });
+                    if status.is_some() != headers.is_some() { Err("responseCode and responseHeaders must be supplied together".into()) }
+                    else { Ok(obscura_js::ops::InterceptResolution::ContinueResponse { status, headers }) }
+                }
+                "Fetch.continueWithAuth" => {
+                    let auth = req.params.get("authChallengeResponse");
+                    match auth.and_then(|value| value.get("response")).and_then(|value| value.as_str()) {
+                        Some("ProvideCredentials") => {
+                            let username = auth.and_then(|v| v.get("username")).and_then(|v| v.as_str()).unwrap_or("");
+                            let password = auth.and_then(|v| v.get("password")).and_then(|v| v.as_str()).unwrap_or("");
+                            let authorization = format!("Basic {}", BASE64.encode(format!("{username}:{password}")));
+                            Ok(obscura_js::ops::InterceptResolution::Continue {
+                                url: None, method: None, headers: Some(HashMap::from([("Authorization".into(), authorization)])), body: None,
+                            })
+                        }
+                        Some("Default" | "CancelAuth") => Ok(obscura_js::ops::InterceptResolution::Continue {
+                            url: None, method: None, headers: None, body: None,
+                        }),
+                        _ => Err("invalid authChallengeResponse".to_string()),
+                    }
+                }
                 "Fetch.continueRequest" => {
                     // Honor the client's overrides (Playwright route.continue,
                     // Puppeteer request.continue). op_fetch_url applies each and
@@ -1850,12 +1954,14 @@ fn handle_fetch_resolution(
                     }
                     // Validate before consuming the pause; keep exact bytes for JS.
                     match decode_optional_binary(&req.params, "body", "fulfillRequest body") {
-                        Ok(bytes) => Ok(obscura_js::ops::InterceptResolution::Fulfill {
-                            status,
-                            headers,
-                            body: String::from_utf8_lossy(&bytes.unwrap_or_default()).to_string(),
-                            body_base64: raw_body.to_string(),
-                        }),
+                        Ok(bytes) => if response_stage {
+                            Ok(obscura_js::ops::InterceptResolution::FulfillResponse { status, headers, body: bytes })
+                        } else {
+                            Ok(obscura_js::ops::InterceptResolution::Fulfill {
+                                status, headers, body: String::from_utf8_lossy(&bytes.unwrap_or_default()).to_string(),
+                                body_base64: raw_body.to_string(),
+                            })
+                        },
                         Err(message) => Err(message),
                     }
                 }
@@ -2071,7 +2177,7 @@ async fn process_with_interception(
                     continue;
                 }
                 if is_main_document_intercept(&intercepted, &page_id) {
-                    loader_id = intercepted.request_id.clone();
+                    loader_id = intercepted.network_id.clone().unwrap_or_else(|| intercepted.request_id.clone());
                     document_request_started = true;
                 }
                 emit_intercepted_request(
@@ -2119,8 +2225,11 @@ async fn process_with_interception(
                             }
                         }
                         if msg.text.contains("Fetch.continueRequest")
+                            || msg.text.contains("Fetch.continueResponse")
+                            || msg.text.contains("Fetch.getResponseBody")
                             || msg.text.contains("Fetch.fulfillRequest")
                             || msg.text.contains("Fetch.failRequest")
+                            || msg.text.contains("Fetch.continueWithAuth")
                         {
                             // Safe: only flips a oneshot to resume the parked
                             // op inside the spawned nav task. No V8 enter on
@@ -2347,7 +2456,6 @@ fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
     let result = match req.method.as_str() {
-        "Network.setCacheDisabled" |
         "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
@@ -2524,7 +2632,7 @@ mod tests {
         let (resolver, _resolution) = tokio::sync::oneshot::channel();
         let intercepted = obscura_js::ops::InterceptedRequest {
             request_id: "fetch-1".into(), page_id: page.clone(), url: "https://example.test/data".into(),
-            method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), resolver,
+            method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), network_id: None, auth_challenge: None, response: None, resolver,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut paused = HashMap::new();
@@ -2545,6 +2653,76 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn auth_challenge_is_routed_and_credentials_resolve_the_pause() {
+        use obscura_js::ops::{AuthenticationChallenge, InterceptResolution, InterceptedRequest};
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page = ctx.create_page();
+        ctx.sessions.insert("auth-session".into(), page.clone());
+        ctx.fetch_intercept.sessions_by_page.insert(page.clone(), "auth-session".into());
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let intercepted = InterceptedRequest { request_id: "auth-1".into(), page_id: page.clone(),
+            url: "https://example.test/".into(), method: "GET".into(), headers: Default::default(),
+            resource_type: "Document".into(), network_id: None, auth_challenge: Some(AuthenticationChallenge {
+                source: "Server".into(), origin: "https://example.test".into(), scheme: "basic".into(), realm: "fixture".into(),
+            }), response: None, resolver };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        super::emit_intercepted_request(intercepted, &ctx, Some((&page, "frame", Some("auth-session".into()))), &tx, &mut paused);
+        let event: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(event["method"], "Fetch.authRequired");
+        assert_eq!(event["sessionId"], "auth-session");
+        assert_eq!(event["params"]["authChallenge"]["realm"], "fixture");
+        assert!(super::handle_fetch_resolution(&json!({"id": 6, "sessionId": "other-session", "method": "Fetch.continueWithAuth",
+            "params": {"requestId": "auth-1", "authChallengeResponse": {"response": "Default"}}}).to_string(), &tx, &mut paused));
+        let rejected: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(rejected.get("error").is_some());
+        assert!(paused.contains_key("auth-1"));
+        assert!(super::handle_fetch_resolution(&json!({"id": 7, "sessionId": "auth-session", "method": "Fetch.continueWithAuth",
+            "params": {"requestId": "auth-1", "authChallengeResponse": {"response": "ProvideCredentials", "username": "user", "password": "pass"}}}).to_string(), &tx, &mut paused));
+        match resolution.await.unwrap() {
+            InterceptResolution::Continue { headers: Some(headers), .. } => assert_eq!(headers["Authorization"], "Basic dXNlcjpwYXNz"),
+            other => panic!("unexpected resolution: {other:?}"),
+        }
+        assert!(paused.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_pause_exposes_binary_body_without_consuming_pause() {
+        use obscura_js::ops::{InterceptedRequest, InterceptedResponse, InterceptResolution};
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page = ctx.create_page();
+        ctx.sessions.insert("response-session".into(), page.clone());
+        ctx.fetch_intercept.sessions_by_page.insert(page.clone(), "response-session".into());
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let body = std::sync::Arc::new(obscura_net::interceptor::HeldResponseBody::new(Box::pin(async { Ok(vec![0, 255, 128, 42]) })));
+        let intercepted = InterceptedRequest { request_id: "response-1".into(), page_id: page.clone(),
+            url: "https://example.test/data".into(), method: "GET".into(), headers: Default::default(),
+            resource_type: "XHR".into(), network_id: None, auth_challenge: None,
+            response: Some(InterceptedResponse { status: 200, headers: [("content-type".into(), "application/octet-stream".into())].into(), body, emit_request_event: true }), resolver };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        super::emit_intercepted_request(intercepted, &ctx, Some((&page, "frame", Some("response-session".into()))), &tx, &mut paused);
+        let request: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(request["method"], "Network.requestWillBeSent");
+        assert_eq!(event["method"], "Fetch.requestPaused");
+        assert_eq!(event["params"]["responseStatusCode"], 200);
+        assert!(super::handle_fetch_resolution(&json!({"id": 7, "sessionId": "response-session", "method": "Fetch.getResponseBody",
+            "params": {"requestId": "response-1"}}).to_string(), &tx, &mut paused));
+        let body: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(body["result"]["body"], "AP+AKg==");
+        assert_eq!(body["result"]["base64Encoded"], true);
+        assert!(paused.contains_key("response-1"));
+        assert!(super::handle_fetch_resolution(&json!({"id": 8, "sessionId": "response-session", "method": "Fetch.continueResponse",
+            "params": {"requestId": "response-1", "responseCode": 201,
+                "responseHeaders": [{"name": "X-Fixture", "value": "modified"}]}}).to_string(), &tx, &mut paused));
+        match resolution.await.unwrap() {
+            InterceptResolution::ContinueResponse { status: Some(201), headers: Some(headers) } => assert_eq!(headers["x-fixture"], "modified"),
+            other => panic!("unexpected response resolution: {other:?}"),
+        }
+    }
+
     #[test]
     fn fetch_pause_goes_to_enabling_session_including_during_navigation() {
         let mut ctx = crate::dispatch::CdpContext::new();
@@ -2557,7 +2735,7 @@ mod tests {
             let request = obscura_js::ops::InterceptedRequest {
                 request_id: "fetch-owner-test".into(), page_id: page.clone(),
                 url: "https://example.test/x".into(), method: "GET".into(),
-                headers: Default::default(), resource_type: "XHR".into(), resolver,
+                headers: Default::default(), resource_type: "XHR".into(), network_id: None, auth_challenge: None, response: None, resolver,
             };
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let mut paused = HashMap::new();
@@ -2579,7 +2757,7 @@ mod tests {
         for session in ["owner", "other"] {
             let (resolver, receiver) = tokio::sync::oneshot::channel();
             paused.insert(session.to_string(), super::PausedIntercept { resolver, main_document: false,
-                resource_type: "Image".into(), session_id: Some(session.into()) });
+                resource_type: "Image".into(), session_id: Some(session.into()), auth_required: false, response_body: None });
             receivers.push(receiver);
         }
         super::resume_pauses_on_disable(&json!({"id": 1, "method": "Fetch.disable", "sessionId": "owner"}).to_string(), &mut paused);
@@ -2604,7 +2782,7 @@ mod tests {
             let (resolver, _resolution) = tokio::sync::oneshot::channel();
             let intercepted = obscura_js::ops::InterceptedRequest {
                 request_id: request_id.into(), page_id: page.clone(), url: "http://example.test/".into(),
-                method: "GET".into(), headers: Default::default(), resource_type: "Document".into(), resolver,
+                method: "GET".into(), headers: Default::default(), resource_type: "Document".into(), network_id: None, auth_challenge: None, response: None, resolver,
             };
             super::emit_intercepted_request(intercepted, &ctx,
                 Some((&navigating, "frame-nav", Some("driver".into()))), &tx, &mut paused);
@@ -3729,7 +3907,7 @@ mod tests {
             intercept_tx.send(InterceptedRequest {
                 page_id: page_id.clone(),
                 request_id: "pending-test".into(), url: format!("http://{address}/pending"),
-                method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(),
+                method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(), network_id: None, auth_challenge: None, response: None,
                 resolver: resolution_tx,
             }).unwrap();
             loop {
@@ -4116,7 +4294,7 @@ mod tests {
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None})]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None, auth_required: false, response_body: None })]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         assert!(!handle_fetch_resolution(
             r#"{"id":16,"method":"Network.getResponseBody","params":{"requestId":"request-1"}}"#,
@@ -4139,7 +4317,7 @@ mod tests {
         assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
 
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        paused.insert("request-2".into(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None});
+        paused.insert("request-2".into(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: Some("page-session".into()), auth_required: false, response_body: None });
         assert!(handle_fetch_resolution(
             r#"{"id":18,"method":"Fetch.failRequest","sessionId":"page-session","params":{"requestId":"request-2","errorReason":"Aborted"}}"#,
             &reply_tx, &mut paused,
@@ -4269,7 +4447,7 @@ mod tests {
     #[test]
     fn continue_request_decodes_a_base64_post_data() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None})]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None, auth_required: false, response_body: None })]);
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         // base64 of {"a":1}
@@ -4295,7 +4473,7 @@ mod tests {
     #[test]
     fn continue_request_keeps_a_non_utf8_post_data_intact() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None})]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None, auth_required: false, response_body: None })]);
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         // base64 of the three bytes 00 FF FE, which are not valid UTF-8
@@ -4321,7 +4499,7 @@ mod tests {
     #[test]
     fn continue_request_rejects_post_data_that_is_not_base64_without_wedging_it() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None})]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None, auth_required: false, response_body: None })]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         assert!(handle_fetch_resolution(
@@ -4367,7 +4545,7 @@ mod tests {
     #[test]
     fn fulfill_request_preserves_repeated_set_cookie_headers() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("document-1".into(), super::PausedIntercept { resolver: tx, main_document: true, resource_type: "Document".into(), session_id: None })]);
+        let mut paused = HashMap::from([("document-1".into(), super::PausedIntercept { resolver: tx, main_document: true, resource_type: "Document".into(), session_id: None, auth_required: false, response_body: None })]);
         let (reply_tx, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(handle_fetch_resolution(r#"{"id":1,"method":"Fetch.fulfillRequest","params":{"requestId":"document-1","responseCode":200,"responseHeaders":[{"name":"Set-Cookie","value":"first=1; Path=/"},{"name":"Set-Cookie","value":"second=2; Path=/"},{"name":"set-cookie","value":"third=3; Path=/"},{"name":"Content-Type","value":"text/html"}]}}"#,
             &reply_tx, &mut paused));
@@ -4381,7 +4559,7 @@ mod tests {
     #[test]
     fn fulfill_request_rejects_a_body_that_is_not_base64() {
         let (resolution_tx, _resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None})]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None, auth_required: false, response_body: None })]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         assert!(handle_fetch_resolution(
@@ -4406,7 +4584,7 @@ mod tests {
     fn continue_request_rejects_invalid_binary_values_and_allows_retry() {
         for value in [json!(null), json!(42), json!("AA="), json!("AB=="), json!("====")] {
             let (tx, mut rx) = tokio::sync::oneshot::channel();
-            let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept { resolver: tx, main_document: false, resource_type: "XHR".into(), session_id: None })]);
+            let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept { resolver: tx, main_document: false, resource_type: "XHR".into(), session_id: None, auth_required: false, response_body: None })]);
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
             let command = json!({"id": 1, "method": "Fetch.continueRequest",
                 "params": {"requestId": "request-1", "postData": value}}).to_string();
@@ -4429,7 +4607,7 @@ mod tests {
     #[test]
     fn continue_request_without_post_data_leaves_the_body_alone() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None})]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false, resource_type: "XHR".into(), session_id: None, auth_required: false, response_body: None })]);
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         assert!(handle_fetch_resolution(

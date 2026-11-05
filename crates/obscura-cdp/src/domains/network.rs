@@ -24,6 +24,16 @@ fn cookie_jar_for<'a>(ctx: &'a CdpContext, session_id: &Option<String>) -> &'a A
         .unwrap_or(&ctx.default_context.cookie_jar)
 }
 
+fn require_unthrottled(params: &Value) -> Result<(), String> {
+    let latency = params.get("latency").and_then(Value::as_f64).unwrap_or(0.0);
+    let download = params.get("downloadThroughput").and_then(Value::as_f64).unwrap_or(-1.0);
+    let upload = params.get("uploadThroughput").and_then(Value::as_f64).unwrap_or(-1.0);
+    if latency != 0.0 || download != -1.0 || upload != -1.0 {
+        return Err("Network throughput and latency emulation are not implemented".into());
+    }
+    Ok(())
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -118,7 +128,40 @@ pub async fn handle(
             cookie_jar_for(ctx, session_id).clear();
             Ok(json!({}))
         }
-        "setCacheDisabled" => Ok(json!({})),
+        "setCacheDisabled" => {
+            let disabled = params.get("cacheDisabled").and_then(Value::as_bool).ok_or("cacheDisabled required")?;
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            page.network_cache_disabled.store(disabled, std::sync::atomic::Ordering::Relaxed);
+            Ok(json!({}))
+        }
+        "emulateNetworkConditions" => {
+            let offline = params.get("offline").and_then(Value::as_bool).ok_or("offline required")?;
+            require_unthrottled(params)?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            page.set_network_offline(offline);
+            Ok(json!({}))
+        }
+        "overrideNetworkState" => {
+            let offline = params.get("offline").and_then(Value::as_bool).ok_or("offline required")?;
+            require_unthrottled(params)?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            page.set_navigator_offline(offline);
+            Ok(json!({}))
+        }
+        "emulateNetworkConditionsByRule" => {
+            let rules = params.get("matchedNetworkConditions").and_then(Value::as_array).ok_or("matchedNetworkConditions required")?;
+            if rules.len() > 1 || rules.first().is_some_and(|rule| rule.get("urlPattern").and_then(Value::as_str).unwrap_or("") != "") {
+                return Err("Only a global network condition rule is implemented".into());
+            }
+            let offline = if let Some(rule) = rules.first() {
+                require_unthrottled(rule)?;
+                rule.get("offline").and_then(Value::as_bool).ok_or("offline required")?
+            } else { false };
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            page.network_offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+            let ids: Vec<String> = rules.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            Ok(json!({"ruleIds": ids}))
+        }
         "setRequestInterception" => Err("Network.setRequestInterception is not implemented; use Fetch.enable".into()),
         "setBlockedURLs" => {
             let patterns = params
@@ -169,6 +212,36 @@ pub async fn handle(
 mod tests {
     use super::*;
     use obscura_net::CookieInfo;
+
+    #[tokio::test]
+    async fn network_controls_are_scoped_to_the_session_page() {
+        let mut ctx = CdpContext::new();
+        let left = ctx.create_page();
+        let right = ctx.create_page();
+        let session = Some("left-network".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), left.clone());
+        handle("setCacheDisabled", &json!({"cacheDisabled": true}), &mut ctx, &session).await.unwrap();
+        handle("emulateNetworkConditions", &json!({"offline": true, "latency": 0,
+            "downloadThroughput": -1, "uploadThroughput": -1}), &mut ctx, &session).await.unwrap();
+        let left_page = ctx.get_page(&left).unwrap();
+        assert!(left_page.network_offline.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(left_page.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed));
+        let right_page = ctx.get_page(&right).unwrap();
+        assert!(!right_page.network_offline.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!right_page.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(handle("emulateNetworkConditions", &json!({"offline": false, "latency": 1}), &mut ctx, &session).await.is_err());
+        handle("overrideNetworkState", &json!({"offline": false}), &mut ctx, &session).await.unwrap();
+        assert!(!ctx.get_page(&left).unwrap().navigator_offline);
+        assert!(ctx.get_page(&left).unwrap().network_offline.load(std::sync::atomic::Ordering::Relaxed));
+        let result = handle("emulateNetworkConditionsByRule", &json!({"matchedNetworkConditions": [{
+            "urlPattern": "", "offline": false, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1
+        }]}), &mut ctx, &session).await.unwrap();
+        assert_eq!(result["ruleIds"].as_array().unwrap().len(), 1);
+        assert!(!ctx.get_page(&left).unwrap().network_offline.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(handle("emulateNetworkConditionsByRule", &json!({"matchedNetworkConditions": [{
+            "urlPattern": "*example*", "offline": true
+        }]}), &mut ctx, &session).await.is_err());
+    }
 
     fn sample_cookie(name: &str) -> CookieInfo {
         CookieInfo {

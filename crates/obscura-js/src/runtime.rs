@@ -1564,6 +1564,24 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().intercept_url_patterns = patterns;
     }
 
+    pub fn set_cdp_request_patterns(&self, patterns: Option<std::sync::Arc<Vec<crate::ops::CdpRequestPattern>>>) {
+        self.state.borrow_mut().cdp_request_patterns = patterns;
+    }
+
+    pub fn set_cdp_response_patterns(&self, patterns: Option<std::sync::Arc<Vec<crate::ops::CdpRequestPattern>>>) {
+        self.state.borrow_mut().cdp_response_patterns = patterns;
+    }
+
+    pub fn set_handle_auth_requests(&self, enabled: bool) {
+        self.state.borrow_mut().handle_auth_requests = enabled;
+    }
+
+    pub fn set_network_overrides(&self, offline: std::sync::Arc<std::sync::atomic::AtomicBool>, cache_disabled: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let mut state = self.state.borrow_mut();
+        state.network_offline = offline;
+        state.network_cache_disabled = cache_disabled;
+    }
+
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
     /// loads honour them like the page's own subresource fetches do.
     #[cfg(feature = "render")]
@@ -2369,8 +2387,14 @@ impl ObscuraJsRuntime {
         }
         let initiator = initiator.expect("checked above");
         let callbacks = state.callbacks.clone();
+        let offline = state.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_disabled = state.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if state.intercept_enabled {
-            state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone()))
+            state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
+        } else { None };
+        let response_config = if state.cdp_response_patterns.is_some() || state.handle_auth_requests {
+            state.intercept_tx.as_ref().map(|tx| (tx.clone(), state.intercept_page_id.clone(),
+                state.cdp_response_patterns.clone().unwrap_or_else(|| std::sync::Arc::new(Vec::new())), state.handle_auth_requests))
         } else { None };
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
@@ -2386,6 +2410,7 @@ impl ObscuraJsRuntime {
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let interception = interception.clone();
+                let response_config = response_config.clone();
                 let initiator = initiator.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
@@ -2412,6 +2437,8 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.offline = offline;
+                    request.cache_disabled = cache_disabled;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
                             request.mode = RequestMode::Cors;
@@ -2428,9 +2455,10 @@ impl ObscuraJsRuntime {
                     let mut changed_method = None;
                     let mut changed_body = None;
                     let mut changed_headers = None;
-                    if let Some((intercept_tx, page_id, patterns)) = interception {
+                    if let Some((intercept_tx, page_id, patterns, cdp_patterns)) = interception {
                         if matches!(parsed.scheme(), "http" | "https")
-                            && crate::ops::should_intercept_url(true, &patterns, &raw) {
+                            && crate::ops::should_intercept_url(true, &patterns, &raw)
+                            && crate::ops::matches_cdp_request_patterns(cdp_patterns.as_deref().map(Vec::as_slice), &raw, if is_font { "Font" } else { "Image" }) {
                             let allow_private = http_client.as_ref().is_some_and(|client| client.allow_private_network);
                             if crate::ops::validate_fetch_url(&parsed, allow_private).is_err() {
                                 return crate::ops::RenderResourceLoad { generation, url: raw, profile, is_font,
@@ -2440,7 +2468,7 @@ impl ObscuraJsRuntime {
                             let (resolver, resolution) = tokio::sync::oneshot::channel();
                             if intercept_tx.send(crate::ops::InterceptedRequest {
                                 request_id: id.clone(), page_id, url: raw.clone(), method: "GET".into(),
-                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), resolver,
+                                headers: Default::default(), resource_type: if is_font { "Font" } else { "Image" }.into(), network_id: None, auth_challenge: None, response: None, resolver,
                             }).is_ok() {
                                 request_id = Some(id);
                                 match resolution.await {
@@ -2476,8 +2504,18 @@ impl ObscuraJsRuntime {
                             }
                         }
                     }
+                    let response_hook = response_config.map(|(tx, page_id, patterns, handle_auth)| crate::ops::CdpResponseHook {
+                        tx, page_id, request_id: request_id.clone().unwrap_or_else(crate::ops::next_subresource_interception_id),
+                        resource_type: if is_font { "Font" } else { "Image" }.into(), request_headers: Default::default(),
+                        patterns, request_was_paused: request_id.is_some(), handle_auth,
+                        fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), max_body_bytes: request.max_response_bytes, sequence: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    });
                     #[cfg(feature = "stealth")]
-                    let response = match (stealth_client, http_client) {
+                    let response = if let Some(hook) = &response_hook { match (&stealth_client, &http_client) {
+                        (Some(client), _) => client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref(), hook).await.ok(),
+                        (None, Some(client)) => client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref(), hook).await.ok(),
+                        (None, None) => None,
+                    }} else { match (stealth_client, http_client) {
                         (Some(stealth_client), _) if request_id.is_some() => stealth_client
                             .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         (Some(stealth_client), _) => stealth_client
@@ -2499,9 +2537,11 @@ impl ObscuraJsRuntime {
                             .await
                             .ok(),
                         (None, None) => None,
-                    };
+                    }};
                     #[cfg(not(feature = "stealth"))]
-                    let response = match http_client {
+                    let response = if let Some(hook) = &response_hook {
+                        if let Some(client) = &http_client { client.fetch_resource_request_with_response_hook(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref(), hook).await.ok() } else { None }
+                    } else { match http_client {
                         Some(http_client) if request_id.is_some() => http_client
                             .fetch_resource_request(&target, request, changed_method.as_deref().unwrap_or("GET"), changed_body, changed_headers, callbacks.as_deref()).await.ok(),
                         Some(http_client) => http_client
@@ -2513,7 +2553,10 @@ impl ObscuraJsRuntime {
                             .await
                             .ok(),
                         None => None,
-                    };
+                    }};
+                    if let Some(hook) = &response_hook {
+                        if hook.fired.load(std::sync::atomic::Ordering::Relaxed) { request_id = Some(hook.request_id.clone()); }
+                    }
                     crate::ops::RenderResourceLoad {
                         generation,
                         url: raw,
@@ -23736,6 +23779,189 @@ mod tests {
         let user_agent = events.last().unwrap().request_headers.get("user-agent").unwrap().to_ascii_lowercase();
         assert!(wire.contains(&format!("user-agent: {user_agent}")));
     }
+
+    async fn assert_fetch_basic_auth_challenge(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_page_id("auth-fetch");
+        rt.set_handle_auth_requests(true);
+        let load = rt.call_function_on_for_cdp("async () => (await fetch('/auth')).text()", None, &[], true, true);
+        let serve = async {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let wire = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                if attempt == 0 {
+                    assert!(!wire.contains("authorization:"));
+                    socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"fetch\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(wire.contains("authorization: basic dxnlcjpwyxnz"));
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                }
+            }
+        };
+        let answer = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.resource_type, "Fetch");
+            assert_eq!(request.auth_challenge.unwrap().realm, "fetch");
+            request.resolver.send(crate::ops::InterceptResolution::Continue { url: None, method: None,
+                headers: Some([("Authorization".into(), "Basic dXNlcjpwYXNz".into())].into()), body: None }).unwrap();
+        };
+        let (result, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(load, serve, answer)
+        }).await.expect("fetch authentication completes");
+        assert_eq!(result.unwrap().value.unwrap(), "ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_basic_auth_challenge_retries() { assert_fetch_basic_auth_challenge(false).await; }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_basic_auth_challenge_retries() { assert_fetch_basic_auth_challenge(true).await; }
+
+    async fn assert_fetch_binary_network_response_body(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let load = rt.call_function_on_for_cdp("async () => Array.from(new Uint8Array(await (await fetch('/binary')).arrayBuffer()))", None, &[], true, true);
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\0\xff\x80*").await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, serve) })
+            .await.expect("binary fetch completes");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!([0, 255, 128, 42]));
+        let event = rt.take_js_network_events().pop().unwrap();
+        let body = rt.get_network_response_body(&event.request_id).unwrap();
+        assert!(body.base64_encoded);
+        assert_eq!(body.body, "AP+AKg==");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_binary_network_response_body_is_lossless() { assert_fetch_binary_network_response_body(false).await; }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_binary_network_response_body_is_lossless() { assert_fetch_binary_network_response_body(true).await; }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn offline_fetch_rejects_as_type_error_and_reports_network_failure() {
+        let mut rt = redirect_runtime_for_origin("http://127.0.0.1:9");
+        rt.set_network_overrides(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let result = rt.call_function_on_for_cdp("async () => fetch('/offline').then(() => 'ok', error => error.name)",
+            None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), "TypeError");
+        let event = rt.take_js_network_events().pop().unwrap();
+        assert_eq!(event.error_text.as_deref(), Some("net::ERR_INTERNET_DISCONNECTED"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_intercepted_fetch_rejects_as_type_error() {
+        let mut rt = redirect_runtime_for_origin("https://example.test");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let load = rt.call_function_on_for_cdp("async () => fetch('/abort').then(() => 'ok', error => error.name)",
+            None, &[], true, true);
+        let fail = async {
+            rx.recv().await.unwrap().resolver.send(crate::ops::InterceptResolution::Fail { reason: "Failed".into() }).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, fail) })
+            .await.expect("intercepted request completes");
+        assert_eq!(result.unwrap().value.unwrap(), "TypeError");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_stage_pauses_each_fetch_redirect() {
+        assert_response_stage_pauses_each_fetch_redirect(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_response_stage_pauses_each_fetch_redirect() {
+        assert_response_stage_pauses_each_fetch_redirect(true).await;
+    }
+
+    async fn assert_response_stage_pauses_each_fetch_redirect(stealth: bool) {
+        let mut rt = redirect_chain_runtime(2);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_page_id("response-fetch");
+        rt.set_cdp_response_patterns(Some(std::sync::Arc::new(vec![crate::ops::CdpRequestPattern {
+            url_pattern: "*".into(), resource_type: Some("XHR".into()),
+        }])));
+        let load = rt.call_function_on_for_cdp("async () => (await fetch('/hop/1')).text()", None, &[], true, true);
+        let answer = async {
+            let mut statuses = Vec::new();
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let request = rx.recv().await.unwrap();
+                statuses.push(request.response.as_ref().unwrap().status);
+                ids.push((request.request_id.clone(), request.network_id.clone()));
+                request.resolver.send(crate::ops::InterceptResolution::ContinueResponse { status: None, headers: None }).unwrap();
+            }
+            (statuses, ids)
+        };
+        let (result, (statuses, ids)) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, answer) })
+            .await.expect("redirect response pauses complete");
+        assert_eq!(statuses, vec![302, 200]);
+        assert_ne!(ids[0].0, ids[1].0);
+        assert_eq!(ids[0].1, ids[1].1);
+        assert_eq!(result.unwrap().value.unwrap(), "arrived");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failing_response_stage_rejects_fetch_as_type_error() {
+        let mut rt = redirect_chain_runtime(1);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_cdp_response_patterns(Some(std::sync::Arc::new(vec![crate::ops::CdpRequestPattern {
+            url_pattern: "*".into(), resource_type: None,
+        }])));
+        let load = rt.call_function_on_for_cdp("async () => fetch('/hop/0').then(() => 'ok', error => error.name)", None, &[], true, true);
+        let answer = async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.response.as_ref().unwrap().status, 200);
+            request.resolver.send(crate::ops::InterceptResolution::Fail { reason: "Failed".into() }).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, answer) })
+            .await.expect("failed response pause completes");
+        assert_eq!(result.unwrap().value.unwrap(), "TypeError");
+    }
+
 
     #[tokio::test(flavor = "current_thread")]
     async fn subscribed_fetch_network_event_retains_explicit_request_headers() {

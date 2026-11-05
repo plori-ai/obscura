@@ -8904,6 +8904,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     cleanup();
+    if (parsed.interceptFailed) throw new TypeError('Failed to fetch');
     const err = new TypeError('net::ERR_FAILED');
     err.name = 'AbortError';
     err.__aborted = true;

@@ -13,7 +13,7 @@ use tokio::sync::{RwLock, watch};
 use url::Url;
 
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
-use crate::interceptor::{InterceptAction, RequestInterceptor};
+use crate::interceptor::{InterceptAction, RequestInterceptor, ResponseInterceptor};
 
 fn configured_root_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
@@ -202,6 +202,9 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    /// Page-scoped CDP network emulation flags, captured when the request starts.
+    pub offline: bool,
+    pub cache_disabled: bool,
 }
 
 impl ResourceRequest {
@@ -213,6 +216,8 @@ impl ResourceRequest {
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
+            offline: false,
+            cache_disabled: false,
         }
     }
 
@@ -249,6 +254,8 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            offline: false,
+            cache_disabled: false,
         }
     }
 
@@ -270,6 +277,8 @@ impl ResourceRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024),
+            offline: false,
+            cache_disabled: false,
         }
     }
 
@@ -1234,7 +1243,7 @@ impl ObscuraHttpClient {
         body: &Option<Vec<u8>>,
         request: &ResourceRequest,
     ) -> Option<ResourceCacheKey> {
-        if *method != Method::GET
+        if request.cache_disabled || *method != Method::GET
             || body.is_some()
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
@@ -1432,7 +1441,7 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None).await
+        self.fetch_request_uncached::<false>(initial_method, url, initial_body, callbacks, request, None, None).await
     }
 
     /// A navigation continued by an interceptor uses request-local overrides.
@@ -1442,7 +1451,7 @@ impl ObscuraHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
-        self.fetch_request_uncached(method, url, body, callbacks, ResourceRequest::navigation(), headers).await
+        self.fetch_request_uncached::<false>(method, url, body, callbacks, ResourceRequest::navigation(), headers, None).await
     }
 
     /// Continue a subresource with request-local interception overrides.
@@ -1452,14 +1461,26 @@ impl ObscuraHttpClient {
     ) -> Result<Response, ObscuraNetError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
-        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
+        self.fetch_request_uncached::<false>(method, url, body, callbacks, request, headers, None).await
     }
 
-    async fn fetch_request_uncached(
+    pub async fn fetch_resource_request_with_response_hook(
+        &self, url: &Url, request: ResourceRequest, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>, hook: &dyn ResponseInterceptor,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes()).map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached::<true>(method, url, body, callbacks, request, headers, Some(hook)).await
+    }
+
+    async fn fetch_request_uncached<const RESPONSE_HOOK: bool>(
         &self, initial_method: Method, url: &Url, initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
         mut request_headers: Option<HashMap<String, String>>,
+        response_hook: Option<&dyn ResponseInterceptor>,
     ) -> Result<Response, ObscuraNetError> {
+        if request.offline && matches!(url.scheme(), "http" | "https") {
+            return Err(ObscuraNetError::Network("net::ERR_INTERNET_DISCONNECTED".into()));
+        }
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
 
@@ -1486,16 +1507,13 @@ impl ObscuraHttpClient {
 
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
-        // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
-        // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
-        // (the initial one plus 20 hops), so the 20th redirect is still followed
-        // and only the 21st fails. The old `0..max_redirects` made 20 requests
-        // total and thus followed only 19 (WPT redirect-count: 20 must pass).
+        // Follow up to 20 redirects. Authentication retries do not consume a hop.
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut attempted_auth = false;
 
-        for _redirect_count in 0..=max_redirects {
+        while redirects.len() <= max_redirects {
             validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
                 url: current_url.clone(),
@@ -1645,6 +1663,10 @@ impl ObscuraHttpClient {
             }
 
             drop(extra_headers);
+            if request.cache_disabled {
+                headers.insert(reqwest::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                headers.insert(reqwest::header::PRAGMA, HeaderValue::from_static("no-cache"));
+            }
             let default_form_type = method == Method::POST && !headers.contains_key(reqwest::header::CONTENT_TYPE);
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
@@ -1664,7 +1686,7 @@ impl ObscuraHttpClient {
                 ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
 
-            let status = resp.status();
+            let mut status = resp.status();
             validate_reqwest_cors_response(
                 &request,
                 &current_url,
@@ -1689,12 +1711,55 @@ impl ObscuraHttpClient {
                 );
             }
 
+            if RESPONSE_HOOK && status.as_u16() == 401 && !attempted_auth && request.sends_credentials_to(&current_url) {
+                if let (Some(hook), Some(challenge)) = (response_hook, response_headers.get("www-authenticate")) {
+                    let existing = match &request_headers {
+                        Some(headers) => headers.clone(),
+                        None => self.extra_headers.read().await.clone(),
+                    };
+                    if let Some(authorization) = hook.authenticate(&current_url, method.as_str(), &existing, challenge).await {
+                        attempted_auth = true;
+                        let mut headers = existing;
+                        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                        headers.insert("Authorization".into(), authorization);
+                        request_headers = Some(headers);
+                        continue;
+                    }
+                }
+            }
+
+            let mut response = Some(resp);
+            let mut intercepted_body = None;
+            if RESPONSE_HOOK {
+                let hook = response_hook.ok_or_else(|| ObscuraNetError::Network("response hook unavailable".into()))?;
+                let original = response.take().ok_or_else(|| ObscuraNetError::Network("response unavailable".into()))?;
+                let body_url = current_url.clone();
+                let max_bytes = request.max_response_bytes;
+                let body = Box::pin(async move {
+                    read_reqwest_body_limited(original, &body_url, max_bytes).await.map_err(|error| error.to_string())
+                });
+                let original_cookies = response_headers.get("set-cookie").cloned();
+                let intercepted = hook.intercept_response(&current_url, method.as_str(), status.as_u16(), response_headers, body).await
+                    .map_err(ObscuraNetError::Network)?;
+                status = reqwest::StatusCode::from_u16(intercepted.status)
+                    .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+                response_headers = intercepted.headers;
+                if request.sends_credentials_to(&current_url) {
+                    crate::interceptor::apply_overridden_response_cookies(
+                        &self.cookie_jar, &current_url, original_cookies.as_deref(), &response_headers);
+                }
+                intercepted_body = Some(intercepted.body);
+            }
+
             if status.is_redirection() {
-                if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
-                    let location_str = location.to_str().map_err(|_| {
-                        ObscuraNetError::Network("Invalid redirect Location header".into())
-                    })?;
-                    let next_url = current_url.join(location_str).map_err(|e| {
+                let location = match &response {
+                    Some(response) => response.headers().get(reqwest::header::LOCATION)
+                        .map(|value| value.to_str().map(str::to_string)
+                            .map_err(|_| ObscuraNetError::Network("Invalid redirect Location header".into()))).transpose()?,
+                    None => response_headers.get("location").cloned(),
+                };
+                if let Some(location_str) = location {
+                    let next_url = current_url.join(&location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
@@ -1722,12 +1787,12 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
-                resp,
-                &current_url,
-                request.max_response_bytes,
-            )
-            .await?;
+            let body_bytes = if let Some(body) = intercepted_body {
+                body.await.map_err(ObscuraNetError::Network)?
+            } else {
+                read_reqwest_body_limited(response.ok_or_else(|| ObscuraNetError::Network("response unavailable".into()))?,
+                    &current_url, request.max_response_bytes).await?
+            };
             drop(in_flight);
 
             let response = Response {
@@ -2751,6 +2816,26 @@ mod ssrf_tests {
         assert_eq!(network_requests.load(Ordering::SeqCst), 1);
         assert_eq!(callback_requests.load(Ordering::SeqCst), 32);
         assert_eq!(callback_responses.load(Ordering::SeqCst), 32);
+    }
+
+    #[tokio::test]
+    async fn request_network_overrides_bypass_cache_and_block_transport() {
+        let (url, requests) = cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let mut request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap();
+        client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        request.cache_disabled = true;
+        client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        request.offline = true;
+        let error = client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap_err();
+        assert!(error.to_string().contains("ERR_INTERNET_DISCONNECTED"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        request.cache_disabled = false;
+        assert_eq!(client.fetch_resource_with_callbacks(&url, request, None).await.unwrap().status, 200);
     }
 
     #[tokio::test]

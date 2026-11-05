@@ -864,8 +864,10 @@ pub(crate) fn schedule_screencast_frame(
 /// Whether a request reported after navigation may be paused for the client.
 /// Chrome only pauses requests that match the `Fetch.enable` URL patterns;
 /// omitted patterns mean every request.
-fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
+fn fetch_pause_matches(ctx: &CdpContext, url: &str, resource_type: &str) -> bool {
     ctx.fetch_intercept.enabled
+        && obscura_js::ops::matches_cdp_request_patterns(
+            ctx.fetch_intercept.cdp_request_patterns.as_deref().map(Vec::as_slice), url, cdp_resource_type(resource_type))
         && (ctx.fetch_intercept.patterns.is_empty()
             || ctx
                 .fetch_intercept
@@ -937,7 +939,7 @@ pub fn emit_navigation_events(
             session_id: es.clone(),
         });
         }
-        if !net_event.intercepted && fetch_pause_matches(ctx, &net_event.url) {
+        if !net_event.intercepted && fetch_pause_matches(ctx, &net_event.url, &net_event.resource_type) {
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
@@ -990,7 +992,7 @@ pub fn emit_navigation_events(
         for (i, net_event) in network_events.iter().enumerate() {
             if Some(i) == nav_idx
                 || net_event.intercepted
-                || !fetch_pause_matches(ctx, &net_event.url)
+                || !fetch_pause_matches(ctx, &net_event.url, &net_event.resource_type)
             {
                 continue;
             }

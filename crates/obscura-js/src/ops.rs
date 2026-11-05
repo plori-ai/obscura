@@ -61,21 +61,160 @@ pub enum InterceptResolution {
     Fail {
         reason: String,
     },
+    ContinueResponse {
+        status: Option<u16>,
+        headers: Option<HashMap<String, String>>,
+    },
+    FulfillResponse {
+        status: u16,
+        headers: HashMap<String, String>,
+        body: Option<Vec<u8>>,
+    },
 }
 
 pub struct InterceptedRequest {
     pub request_id: String,
+    pub network_id: Option<String>,
     pub page_id: String,
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
     pub resource_type: String,
+    pub auth_challenge: Option<AuthenticationChallenge>,
+    pub response: Option<InterceptedResponse>,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
+}
+
+pub struct InterceptedResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: Arc<obscura_net::interceptor::HeldResponseBody>,
+    pub emit_request_event: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthenticationChallenge {
+    pub source: String,
+    pub origin: String,
+    pub scheme: String,
+    pub realm: String,
+}
+
+#[derive(Clone)]
+struct BasicAuthHandler {
+    tx: tokio::sync::mpsc::UnboundedSender<InterceptedRequest>,
+    page_id: String,
+    request_id: String,
+    resource_type: String,
+}
+
+impl BasicAuthHandler {
+    async fn credentials(&self, url: &str, method: &str, headers: &HashMap<String, String>, challenge: &str) -> Option<String> {
+        let (scheme, parameters) = challenge.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("basic") { return None; }
+        let realm = parameters.split(',').filter_map(|part| part.trim().split_once('='))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("realm"))
+            .map(|(_, value)| value.trim().trim_matches('"').to_string()).unwrap_or_default();
+        let origin = url::Url::parse(url).ok()?.origin().ascii_serialization();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        self.tx.send(InterceptedRequest { request_id: self.request_id.clone(), page_id: self.page_id.clone(),
+            url: url.to_string(), method: method.to_string(), headers: headers.clone(), resource_type: self.resource_type.clone(),
+            network_id: None, auth_challenge: Some(AuthenticationChallenge { source: "Server".into(), origin, scheme: "basic".into(), realm }), response: None, resolver }).ok()?;
+        let InterceptResolution::Continue { headers: Some(headers), .. } = resolution.await.ok()? else { return None; };
+        headers.into_iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, value)| value)
+    }
 }
 
 pub fn next_subresource_interception_id() -> String {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     format!("subresource-{}", NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A CDP Fetch request pattern. A missing resource type matches every type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdpRequestPattern {
+    pub url_pattern: String,
+    pub resource_type: Option<String>,
+}
+
+pub fn matches_cdp_request_patterns(patterns: Option<&[CdpRequestPattern]>, url: &str, resource_type: &str) -> bool {
+    let Some(patterns) = patterns else { return true; };
+    patterns.iter().any(|pattern| {
+        pattern.resource_type.as_deref().is_none_or(|kind| kind == resource_type
+            || (resource_type == "XHR" && kind == "Fetch"))
+            && url_matches_cdp_pattern(&pattern.url_pattern, url)
+    })
+}
+
+#[derive(Clone)]
+pub struct CdpResponseHook {
+    pub tx: tokio::sync::mpsc::UnboundedSender<InterceptedRequest>,
+    pub page_id: String,
+    pub request_id: String,
+    pub resource_type: String,
+    pub request_headers: HashMap<String, String>,
+    pub patterns: Arc<Vec<CdpRequestPattern>>,
+    pub request_was_paused: bool,
+    pub handle_auth: bool,
+    pub fired: Arc<std::sync::atomic::AtomicBool>,
+    pub max_body_bytes: usize,
+    pub sequence: Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl obscura_net::interceptor::ResponseInterceptor for CdpResponseHook {
+    async fn authenticate(&self, url: &url::Url, method: &str,
+        headers: &HashMap<String, String>, challenge: &str) -> Option<String> {
+        let kind = if self.resource_type == "Fetch" { "XHR" } else { self.resource_type.as_str() };
+        if !self.handle_auth || matches_cdp_request_patterns(Some(&self.patterns), url.as_str(), kind) {
+            return None;
+        }
+        BasicAuthHandler { tx: self.tx.clone(), page_id: self.page_id.clone(),
+            request_id: self.request_id.clone(), resource_type: self.resource_type.clone() }
+            .credentials(url.as_str(), method, headers, challenge).await
+    }
+
+    async fn intercept_response(&self, url: &url::Url, method: &str, status: u16,
+        headers: HashMap<String, String>, body: obscura_net::interceptor::ResponseBodyFuture,
+    ) -> Result<obscura_net::interceptor::ResponseInterception, String> {
+        use obscura_net::interceptor::{HeldResponseBody, ResponseInterception};
+        let resource_type = if self.resource_type == "Fetch" { "XHR" } else { self.resource_type.as_str() };
+        if !matches_cdp_request_patterns(Some(&self.patterns), url.as_str(), resource_type) {
+            return Ok(ResponseInterception { status, headers, body });
+        }
+        let body = Arc::new(HeldResponseBody::new(body));
+        self.fired.store(true, std::sync::atomic::Ordering::Relaxed);
+        let sequence = self.sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pause_id = if sequence == 0 { self.request_id.clone() } else { format!("{}-response-{}", self.request_id, sequence) };
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let request = InterceptedRequest {
+            request_id: pause_id, network_id: Some(self.request_id.clone()), page_id: self.page_id.clone(), url: url.to_string(), method: method.to_string(),
+            headers: self.request_headers.clone(), resource_type: self.resource_type.clone(), auth_challenge: None,
+            response: Some(InterceptedResponse { status, headers: headers.clone(), body: body.clone(), emit_request_event: !self.request_was_paused || sequence > 0 }), resolver,
+        };
+        self.tx.send(request).map_err(|_| "response interception channel closed".to_string())?;
+        let resolution = resolution.await.map_err(|_| "response interception cancelled".to_string())?;
+        let (status, headers, replacement) = match resolution {
+            InterceptResolution::ContinueResponse { status: changed, headers: changed_headers } =>
+                (changed.unwrap_or(status), changed_headers.map(obscura_net::client::normalize_intercepted_headers).unwrap_or(headers), None),
+            InterceptResolution::Continue { .. } => (status, headers, None),
+            InterceptResolution::FulfillResponse { status, headers, body } =>
+                (status, obscura_net::client::normalize_intercepted_headers(headers), body),
+            InterceptResolution::Fail { reason } => return Err(reason),
+            InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
+                let bytes = if body_base64.is_empty() { body.into_bytes() } else { BASE64.decode(body_base64).map_err(|e| e.to_string())? };
+                (status, headers, Some(bytes))
+            }
+        };
+        if replacement.as_ref().is_some_and(|bytes| bytes.len() > self.max_body_bytes) {
+            return Err("fulfilled response exceeds the body limit".into());
+        }
+        let body: obscura_net::interceptor::ResponseBodyFuture = match replacement {
+            Some(bytes) => Box::pin(async move { Ok(bytes) }),
+            None => Box::pin(async move { body.bytes().await.map(|bytes| bytes.as_ref().clone()) }),
+        };
+        Ok(ResponseInterception { status, headers, body })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -402,11 +541,16 @@ pub struct ObscuraState {
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_enabled: bool,
+    pub handle_auth_requests: bool,
+    pub network_offline: Arc<std::sync::atomic::AtomicBool>,
+    pub network_cache_disabled: Arc<std::sync::atomic::AtomicBool>,
     pub network_reporting_enabled: bool,
     pub extra_http_headers: HashMap<String, String>,
     /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
     /// sent to the interception channel; empty means every request.
     pub intercept_url_patterns: Vec<String>,
+    pub cdp_request_patterns: Option<std::sync::Arc<Vec<CdpRequestPattern>>>,
+    pub cdp_response_patterns: Option<std::sync::Arc<Vec<CdpRequestPattern>>>,
     pub intercept_page_id: String,
     /// Blob URL bytes and MIME types, shared by the page's realms.
     pub blob_urls: HashMap<String, (String, Vec<u8>)>,
@@ -690,9 +834,14 @@ impl ObscuraState {
             intercept_tx: None,
             blob_urls: HashMap::new(),
             intercept_enabled: false,
+            handle_auth_requests: false,
+            network_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            network_cache_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             network_reporting_enabled: false,
             extra_http_headers: HashMap::new(),
             intercept_url_patterns: Vec::new(),
+            cdp_request_patterns: None,
+            cdp_response_patterns: None,
             intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
@@ -932,6 +1081,20 @@ fn record_js_network_completion(
     });
 }
 
+fn record_js_network_completion_bytes(state: &RefCell<OpState>, event: JsNetworkEvent, body: &[u8]) {
+    let content_type = event.response_headers.get("content-type").map(|value| value.split(';').next().unwrap_or("").trim().to_ascii_lowercase());
+    let text_type = content_type.as_deref().is_some_and(|mime| mime.starts_with("text/")
+        || mime.contains("json") || mime.contains("javascript") || mime.contains("xml") || mime.contains("svg"));
+    let encoded = (content_type.is_some() && !text_type) || std::str::from_utf8(body).is_err();
+    let state_borrow = state.borrow();
+    let gs = state_borrow.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    record_network_completion(&mut gs, event, || StoredNetworkResponseBody {
+        body: if encoded { BASE64.encode(body) } else { String::from_utf8_lossy(body).into_owned() },
+        base64_encoded: encoded,
+    });
+}
+
 pub(crate) fn record_network_completion(
     gs: &mut ObscuraState,
     event: JsNetworkEvent,
@@ -1047,6 +1210,19 @@ pub(crate) struct FetchNetworkGuard {
     pub(crate) state: std::rc::Weak<RefCell<ObscuraState>>,
     pub(crate) event: Option<JsNetworkEvent>,
     pub(crate) cancel: Option<Rc<CancelHandle>>,
+}
+
+impl FetchNetworkGuard {
+    fn fail_with(&mut self, error: &str) {
+        let Some(mut event) = self.event.take() else { return; };
+        event.status = 0;
+        event.error_text = Some(error.to_string());
+        event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs_f64();
+        if let Some(state) = self.state.upgrade() {
+            if let Ok(mut state) = state.try_borrow_mut() { push_js_network_event(&mut state, event); }
+        }
+    }
 }
 
 impl Drop for FetchNetworkGuard {
@@ -3955,6 +4131,23 @@ fn intercept_fulfill_response(
     })
 }
 
+enum FetchHopResponse {
+    Raw(reqwest::Response),
+    Intercepted(obscura_net::interceptor::ResponseInterception),
+}
+
+impl FetchHopResponse {
+    fn status(&self) -> u16 {
+        match self { Self::Raw(response) => response.status().as_u16(), Self::Intercepted(response) => response.status }
+    }
+    fn header(&self, name: &str) -> Option<&str> {
+        match self {
+            Self::Raw(response) => response.headers().get(name)?.to_str().ok(),
+            Self::Intercepted(response) => response.headers.get(name).map(String::as_str),
+        }
+    }
+}
+
 #[op2]
 #[string]
 async fn op_fetch_url(
@@ -4016,7 +4209,7 @@ async fn fetch_url_inner(
     );
 
     let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client,
-        network_reporting_enabled, extra_http_headers, reported_stealth_ua) = {
+        network_reporting_enabled, extra_http_headers, reported_stealth_ua, auth_handler, network_offline, network_cache_disabled, response_context) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -4055,7 +4248,15 @@ async fn fetch_url_inner(
         // The CDP resolver map spans pages and navigations on a connection.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
+        let auth_handler = if gs.handle_auth_requests {
+            gs.intercept_tx.clone().map(|tx| BasicAuthHandler { tx, page_id: gs.intercept_page_id.clone(),
+                request_id: request_id.clone(), resource_type: resource_type_name.to_string() })
+        } else { None };
+        let response_context = gs.cdp_response_patterns.as_ref().and_then(|patterns| gs.intercept_tx.as_ref()
+            .map(|tx| (tx.clone(), gs.intercept_page_id.clone(), patterns.clone())));
+        let fetch_type = if resource_type_name == "Fetch" { "XHR" } else { resource_type_name };
+        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url)
+            && matches_cdp_request_patterns(gs.cdp_request_patterns.as_deref().map(Vec::as_slice), &url, fetch_type) {
             gs.intercept_tx.clone()
         } else {
             None
@@ -4079,6 +4280,10 @@ async fn fetch_url_inner(
             gs.network_reporting_enabled,
             if gs.extra_http_headers.is_empty() { None } else { Some(gs.extra_http_headers.clone()) },
             reported_stealth_ua,
+            auth_handler,
+            gs.network_offline.load(std::sync::atomic::Ordering::Relaxed),
+            gs.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed),
+            response_context,
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -4138,6 +4343,7 @@ async fn fetch_url_inner(
             method: method.clone(),
             headers: custom_headers.clone(),
             resource_type: resource_type_name.to_string(),
+            network_id: None, auth_challenge: None, response: None,
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
@@ -4188,6 +4394,7 @@ async fn fetch_url_inner(
                         "url": url,
                         "headers": {},
                         "blocked": true,
+                        "interceptFailed": true,
                         "error": reason,
                     })
                     .to_string());
@@ -4209,6 +4416,9 @@ async fn fetch_url_inner(
                         override_headers.is_some(),
                         override_body.is_some()
                     );
+                }
+                Ok(InterceptResolution::ContinueResponse { .. } | InterceptResolution::FulfillResponse { .. }) => {
+                    return Err(deno_error::JsErrorBox::generic("invalid request-stage interception resolution"));
                 }
                 Err(_) => {}
             }
@@ -4253,6 +4463,11 @@ async fn fetch_url_inner(
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
 
+    if network_offline && url::Url::parse(&url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) {
+        network_guard.fail_with("net::ERR_INTERNET_DISCONNECTED");
+        return Err(deno_error::JsErrorBox::type_error("Failed to fetch"));
+    }
+
     let client = match &http_client {
         Some(client) => client.request_client().await,
         None => {
@@ -4271,8 +4486,22 @@ async fn fetch_url_inner(
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
     let replace_extra_headers = override_headers.is_some();
-    let custom_headers: std::collections::HashMap<String, String> =
+    let mut custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    if network_cache_disabled {
+        custom_headers.retain(|name, _| !name.eq_ignore_ascii_case("cache-control") && !name.eq_ignore_ascii_case("pragma"));
+        custom_headers.insert("cache-control".into(), "no-cache".into());
+        custom_headers.insert("pragma".into(), "no-cache".into());
+    }
+    let response_hook = response_context.map(|(tx, page_id, patterns)| CdpResponseHook {
+        tx, page_id, request_id: request_id.clone(), resource_type: resource_type_name.to_string(),
+        request_headers: custom_headers.clone(), patterns,
+        request_was_paused: network_guard.event.as_ref().is_some_and(|event| event.intercepted),
+        handle_auth: false,
+        fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        max_body_bytes: fetch_max_body_bytes(),
+        sequence: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    });
     if network_reporting_enabled {
         if let Some(event) = &mut network_guard.event {
             event.request_headers = extra_http_headers.iter().filter(|_| !replace_extra_headers)
@@ -4420,6 +4649,8 @@ async fn fetch_url_inner(
                 network_guard,
                 resource_type,
                 replace_extra_headers,
+                auth_handler,
+                response_hook,
             )
             .await;
         }
@@ -4447,6 +4678,7 @@ async fn fetch_url_inner(
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
+    let mut attempted_auth = false;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
     let response = loop {
         let mut req = client
@@ -4522,7 +4754,48 @@ async fn fetch_url_inner(
             }
         }
 
-        if !resp.status().is_redirection() {
+        let response_paused = response_hook.as_ref().is_some_and(|hook|
+            matches_cdp_request_patterns(Some(&hook.patterns), &current_url, if resource_type_name == "Fetch" { "XHR" } else { resource_type_name }));
+        if resp.status().as_u16() == 401 && credentials_allowed && !attempted_auth && !response_paused {
+            if let (Some(handler), Some(challenge)) = (&auth_handler,
+                resp.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok())) {
+                attempted_auth = true;
+                if let Some(authorization) = handler.credentials(&current_url, current_method.as_str(), &current_headers, challenge).await {
+                    current_headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                    current_headers.insert("Authorization".into(), authorization);
+                    continue;
+                }
+            }
+        }
+        let resp = if let Some(hook) = &response_hook {
+            use obscura_net::interceptor::ResponseInterceptor as _;
+            let status = resp.status().as_u16();
+            let mut headers = HashMap::new();
+            for (name, value) in resp.headers().iter() {
+                obscura_net::client::merge_response_header(&mut headers, name.to_string(), value.to_str().unwrap_or("").to_string());
+            }
+            let body = Box::pin(async move { read_body_capped(resp, fetch_max_body_bytes()).await.map_err(|error| error.to_string()) });
+            let current = url::Url::parse(&current_url).map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+            let original_cookies = headers.get("set-cookie").cloned();
+            let response = match hook.intercept_response(&current, current_method.as_str(), status, headers, body).await {
+                Ok(response) => response,
+                Err(_) => {
+                    if hook.fired.load(std::sync::atomic::Ordering::Relaxed) { network_guard.event = None; }
+                    return Err(deno_error::JsErrorBox::type_error("Failed to fetch"));
+                }
+            };
+            if credentials_allowed {
+                if let Some(jar) = &cookie_jar {
+                    obscura_net::interceptor::apply_overridden_response_cookies(
+                        jar, &current, original_cookies.as_deref(), &response.headers);
+                }
+            }
+            if hook.fired.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(event) = &mut network_guard.event { event.intercepted = true; }
+            }
+            FetchHopResponse::Intercepted(response)
+        } else { FetchHopResponse::Raw(resp) };
+        if !(300..400).contains(&resp.status()) {
             break resp;
         }
 
@@ -4530,16 +4803,8 @@ async fn fetch_url_inner(
         // not only the final one. A cross-origin redirect response must be
         // authorized before it is followed (#973).
         if mode == "cors" && current_is_cross_origin {
-            let allowed = resp
-                .headers()
-                .get("access-control-allow-origin")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let allow_credentials = resp
-                .headers()
-                .get("access-control-allow-credentials")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+            let allowed = resp.header("access-control-allow-origin").unwrap_or("");
+            let allow_credentials = resp.header("access-control-allow-credentials").unwrap_or("");
             if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
                 return Ok(serde_json::json!({
                     "status": 0, "body": "", "url": current_url, "headers": {},
@@ -4553,11 +4818,7 @@ async fn fetch_url_inner(
             }
         }
 
-        let location_header = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let location_header = resp.header("location").map(str::to_string);
         let Some(location) = location_header else {
             // 3xx without a Location header is not actually a redirect.
             break resp;
@@ -4600,7 +4861,7 @@ async fn fetch_url_inner(
 
         // Browser semantics: 301/302/303 downgrade to GET with no body.
         // 307/308 preserve method and body.
-        let status_code = resp.status().as_u16();
+        let status_code = resp.status();
         let downgraded_to_get = status_code == 301 || status_code == 302 || status_code == 303;
         if downgraded_to_get {
             current_method = reqwest::Method::GET;
@@ -4614,16 +4875,21 @@ async fn fetch_url_inner(
 
         redirected_from.push(base);
         current_url = next_url.to_string();
+        attempted_auth = false;
     };
 
     let redirected = redirects_followed > 0;
-    let status = response.status().as_u16();
-
-    let mut resp_headers = std::collections::HashMap::new();
-    for (name, value) in response.headers().iter() {
-        obscura_net::client::merge_response_header(&mut resp_headers, name.to_string(),
-            value.to_str().unwrap_or("").to_string());
-    }
+    let (status, resp_headers, response, response_body) = match response {
+        FetchHopResponse::Raw(response) => {
+            let status = response.status().as_u16();
+            let mut headers = HashMap::new();
+            for (name, value) in response.headers().iter() {
+                obscura_net::client::merge_response_header(&mut headers, name.to_string(), value.to_str().unwrap_or("").to_string());
+            }
+            (status, headers, Some(response), None)
+        }
+        FetchHopResponse::Intercepted(response) => (response.status, response.headers, None, Some(response.body)),
+    };
 
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
@@ -4678,7 +4944,11 @@ async fn fetch_url_inner(
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
-        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let resp_bytes = if let Some(body) = response_body {
+            body.await.map_err(deno_error::JsErrorBox::generic)?
+        } else {
+            read_body_capped(response.ok_or_else(|| deno_error::JsErrorBox::generic("response unavailable"))?, fetch_max_body_bytes()).await?
+        };
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -4698,7 +4968,7 @@ async fn fetch_url_inner(
                 event.response_headers = resp_headers; event.body_size = resp_bytes.len();
                 event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64();
-                record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+                record_js_network_completion_bytes(&state, event, &resp_bytes);
             }
         }
         network_guard.event = None;
@@ -4748,9 +5018,11 @@ async fn stealth_fetch_all(
     allow_private_network: bool,
     internal_load: bool,
     cancel: Option<Rc<CancelHandle>>,
-    network_guard: FetchNetworkGuard,
+    mut network_guard: FetchNetworkGuard,
     resource_type: ResourceType,
     replace_extra_headers: bool,
+    auth_handler: Option<BasicAuthHandler>,
+    response_hook: Option<CdpResponseHook>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -4763,6 +5035,7 @@ async fn stealth_fetch_all(
     let mut crossed_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
+    let mut attempted_auth = false;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
 
     let response = loop {
@@ -4811,6 +5084,40 @@ async fn stealth_fetch_all(
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
+        let response_paused = response_hook.as_ref().is_some_and(|hook|
+            matches_cdp_request_patterns(Some(&hook.patterns), &current_url, if hook.resource_type == "Fetch" { "XHR" } else { &hook.resource_type }));
+        if r.status == 401 && credentials_allowed && !attempted_auth && !response_paused {
+            if let (Some(handler), Some(challenge)) = (&auth_handler, r.headers.get("www-authenticate")) {
+                attempted_auth = true;
+                if let Some(authorization) = handler.credentials(&current_url, &current_method, &current_headers, challenge).await {
+                    current_headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                    current_headers.insert("Authorization".into(), authorization);
+                    continue;
+                }
+            }
+        }
+        let r = if let Some(hook) = &response_hook {
+            use obscura_net::interceptor::ResponseInterceptor as _;
+            let original_body = r.body;
+            let body = Box::pin(async move { original_body.await.map_err(|error| error.to_string()) });
+            let original_cookies = r.headers.get("set-cookie").cloned();
+            let intercepted = match hook.intercept_response(&parsed_current, &current_method, r.status, r.headers, body).await {
+                Ok(response) => response,
+                Err(_) => {
+                    if hook.fired.load(std::sync::atomic::Ordering::Relaxed) { network_guard.event = None; }
+                    return Err(deno_error::JsErrorBox::type_error("Failed to fetch"));
+                }
+            };
+            if credentials_allowed {
+                obscura_net::interceptor::apply_overridden_response_cookies(
+                    &stealth.cookie_jar, &parsed_current, original_cookies.as_deref(), &intercepted.headers);
+            }
+            if hook.fired.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(event) = &mut network_guard.event { event.intercepted = true; }
+            }
+            obscura_net::wreq_client::StealthResponseHeaders { status: intercepted.status, headers: intercepted.headers,
+                body: Box::pin(async move { intercepted.body.await.map_err(obscura_net::ObscuraNetError::Network) }) }
+        } else { r };
         if !(300..400).contains(&r.status) {
             break r;
         }
@@ -4876,10 +5183,11 @@ async fn stealth_fetch_all(
         sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
+        attempted_auth = false;
     };
 
     let status = response.status;
-    let resp_headers = response.headers;
+    let resp_headers = response.headers.clone();
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
@@ -4955,7 +5263,7 @@ async fn stealth_fetch_all(
             event.body_size = resp_bytes.len();
             event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs_f64();
-            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+            record_js_network_completion_bytes(&state, event, &resp_bytes);
         } else { network_guard.event = None; }
         Ok(resp_bytes)
     });
@@ -5230,6 +5538,24 @@ mod tests {
             assert_eq!(super::url_matches_cdp_pattern(pattern, url), expected,
                 "pattern {pattern:?}, URL {url:?}");
         }
+    }
+
+    #[test]
+    fn cdp_request_patterns_match_url_and_resource_type_together() {
+        use super::{CdpRequestPattern, matches_cdp_request_patterns};
+        let patterns = [
+            CdpRequestPattern { url_pattern: "*/asset-?".into(), resource_type: Some("Image".into()) },
+            CdpRequestPattern { url_pattern: r"*/literal\*".into(), resource_type: Some("Script".into()) },
+        ];
+        assert!(matches_cdp_request_patterns(Some(&patterns), "https://x/asset-a", "Image"));
+        assert!(!matches_cdp_request_patterns(Some(&patterns), "https://x/asset-a", "Script"));
+        assert!(!matches_cdp_request_patterns(Some(&patterns), "https://x/asset-aa", "Image"));
+        assert!(matches_cdp_request_patterns(Some(&patterns), "https://x/literal*", "Script"));
+        assert!(!matches_cdp_request_patterns(Some(&patterns), "https://x/literalx", "Script"));
+        assert!(matches_cdp_request_patterns(None, "https://x/anything", "Document"));
+        assert!(!matches_cdp_request_patterns(Some(&[]), "https://x/anything", "Document"));
+        let fetch = [CdpRequestPattern { url_pattern: "*".into(), resource_type: Some("Fetch".into()) }];
+        assert!(matches_cdp_request_patterns(Some(&fetch), "https://x/data", "XHR"));
     }
 
     // #967 — a redirect must not forward the caller's credentials to a
@@ -8813,6 +9139,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         page_in_flight,
         blocked,
         interception,
+        response_config,
     ) = {
         let gs = shared.borrow();
         let Some(dom) = gs.dom.as_ref() else {
@@ -8837,6 +9164,8 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.offline = gs.network_offline.load(std::sync::atomic::Ordering::Relaxed);
+        request.cache_disabled = gs.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;
@@ -8851,8 +9180,13 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         let blocked = gs.blocked_urls.iter().any(|pattern| {
             pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
         });
-        let interception = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &selected_url) {
+        let interception = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &selected_url)
+            && matches_cdp_request_patterns(gs.cdp_request_patterns.as_deref().map(Vec::as_slice), &selected_url, "Image") {
             gs.intercept_tx.clone().map(|tx| (tx, gs.intercept_page_id.clone()))
+        } else { None };
+        let response_config = if gs.cdp_response_patterns.is_some() || gs.handle_auth_requests {
+            gs.intercept_tx.as_ref().map(|tx| (tx.clone(), gs.intercept_page_id.clone(),
+                gs.cdp_response_patterns.clone().unwrap_or_else(|| Arc::new(Vec::new())), gs.handle_auth_requests))
         } else { None };
         (
             gs.document_generation,
@@ -8864,6 +9198,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             Arc::clone(&gs.page_in_flight),
             blocked,
             interception,
+            response_config,
         )
     };
 
@@ -8931,7 +9266,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 let (resolver, resolution) = tokio::sync::oneshot::channel();
                 if tx.send(InterceptedRequest { request_id: request_id.clone(), page_id,
                     url: selected_url.clone(), method: "GET".into(), headers: HashMap::new(),
-                    resource_type: "Image".into(), resolver }).is_ok() {
+                    resource_type: "Image".into(), network_id: None, auth_challenge: None, response: None, resolver }).is_ok() {
                     intercepted_id = Some(request_id);
                     match resolution.await {
                         Ok(InterceptResolution::Continue { url, method, headers, body }) => {
@@ -8959,13 +9294,28 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                             return Some(response);
                         }
                         Ok(InterceptResolution::Fail { .. }) => return None,
+                        Ok(InterceptResolution::ContinueResponse { .. } | InterceptResolution::FulfillResponse { .. }) => return None,
                         Err(_) => return None,
                     }
                 }
             }
         }
+        let response_hook = response_config.map(|(tx, page_id, patterns, handle_auth)| CdpResponseHook {
+            tx, page_id, request_id: intercepted_id.clone().unwrap_or_else(next_subresource_interception_id),
+            resource_type: "Image".into(), request_headers: Default::default(), patterns,
+            request_was_paused: intercepted_id.is_some(), handle_auth, fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_body_bytes: resource_request.max_response_bytes, sequence: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        });
         #[cfg(feature = "stealth")]
-        let response = {
+        let response = if let Some(hook) = &response_hook {
+            if let Some(client) = &stealth_client {
+                client.fetch_resource_request_with_response_hook(&resolved_url, resource_request.clone(), override_method.as_deref().unwrap_or("GET"),
+                    override_body, override_headers, callbacks.as_deref(), hook).await.ok()
+            } else if let Some(client) = &http_client {
+                client.fetch_resource_request_with_response_hook(&resolved_url, resource_request.clone(), override_method.as_deref().unwrap_or("GET"),
+                    override_body, override_headers, callbacks.as_deref(), hook).await.ok()
+            } else { None }
+        } else {
             if let Some(client) = stealth_client {
                 if intercepted_id.is_some() {
                     client.fetch_resource_request(&resolved_url, resource_request.clone(), override_method.as_deref().unwrap_or("GET"),
@@ -8983,12 +9333,18 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             }
         };
         #[cfg(not(feature = "stealth"))]
-        let response = if intercepted_id.is_some() {
+        let response = if let Some(hook) = &response_hook {
+            http_client.as_ref().unwrap().fetch_resource_request_with_response_hook(&resolved_url, resource_request,
+                override_method.as_deref().unwrap_or("GET"), override_body, override_headers, callbacks.as_deref(), hook).await.ok()
+        } else if intercepted_id.is_some() {
             http_client.as_ref().unwrap().fetch_resource_request(&resolved_url, resource_request,
                 override_method.as_deref().unwrap_or("GET"), override_body, override_headers, callbacks.as_deref()).await.ok()
         } else {
             http_client.as_ref().unwrap().fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref()).await.ok()
         };
+        if let Some(hook) = &response_hook {
+            if hook.fired.load(std::sync::atomic::Ordering::Relaxed) { intercepted_id = Some(hook.request_id.clone()); }
+        }
         if let (Some(id), Some(response)) = (intercepted_id.as_deref(), response.as_ref()) {
             record_intercepted_image_completion(&shared, id, response);
         }
