@@ -45,6 +45,7 @@ integration_tests!(
     iframe_event_dispatch,
     input_activation_author_accessors,
     input_key_event_escaping,
+    keyboard_default_actions,
     input_mouse_event_parity,
     input_mouse_label_activation,
     js_fetch_emits_network_events,
