@@ -4241,6 +4241,7 @@ async fn fetch_url_inner(
                         "url": url,
                         "headers": {},
                         "blocked": true,
+                        "interceptFailed": true,
                         "error": reason,
                     })
                     .to_string());

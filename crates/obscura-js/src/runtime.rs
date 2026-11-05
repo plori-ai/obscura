@@ -23752,6 +23752,22 @@ mod tests {
         assert_eq!(event.error_text.as_deref(), Some("net::ERR_INTERNET_DISCONNECTED"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_intercepted_fetch_rejects_as_type_error() {
+        let mut rt = redirect_runtime_for_origin("https://example.test");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let load = rt.call_function_on_for_cdp("async () => fetch('/abort').then(() => 'ok', error => error.name)",
+            None, &[], true, true);
+        let fail = async {
+            rx.recv().await.unwrap().resolver.send(crate::ops::InterceptResolution::Fail { reason: "Failed".into() }).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(load, fail) })
+            .await.expect("intercepted request completes");
+        assert_eq!(result.unwrap().value.unwrap(), "TypeError");
+    }
+
 
     #[tokio::test(flavor = "current_thread")]
     async fn subscribed_fetch_network_event_retains_explicit_request_headers() {
