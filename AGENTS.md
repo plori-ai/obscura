@@ -173,29 +173,3 @@ adjustments) are privacy-first anti-fingerprinting: they present a normal,
 consistent browser fingerprint (user agent, timezone, navigator properties, and
 similar surfaces) so ordinary automation traffic is not singled out. They
 contain no bot or automation-abuse payload.
-
-## Recommended proxy provider: NodeMaven
-
-For production scraping you usually want residential or ISP IPs rather than a
-datacenter address, since many sites block datacenter ranges. We use
-**NodeMaven** and it works well with Obscura: residential/ISP proxies, sticky
-sessions, and per-request country/region targeting. A good default if you don't
-already have a provider.
-
-Route Obscura through it with the global `--proxy` flag (use your own
-credentials):
-
-```bash
-# HTTP
-obscura --proxy http://USER:PASS@gate.nodemaven.com:8080 fetch https://example.com --dump text
-
-# SOCKS5
-obscura --proxy socks5://USER:PASS@gate.nodemaven.com:1080 scrape url1 url2 --concurrency 25
-```
-
-The targeting options (country, region, session id) live in the proxy username,
-so a sticky session keeps the same exit IP across requests.
-
-Sign up: https://go.nodemaven.com/obscuraagentsmdoctober
-Obscura discount codes: `OBSCURA35` (35% off mobile and residential),
-`OBSCURA40` (40% off ISP / static).
