@@ -89,6 +89,8 @@ async fn stealth_navigation_preserves_chrome_header_order() {
         .fetch_navigation_request(&url, "GET", None,
             Some([("referer".into(), "https://example.com/".into())].into()), None).await.unwrap();
     let head = fixture.await.unwrap();
+    assert!(head.contains("Chrome/149.0.0.0 Safari/537.36"), "unexpected UA: {head}");
+    assert!(head.contains("\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""), "unexpected client hints: {head}");
     let names: Vec<_> = head.lines().skip(1).filter_map(|line| line.split_once(':').map(|(name, _)| name)).collect();
     for pair in [
         ("sec-ch-ua-platform", "Upgrade-Insecure-Requests"),
@@ -103,4 +105,26 @@ async fn stealth_navigation_preserves_chrome_header_order() {
         let second = names.iter().position(|name| *name == pair.1).unwrap();
         assert!(first < second, "unexpected header order: {head}");
     }
+}
+
+#[cfg(feature = "stealth")]
+#[test]
+fn chrome149_transport_uses_chromium_settings_and_priority() {
+    use wreq::IntoEmulation;
+    let profile = wreq_util::Emulation::builder()
+        .profile(wreq_util::Profile::Chrome149)
+        .platform(wreq_util::Platform::Windows)
+        .build().into_emulation();
+    let tls = profile.tls_options.unwrap();
+    assert_eq!(tls.curves_list.as_deref(), Some("X25519MLKEM768:X25519:P-256:P-384"));
+    assert!(tls.alps_use_new_codepoint && tls.enable_ech_grease);
+    assert_eq!(tls.permute_extensions, Some(true));
+    assert!(tls.certificate_compressors.is_some());
+    let h2 = profile.http2_options.unwrap();
+    assert_eq!(h2.header_table_size, Some(65536));
+    assert_eq!(h2.enable_push, Some(false));
+    assert_eq!(h2.initial_window_size, 6291456);
+    assert_eq!(h2.max_header_list_size, Some(262144));
+    assert_eq!(h2.headers_stream_dependency,
+        Some(wreq::http2::StreamDependency::new(wreq::http2::StreamId::zero(), 255, true)));
 }

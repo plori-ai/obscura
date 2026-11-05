@@ -62,4 +62,11 @@ macro_rules! http2_options {
             .enable_push(false)
             .build()
     };
+    (4) => {
+        http2_options!(@base Http2Options::builder())
+            // The wire weight is one greater than the encoded byte.
+            .headers_stream_dependency(StreamDependency::new(StreamId::zero(), 255, true))
+            .enable_push(false)
+            .build()
+    };
 }
