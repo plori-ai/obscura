@@ -2379,8 +2379,10 @@ impl ObscuraJsRuntime {
         let interception = if state.intercept_enabled {
             state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
         } else { None };
-        let response_config = state.cdp_response_patterns.as_ref().and_then(|patterns| state.intercept_tx.as_ref()
-            .map(|tx| (tx.clone(), state.intercept_page_id.clone(), patterns.clone())));
+        let response_config = if state.cdp_response_patterns.is_some() || state.handle_auth_requests {
+            state.intercept_tx.as_ref().map(|tx| (tx.clone(), state.intercept_page_id.clone(),
+                state.cdp_response_patterns.clone().unwrap_or_else(|| std::sync::Arc::new(Vec::new())), state.handle_auth_requests))
+        } else { None };
         let generation = state.document_generation;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
@@ -2489,10 +2491,10 @@ impl ObscuraJsRuntime {
                             }
                         }
                     }
-                    let response_hook = response_config.map(|(tx, page_id, patterns)| crate::ops::CdpResponseHook {
+                    let response_hook = response_config.map(|(tx, page_id, patterns, handle_auth)| crate::ops::CdpResponseHook {
                         tx, page_id, request_id: request_id.clone().unwrap_or_else(crate::ops::next_subresource_interception_id),
                         resource_type: if is_font { "Font" } else { "Image" }.into(), request_headers: Default::default(),
-                        patterns, request_was_paused: request_id.is_some(),
+                        patterns, request_was_paused: request_id.is_some(), handle_auth,
                         fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), max_body_bytes: request.max_response_bytes, sequence: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     });
                     #[cfg(feature = "stealth")]

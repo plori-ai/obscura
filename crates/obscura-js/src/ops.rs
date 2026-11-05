@@ -155,6 +155,7 @@ pub struct CdpResponseHook {
     pub request_headers: HashMap<String, String>,
     pub patterns: Arc<Vec<CdpRequestPattern>>,
     pub request_was_paused: bool,
+    pub handle_auth: bool,
     pub fired: Arc<std::sync::atomic::AtomicBool>,
     pub max_body_bytes: usize,
     pub sequence: Arc<std::sync::atomic::AtomicU32>,
@@ -162,6 +163,17 @@ pub struct CdpResponseHook {
 
 #[async_trait::async_trait]
 impl obscura_net::interceptor::ResponseInterceptor for CdpResponseHook {
+    async fn authenticate(&self, url: &url::Url, method: &str,
+        headers: &HashMap<String, String>, challenge: &str) -> Option<String> {
+        let kind = if self.resource_type == "Fetch" { "XHR" } else { self.resource_type.as_str() };
+        if !self.handle_auth || matches_cdp_request_patterns(Some(&self.patterns), url.as_str(), kind) {
+            return None;
+        }
+        BasicAuthHandler { tx: self.tx.clone(), page_id: self.page_id.clone(),
+            request_id: self.request_id.clone(), resource_type: self.resource_type.clone() }
+            .credentials(url.as_str(), method, headers, challenge).await
+    }
+
     async fn intercept_response(&self, url: &url::Url, method: &str, status: u16,
         headers: HashMap<String, String>, body: obscura_net::interceptor::ResponseBodyFuture,
     ) -> Result<obscura_net::interceptor::ResponseInterception, String> {
@@ -4443,6 +4455,7 @@ async fn fetch_url_inner(
         tx, page_id, request_id: request_id.clone(), resource_type: resource_type_name.to_string(),
         request_headers: custom_headers.clone(), patterns,
         request_was_paused: network_guard.event.as_ref().is_some_and(|event| event.intercepted),
+        handle_auth: false,
         fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         max_body_bytes: fetch_max_body_bytes(),
         sequence: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -9099,8 +9112,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             && matches_cdp_request_patterns(gs.cdp_request_patterns.as_deref().map(Vec::as_slice), &selected_url, "Image") {
             gs.intercept_tx.clone().map(|tx| (tx, gs.intercept_page_id.clone()))
         } else { None };
-        let response_config = gs.cdp_response_patterns.as_ref().and_then(|patterns| gs.intercept_tx.as_ref()
-            .map(|tx| (tx.clone(), gs.intercept_page_id.clone(), patterns.clone())));
+        let response_config = if gs.cdp_response_patterns.is_some() || gs.handle_auth_requests {
+            gs.intercept_tx.as_ref().map(|tx| (tx.clone(), gs.intercept_page_id.clone(),
+                gs.cdp_response_patterns.clone().unwrap_or_else(|| Arc::new(Vec::new())), gs.handle_auth_requests))
+        } else { None };
         (
             gs.document_generation,
             selected_url,
@@ -9213,10 +9228,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 }
             }
         }
-        let response_hook = response_config.map(|(tx, page_id, patterns)| CdpResponseHook {
+        let response_hook = response_config.map(|(tx, page_id, patterns, handle_auth)| CdpResponseHook {
             tx, page_id, request_id: intercepted_id.clone().unwrap_or_else(next_subresource_interception_id),
             resource_type: "Image".into(), request_headers: Default::default(), patterns,
-            request_was_paused: intercepted_id.is_some(), fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_was_paused: intercepted_id.is_some(), handle_auth, fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_body_bytes: resource_request.max_response_bytes, sequence: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
         #[cfg(feature = "stealth")]

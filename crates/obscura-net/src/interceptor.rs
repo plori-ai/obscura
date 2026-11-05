@@ -48,6 +48,10 @@ pub struct ResponseInterception {
 
 #[async_trait::async_trait]
 pub trait ResponseInterceptor: Send + Sync {
+    /// Return a request-scoped Authorization value for a challenge, if handled.
+    async fn authenticate(&self, _url: &url::Url, _method: &str,
+        _headers: &HashMap<String, String>, _challenge: &str) -> Option<String> { None }
+
     async fn intercept_response(&self, url: &url::Url, method: &str, status: u16,
         headers: HashMap<String, String>, body: ResponseBodyFuture) -> Result<ResponseInterception, String>;
 }

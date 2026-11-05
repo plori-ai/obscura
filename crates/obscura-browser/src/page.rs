@@ -21,6 +21,7 @@ struct NativeInterception {
     patterns: Vec<String>,
     cdp_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
     response_patterns: Option<Arc<Vec<obscura_js::ops::CdpRequestPattern>>>,
+    handle_auth: bool,
     headers: std::collections::HashMap<String, String>,
 }
 
@@ -35,15 +36,16 @@ impl NativeInterception {
         if !matches!(url.scheme(), "http" | "https") { return Ok(None); }
         let request_matches = (self.patterns.is_empty() || self.patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str())))
             && obscura_js::ops::matches_cdp_request_patterns(self.cdp_patterns.as_deref().map(Vec::as_slice), url.as_str(), kind);
-        if !request_matches && self.response_patterns.is_none() { return Ok(None); }
+        if !request_matches && self.response_patterns.is_none() && !self.handle_auth { return Ok(None); }
         obscura_js::ops::validate_fetch_url(url, client.allow_private_network)?;
         let id = obscura_js::ops::next_subresource_interception_id();
-        let hook = self.response_patterns.as_ref().map(|patterns| CdpResponseHook {
+        let hook = if self.response_patterns.is_some() || self.handle_auth { Some(CdpResponseHook {
             tx: self.tx.clone(), page_id: self.page_id.clone(), request_id: id.clone(), resource_type: kind.into(),
-            request_headers: self.headers.clone(), patterns: patterns.clone(), request_was_paused: request_matches,
+            request_headers: self.headers.clone(), patterns: self.response_patterns.clone().unwrap_or_else(|| Arc::new(Vec::new())),
+            request_was_paused: request_matches, handle_auth: self.handle_auth,
             fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_body_bytes: request.max_response_bytes, sequence: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        });
+        }) } else { None };
         let mut target = url.clone();
         let mut changed_method = None;
         let mut changed_headers = None;
@@ -1918,7 +1920,7 @@ impl Page {
         let request_id = format!("{}.{}", self.id, self.network_event_counter + 1);
         let response_hook = self.cdp_response_patterns.as_ref().map(|patterns| obscura_js::ops::CdpResponseHook {
             tx: tx.clone(), page_id: self.id.clone(), request_id: request_id.clone(), resource_type: "Document".into(),
-            request_headers: request_headers.clone(), patterns: patterns.clone(), request_was_paused: request_matches,
+            request_headers: request_headers.clone(), patterns: patterns.clone(), request_was_paused: request_matches, handle_auth: false,
             fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_body_bytes: ResourceRequest::navigation().max_response_bytes, sequence: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
@@ -2305,7 +2307,7 @@ impl Page {
         let offline = self.network_offline.load(std::sync::atomic::Ordering::Relaxed);
         let cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), response_patterns: self.cdp_response_patterns.clone(), headers: self.cdp_extra_headers.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), response_patterns: self.cdp_response_patterns.clone(), handle_auth: self.handle_auth_requests, headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
@@ -2756,7 +2758,7 @@ impl Page {
         let offline = self.network_offline.load(std::sync::atomic::Ordering::Relaxed);
         let cache_disabled = self.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed);
         let interception = if self.intercept_enabled { self.intercept_tx.clone().map(|tx| NativeInterception {
-            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), response_patterns: self.cdp_response_patterns.clone(), headers: self.cdp_extra_headers.clone(),
+            tx, page_id: self.id.clone(), patterns: self.intercept_block_patterns.clone(), cdp_patterns: self.cdp_request_patterns.clone(), response_patterns: self.cdp_response_patterns.clone(), handle_auth: self.handle_auth_requests, headers: self.cdp_extra_headers.clone(),
         }) } else { None };
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
@@ -5628,7 +5630,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, response_patterns: None, headers: Default::default() };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, response_patterns: None, handle_auth: false, headers: Default::default() };
         let (result, (), wire) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
                 interception.fetch(&original, request, "Script", &client,
@@ -5664,6 +5666,84 @@ mod tests {
         assert!(wire.ends_with(&[0, 128, 255]));
     }
 
+    async fn assert_parser_resource_authentication(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Url::parse(&format!("http://{}/app.js", listener.local_addr().unwrap())).unwrap();
+        let redirected = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_url = format!("http://{}/final", redirected.local_addr().unwrap());
+        let other_origin = tokio::spawn(async move {
+            let (mut socket, _) = redirected.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            assert!(!String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("authorization:"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        });
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                if attempt == 0 {
+                    assert!(!headers.contains("authorization:"));
+                    socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"static\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(headers.contains("authorization: basic dxnlcjpwyxnz"));
+                    let reply = format!("HTTP/1.1 302 Found\r\nLocation: {redirect_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let jar = Arc::new(obscura_net::CookieJar::new());
+        let client = ObscuraHttpClient::with_full_options(jar.clone(), None, true);
+        #[cfg(feature = "stealth")]
+        let stealth_client = stealth.then(|| obscura_net::StealthHttpClient::with_proxy(jar, None, true));
+        #[cfg(not(feature = "stealth"))]
+        let _ = (stealth, jar);
+        let callbacks = CallbackRegistry::new();
+        let request = ResourceRequest::subresource(ResourceType::Script, &target);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: Vec::new(),
+            cdp_patterns: Some(Arc::new(Vec::new())), response_patterns: None, handle_auth: true, headers: Default::default() };
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(interception.fetch(&target, request, "Script", &client,
+                #[cfg(feature = "stealth")] stealth_client.as_ref(), &callbacks), async {
+                let request = rx.recv().await.unwrap();
+                assert_eq!(request.resource_type, "Script");
+                assert_eq!(request.auth_challenge.as_ref().unwrap().realm, "static");
+                request.resolver.send(InterceptResolution::Continue { url: None, method: None,
+                    headers: Some([("Authorization".into(), "Basic dXNlcjpwYXNz".into())].into()), body: None }).unwrap();
+            })
+        }).await.expect("resource challenge must complete");
+        assert_eq!(response.unwrap().unwrap().0.body, b"ok");
+        assert!(client.extra_headers.read().await.is_empty());
+        server.await.unwrap();
+        other_origin.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_resource_authentication_retries_with_scoped_credentials() {
+        assert_parser_resource_authentication(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_parser_resource_authentication_retries_with_scoped_credentials() {
+        assert_parser_resource_authentication(true).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn continued_parser_resource_rejects_private_url_rewrite() {
         use obscura_js::ops::InterceptResolution;
@@ -5673,7 +5753,7 @@ mod tests {
         let callbacks = CallbackRegistry::new();
         let request = ResourceRequest::subresource(ResourceType::Script, &original);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, response_patterns: None, headers: Default::default() };
+        let interception = NativeInterception { tx, page_id: "owner".into(), patterns: vec!["*".into()], cdp_patterns: None, response_patterns: None, handle_auth: false, headers: Default::default() };
         let (result, ()) = tokio::join!(
             interception.fetch(&original, request, "Script", &client,
                 #[cfg(feature = "stealth")] None, &callbacks),

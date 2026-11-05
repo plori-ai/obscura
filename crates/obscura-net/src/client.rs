@@ -1507,16 +1507,13 @@ impl ObscuraHttpClient {
 
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
-        // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
-        // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
-        // (the initial one plus 20 hops), so the 20th redirect is still followed
-        // and only the 21st fails. The old `0..max_redirects` made 20 requests
-        // total and thus followed only 19 (WPT redirect-count: 20 must pass).
+        // Follow up to 20 redirects. Authentication retries do not consume a hop.
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut attempted_auth = false;
 
-        for _redirect_count in 0..=max_redirects {
+        while redirects.len() <= max_redirects {
             validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
                 url: current_url.clone(),
@@ -1712,6 +1709,23 @@ impl ObscuraHttpClient {
                     k.as_str().to_lowercase(),
                     v.to_str().unwrap_or("").to_string(),
                 );
+            }
+
+            if RESPONSE_HOOK && status.as_u16() == 401 && !attempted_auth && request.sends_credentials_to(&current_url) {
+                if let (Some(hook), Some(challenge)) = (response_hook, response_headers.get("www-authenticate")) {
+                    let existing = match &request_headers {
+                        Some(headers) => headers.clone(),
+                        None => self.extra_headers.read().await.clone(),
+                    };
+                    if let Some(authorization) = hook.authenticate(&current_url, method.as_str(), &existing, challenge).await {
+                        attempted_auth = true;
+                        let mut headers = existing;
+                        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                        headers.insert("Authorization".into(), authorization);
+                        request_headers = Some(headers);
+                        continue;
+                    }
+                }
             }
 
             let mut response = Some(resp);

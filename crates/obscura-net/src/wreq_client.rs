@@ -393,10 +393,10 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut attempted_auth = false;
 
-        // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
-        // 21 requests, so the 20th hop is followed and only the 21st fails.
-        for _ in 0..=20 {
+        // Authentication retries do not consume a redirect hop.
+        while redirects.len() <= 20 {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.request(method.clone(), current_url.as_str());
 
@@ -517,6 +517,23 @@ impl StealthHttpClient {
                     k.as_str().to_lowercase(),
                     v.to_str().unwrap_or("").to_string(),
                 );
+            }
+
+            if RESPONSE_HOOK && status.as_u16() == 401 && !attempted_auth && request.sends_credentials_to(&current_url) {
+                if let (Some(hook), Some(challenge)) = (response_hook, response_headers.get("www-authenticate")) {
+                    let existing = match &request_headers {
+                        Some(headers) => headers.clone(),
+                        None => self.extra_headers.read().await.clone(),
+                    };
+                    if let Some(authorization) = hook.authenticate(&current_url, method.as_str(), &existing, challenge).await {
+                        attempted_auth = true;
+                        let mut headers = existing;
+                        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                        headers.insert("Authorization".into(), authorization);
+                        request_headers = Some(headers);
+                        continue;
+                    }
+                }
             }
 
             let mut response = Some(resp);

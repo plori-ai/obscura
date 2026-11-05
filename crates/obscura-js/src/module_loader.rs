@@ -278,8 +278,10 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let interception = if state.intercept_enabled {
                     state.intercept_tx.clone().map(|tx| (tx, state.intercept_page_id.clone(), state.intercept_url_patterns.clone(), state.cdp_request_patterns.clone()))
                 } else { None };
-                let response_config = state.cdp_response_patterns.as_ref().and_then(|patterns| state.intercept_tx.as_ref()
-                    .map(|tx| (tx.clone(), state.intercept_page_id.clone(), patterns.clone())));
+                let response_config = if state.cdp_response_patterns.is_some() || state.handle_auth_requests {
+                    state.intercept_tx.as_ref().map(|tx| (tx.clone(), state.intercept_page_id.clone(),
+                        state.cdp_response_patterns.clone().unwrap_or_else(|| Arc::new(Vec::new())), state.handle_auth_requests))
+                } else { None };
                 Ok((client, stealth, state.callbacks.clone(), interception,
                     state.network_offline.load(std::sync::atomic::Ordering::Relaxed),
                     state.network_cache_disabled.load(std::sync::atomic::Ordering::Relaxed), response_config))
@@ -392,9 +394,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                             }
                         }
                     }
-                    let response_hook = response_config.map(|(tx, page_id, patterns)| crate::ops::CdpResponseHook {
+                    let response_hook = response_config.map(|(tx, page_id, patterns, handle_auth)| crate::ops::CdpResponseHook {
                         tx, page_id, request_id: request_id.clone(), resource_type: "Script".into(),
-                        request_headers: Default::default(), patterns, request_was_paused: intercepted,
+                        request_headers: Default::default(), patterns, request_was_paused: intercepted, handle_auth,
                         fired: Arc::new(std::sync::atomic::AtomicBool::new(false)), max_body_bytes: request.max_response_bytes, sequence: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     });
                     #[cfg(feature = "stealth")]
