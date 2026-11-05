@@ -13,6 +13,7 @@ Changes in this fork, compared with upstream v0.2.6 (see the git history for eve
 - CSSOM keeps `!important`; `data:` and `blob:` JavaScript modules load; `SVGPathElement.getTotalLength()`/`getPointAtLength()`.
 - Stealth: one stable identity per browser context (pages, frames and workers agree); TLS and HTTP/2 match Chrome 149, and the UA and client hints claim 149.
 - Worker `MessageEvent`s, `about:blank` frame origins, `document.lastModified`, PDF plugin MIME types, `chrome.app.runningState`, WebRTC offer SDP.
+- MCP: a request longer than 8 KiB is no longer lost when a page with timers runs between two reads of it; snapshots report the live document title.
 
 Licensed under Apache-2.0, like upstream (see LICENSE).
 
