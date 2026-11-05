@@ -4598,8 +4598,27 @@ fn paint_laid_dom_scrolled(
             // Opacity is applied to the finished stacking context, never to
             // each primitive. Otherwise two opaque overlapping children at
             // opacity:.5 incorrectly become .75 alpha in their overlap.
-            let layer = Pixmap::new(pixmap.width(), pixmap.height())?;
-            let mut layer = paint_laid_dom_scrolled(
+            // Paint outside the viewport too: those pixels can contribute to
+            // the blur after filtering. Bound the expanded allocation with the
+            // same limits used by transformed capture surfaces.
+            let requested_margin = (blur * raster_scale * 3.0).ceil();
+            let margin = if blur > 0.0 && raster_scale.is_finite() && raster_scale > 0.0
+                && requested_margin.is_finite() && requested_margin >= 0.0
+                && requested_margin <= MAX_CAPTURE_DIMENSION as f32 {
+                let margin = requested_margin as u32;
+                let dimensions = margin.checked_mul(2).and_then(|extra| {
+                    Some((pixmap.width().checked_add(extra)?, pixmap.height().checked_add(extra)?))
+                });
+                match dimensions {
+                    Some((w, h)) if w <= MAX_CAPTURE_DIMENSION && h <= MAX_CAPTURE_DIMENSION
+                        && u64::from(w) * u64::from(h) <= MAX_CAPTURE_PIXELS => margin,
+                    _ => 0,
+                }
+            } else { 0 };
+            let extra = margin * 2;
+            let layer = Pixmap::new(pixmap.width() + extra, pixmap.height() + extra)?;
+            let layer_offset = if margin == 0 { 0.0 } else { margin as f32 / raster_scale };
+            let layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
                 base_url,
@@ -4620,27 +4639,38 @@ fn paint_laid_dom_scrolled(
                 Some(nid),
                 suppress_stacking_for,
                 suppress_transform_for,
-                clip_scope_root,
+                if blur > 0.0 { Some(nid) } else { clip_scope_root },
                 surface_extent,
-                surface_offset,
+                (surface_offset.0 + layer_offset, surface_offset.1 + layer_offset),
                 raster_scale,
                 print_economy,
                 canvas_background,
             )?;
-            if blur > 0.0 {
-                gaussian_blur_pixmap(&mut layer, blur * raster_scale);
-            }
+            let (layer, content_x, content_y) = if blur > 0.0 {
+                let Some(result) = blur_isolated_layer(layer, blur * raster_scale) else { continue };
+                result
+            } else { (layer, 0, 0) };
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
                 ..tiny_skia::PixmapPaint::default()
             };
+            let outside_clip = (blur > 0.0).then(|| scroll_state.overflow_clip_for(laid, nid)).flatten();
+            let clip_mask = outside_clip.as_ref().and_then(|clip| {
+                cached_overflow_clip_mask(
+                    &mut overflow_mask_cache,
+                    pixmap.width(),
+                    pixmap.height(),
+                    clip,
+                    scroll_state.surface_extent.unwrap_or(viewport),
+                )
+            });
             pixmap.draw_pixmap(
-                0,
-                0,
+                content_x as i32 - margin as i32,
+                content_y as i32 - margin as i32,
                 layer.as_ref(),
                 &group_paint,
                 Transform::identity(),
-                None,
+                clip_mask.as_deref(),
             );
             continue;
         }
@@ -6806,6 +6836,40 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
         channel(color[2]),
         color[3],
     ]
+}
+
+/// Blur only the nontransparent part of an isolated surface and its kernel
+/// margin. Small filtered elements should not blur a whole viewport.
+fn blur_isolated_layer(mut layer: Pixmap, sigma: f32) -> Option<(Pixmap, u32, u32)> {
+    let (width, height) = (layer.width() as usize, layer.height() as usize);
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0usize, 0usize);
+    for (y, row) in layer.pixels().chunks_exact(width).enumerate() {
+        if let Some(first) = row.iter().position(|pixel| pixel.alpha() != 0) {
+            let last = row.iter().rposition(|pixel| pixel.alpha() != 0).unwrap_or(first);
+            left = left.min(first);
+            right = right.max(last + 1);
+            top = top.min(y);
+            bottom = y + 1;
+        }
+    }
+    if right <= left || bottom <= top { return None; }
+    let padding = ((sigma.max(0.0) * 3.0).ceil() + 2.0) as usize;
+    left = left.saturating_sub(padding);
+    top = top.saturating_sub(padding);
+    right = right.saturating_add(padding).min(width);
+    bottom = bottom.saturating_add(padding).min(height);
+    if left == 0 && top == 0 && right == width && bottom == height {
+        gaussian_blur_pixmap(&mut layer, sigma);
+        return Some((layer, 0, 0));
+    }
+    let (crop_width, crop_height) = (right - left, bottom - top);
+    let mut crop = Pixmap::new(crop_width as u32, crop_height as u32)?;
+    for (y, row) in crop.pixels_mut().chunks_exact_mut(crop_width).enumerate() {
+        let start = (top + y) * width + left;
+        row.copy_from_slice(&layer.pixels()[start..start + crop_width]);
+    }
+    gaussian_blur_pixmap(&mut crop, sigma);
+    Some((crop, left as u32, top as u32))
 }
 
 /// Approximate a Gaussian using three separable box filters. Work is linear in
@@ -12661,6 +12725,67 @@ mod tests {
             }
         }
         assert!(red > 10 && blue == 0 && gray > 20, "red={red}, blue={blue}, gray={gray}");
+    }
+
+    #[test]
+    fn cropped_filter_blur_matches_full_surface() {
+        for sigma in [0.5, 2.0, 8.0, 15.0] {
+            let mut layer = Pixmap::new(128, 96).unwrap();
+            for y in 25..38 {
+                for x in 37..54 {
+                    let alpha = ((x * 13 + y * 17) % 256) as u8;
+                    layer.pixels_mut()[(y * 128 + x) as usize] =
+                        tiny_skia::PremultipliedColorU8::from_rgba(alpha, 0, 0, alpha).unwrap();
+                }
+            }
+            let mut reference = layer.clone();
+            gaussian_blur_pixmap(&mut reference, sigma);
+            let (actual, left, top) = blur_isolated_layer(layer, sigma).unwrap();
+            for y in 0u32..96 {
+                for x in 0u32..128 {
+                    let got = x.checked_sub(left).zip(y.checked_sub(top))
+                        .and_then(|(x, y)| (x < actual.width() && y < actual.height()).then(|| actual.pixel(x, y)).flatten())
+                        .unwrap_or(tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
+                    assert_eq!(got, reference.pixel(x, y).unwrap(), "sigma={sigma} x={x} y={y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offscreen_filter_blur_reaches_the_viewport() {
+        let tree = parse_html(r#"<html style="background:white"><body style="margin:0">
+            <div style="position:absolute;left:-12px;top:20px;width:12px;height:50px;
+                        background:black;filter:blur(8px)"></div>
+            <div style="position:absolute;left:100px;top:20px;width:12px;height:50px;
+                        background:black;filter:blur(8px)"></div>
+            <div style="position:absolute;left:20px;top:-12px;width:15px;height:12px;
+                        background:black;filter:blur(8px)"></div>
+            <div style="position:absolute;left:70px;top:100px;width:15px;height:12px;
+                        background:black;filter:blur(8px)"></div>
+            <div style="position:absolute;left:40px;top:20px;width:30px;height:50px;overflow:hidden">
+              <div style="position:absolute;left:-12px;top:0;width:12px;height:50px;
+                          background:black;filter:blur(8px)"></div>
+            </div>
+            </body></html>"#);
+        let pixmap = paint_dom(&tree, (100.0, 100.0), None).expect("paint");
+        let edge = pixmap.pixel(0, 40).unwrap().red();
+        let farther = pixmap.pixel(10, 40).unwrap().red();
+        assert!(edge < 225 && farther > edge && farther < 255, "edge={edge}, farther={farther}");
+        assert!(pixmap.pixel(99, 40).unwrap().red() < 225, "right edge blur");
+        assert!(pixmap.pixel(27, 0).unwrap().red() < 225, "top edge blur");
+        assert!(pixmap.pixel(77, 99).unwrap().red() < 225, "bottom edge blur");
+        assert_eq!(pixmap.pixel(39, 40).unwrap().red(), 255, "ancestor clip must apply after filtering");
+        assert!(pixmap.pixel(40, 40).unwrap().red() < 225, "blur must reach inside the ancestor clip");
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared = prepare_dom(&tree, (100.0, 100.0), None, &mut resources).unwrap();
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let scaled = paint_prepared_region_with_scroll(
+            &tree, &mut prepared, &mut resources, &scroll, CaptureRegion::new(0.0, 0.0, 100.0, 100.0, 2.0),
+        ).unwrap();
+        assert!(scaled.pixel(0, 80).unwrap().red() < 225, "offscreen blur at 2x");
+        assert_eq!(scaled.pixel(78, 80).unwrap().red(), 255, "scaled ancestor clip");
+        assert!(scaled.pixel(80, 80).unwrap().red() < 225, "blur inside scaled ancestor clip");
     }
 
     #[test]
