@@ -66,6 +66,9 @@ pub async fn handle(
     match method {
         "enable" => {
             if let Some(patterns) = params.get("patterns").and_then(Value::as_array) {
+                if patterns.is_empty() && params.get("handleAuthRequests").and_then(Value::as_bool).unwrap_or(false) {
+                    return Err("Can't specify empty patterns with handleAuth set".into());
+                }
                 for pattern in patterns {
                     if let Some(stage) = pattern.get("requestStage").and_then(Value::as_str) {
                         if !matches!(stage, "Request" | "Response") { return Err("Unknown Fetch request stage".into()); }
@@ -286,6 +289,14 @@ mod tests {
         assert_eq!(patterns[0].resource_type.as_deref(), Some("Image"));
         assert!(obscura_js::ops::matches_cdp_request_patterns(Some(patterns), "https://x/a", "Image"));
         assert!(!obscura_js::ops::matches_cdp_request_patterns(Some(patterns), "https://x/a", "Script"));
+    }
+
+    #[tokio::test]
+    async fn empty_patterns_cannot_be_combined_with_authentication() {
+        let mut ctx = CdpContext::new();
+        assert!(handle("enable", &json!({"patterns": [], "handleAuthRequests": true}), &mut ctx, &None).await.is_err());
+        assert!(!ctx.fetch_intercept.enabled);
+        assert!(handle("enable", &json!({"patterns": [], "handleAuthRequests": false}), &mut ctx, &None).await.is_ok());
     }
 
     fn pause(ctx: &mut CdpContext, id: &str) -> tokio::sync::oneshot::Receiver<FetchResolution> {
