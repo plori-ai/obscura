@@ -6832,6 +6832,107 @@ pub(crate) fn gaussian_blur_pixmap(pixmap: &mut Pixmap, sigma: f32) {
     pixmap.data_mut().copy_from_slice(&src);
 }
 
+/// Blur an alpha-only shadow mask with the same box kernel as RGBA surfaces.
+pub(crate) fn gaussian_blur_alpha(alpha: &mut [u8], width: usize, height: usize, sigma: f32) {
+    if !sigma.is_finite() || sigma <= 0.0 || width == 0 || height == 0 || width.checked_mul(height) != Some(alpha.len()) { return; }
+    let sigma = f64::from(sigma);
+    let ideal = (4.0 * sigma * sigma + 1.0).sqrt();
+    let mut lower = ideal.floor().max(1.0) as u32;
+    if lower % 2 == 0 { lower -= 1; }
+    let upper = lower.saturating_add(2);
+    let l = f64::from(lower);
+    let count = ((12.0 * sigma * sigma - 3.0 * l * l - 12.0 * l - 9.0)
+        / (-4.0 * l - 4.0)).round().clamp(0.0, 3.0) as usize;
+    let mut src = alpha.to_vec();
+    let mut dst = vec![0u8; src.len()];
+    for pass in 0..3 {
+        let radius = (if pass < count { lower } else { upper } / 2) as usize;
+        if radius == 0 { continue; }
+        match radius {
+            1 => { box_blur_alpha_small::<true, 1>(&src, &mut dst, width, height); box_blur_alpha_small::<false, 1>(&dst, &mut src, width, height); }
+            2 => { box_blur_alpha_small::<true, 2>(&src, &mut dst, width, height); box_blur_alpha_small::<false, 2>(&dst, &mut src, width, height); }
+            3 => { box_blur_alpha_small::<true, 3>(&src, &mut dst, width, height); box_blur_alpha_small::<false, 3>(&dst, &mut src, width, height); }
+            _ => { box_blur_alpha_axis::<true>(&src, &mut dst, width, height, radius); box_blur_alpha_axis::<false>(&dst, &mut src, width, height, radius); }
+        }
+    }
+    alpha.copy_from_slice(&src);
+}
+
+fn box_blur_alpha_small<const HORIZONTAL: bool, const RADIUS: usize>(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
+    if !HORIZONTAL {
+        // Keep each vertical pass in row order: striding down one column at a
+        // time defeats cache locality on the wide, shallow masks used by text.
+        let mut sums = vec![0u32; width];
+        for row in src.chunks_exact(width).take(height.min(RADIUS + 1)) {
+            for (sum, value) in sums.iter_mut().zip(row) { *sum += u32::from(*value); }
+        }
+        for y in 0..height {
+            let out = &mut dst[y * width..(y + 1) * width];
+            for (pixel, sum) in out.iter_mut().zip(&sums) {
+                *pixel = ((*sum + RADIUS as u32) / (2 * RADIUS as u32 + 1)) as u8;
+            }
+            if y >= RADIUS {
+                let row = &src[(y - RADIUS) * width..(y - RADIUS + 1) * width];
+                for (sum, value) in sums.iter_mut().zip(row) { *sum -= u32::from(*value); }
+            }
+            if y < height.saturating_sub(RADIUS + 1) {
+                let row = &src[(y + RADIUS + 1) * width..(y + RADIUS + 2) * width];
+                for (sum, value) in sums.iter_mut().zip(row) { *sum += u32::from(*value); }
+            }
+        }
+        return;
+    }
+    let (lines, length) = if HORIZONTAL { (height, width) } else { (width, height) };
+    for line in 0..lines {
+        let index = |p: usize| if HORIZONTAL { line * width + p } else { p * width + line };
+        let mut sum = 0u32;
+        for p in 0..length.min(RADIUS + 1) { sum += u32::from(src[index(p)]); }
+        for p in 0..length {
+            dst[index(p)] = ((sum + RADIUS as u32) / (2 * RADIUS as u32 + 1)) as u8;
+            if p >= RADIUS { sum -= u32::from(src[index(p - RADIUS)]); }
+            if p < length.saturating_sub(RADIUS + 1) { sum += u32::from(src[index(p + RADIUS + 1)]); }
+        }
+    }
+}
+
+fn box_blur_alpha_axis<const HORIZONTAL: bool>(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    let (lines, length) = if HORIZONTAL { (height, width) } else { (width, height) };
+    let divisor = (radius as u64).saturating_mul(2).saturating_add(1);
+    if divisor <= u64::from(u32::MAX)
+        && (length as u64).saturating_mul(255).saturating_add(divisor / 2) <= u64::from(u32::MAX) {
+        let divisor = divisor as u32;
+        let reciprocal = (1u64 << 32) / u64::from(divisor);
+        for line in 0..lines {
+            let index = |p: usize| if HORIZONTAL { line * width + p } else { p * width + line };
+            let mut sum = 0u32;
+            for p in 0..length.min(radius.saturating_add(1)) { sum += u32::from(src[index(p)]); }
+            for p in 0..length {
+                let value = u64::from(sum) + u64::from(divisor / 2);
+                let mut quotient = (value * reciprocal >> 32) as u32;
+                if value - u64::from(quotient) * u64::from(divisor) >= u64::from(divisor) { quotient += 1; }
+                dst[index(p)] = quotient as u8;
+                if p >= radius { sum -= u32::from(src[index(p - radius)]); }
+                if let Some(next) = p.checked_add(radius).and_then(|v| v.checked_add(1)).filter(|&v| v < length) {
+                    sum += u32::from(src[index(next)]);
+                }
+            }
+        }
+        return;
+    }
+    for line in 0..lines {
+        let index = |p: usize| if HORIZONTAL { line * width + p } else { p * width + line };
+        let mut sum = 0u64;
+        for p in 0..length.min(radius.saturating_add(1)) { sum += u64::from(src[index(p)]); }
+        for p in 0..length {
+            dst[index(p)] = ((sum + divisor / 2) / divisor) as u8;
+            if p >= radius { sum -= u64::from(src[index(p - radius)]); }
+            if let Some(next) = p.checked_add(radius).and_then(|v| v.checked_add(1)).filter(|&v| v < length) {
+                sum += u64::from(src[index(next)]);
+            }
+        }
+    }
+}
+
 fn box_blur_axis(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize, horizontal: bool) {
     let (lines, length) = if horizontal { (height, width) } else { (width, height) };
     let divisor = (radius as u64).saturating_mul(2).saturating_add(1);
@@ -7079,6 +7180,25 @@ fn selected_option_label(tree: &DomTree, select: obscura_dom::tree::NodeId) -> O
     first
 }
 
+trait FastPng {
+    fn encode_png_fast(self) -> image::ImageResult<Vec<u8>>;
+}
+
+impl FastPng for Pixmap {
+    fn encode_png_fast(self) -> image::ImageResult<Vec<u8>> {
+        use image::ImageEncoder as _;
+        let (width, height) = (self.width(), self.height());
+        let pixels = self.take_demultiplied();
+        let mut output = Vec::new();
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut output,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::Adaptive,
+        ).write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)?;
+        Ok(output)
+    }
+}
+
 /// Render `tree` at `viewport` to PNG bytes (RGBA 8-bit). Returns None if the
 /// viewport is zero-sized. Convenience over `paint_dom` + `encode_png`.
 pub fn screenshot_png(
@@ -7086,7 +7206,7 @@ pub fn screenshot_png(
     viewport: (f32, f32),
     base_url: Option<&str>,
 ) -> Option<Vec<u8>> {
-    paint_dom(tree, viewport, base_url)?.encode_png().ok()
+    paint_dom(tree, viewport, base_url)?.encode_png_fast().ok()
 }
 
 /// PNG convenience wrapper for a scrolled root viewport.
@@ -7096,7 +7216,7 @@ pub fn screenshot_png_scrolled(
     base_url: Option<&str>,
     scroll: (f32, f32),
 ) -> Option<Vec<u8>> {
-    paint_dom_scrolled(tree, viewport, base_url, scroll).and_then(|pixmap| pixmap.encode_png().ok())
+    paint_dom_scrolled(tree, viewport, base_url, scroll).and_then(|pixmap| pixmap.encode_png_fast().ok())
 }
 
 pub fn screenshot_png_scrolled_at_animation_time(
@@ -7107,7 +7227,7 @@ pub fn screenshot_png_scrolled_at_animation_time(
     animation_sample_time: crate::AnimationSampleTime,
 ) -> Option<Vec<u8>> {
     paint_dom_scrolled_at_animation_time(tree, viewport, base_url, scroll, animation_sample_time)
-    .and_then(|pixmap| pixmap.encode_png().ok())
+    .and_then(|pixmap| pixmap.encode_png_fast().ok())
 }
 
 pub fn screenshot_png_scrolled_at_animation_time_with_surface_color(
@@ -7126,7 +7246,7 @@ pub fn screenshot_png_scrolled_at_animation_time_with_surface_color(
         animation_sample_time,
         surface_color,
     )
-    .and_then(|pixmap| pixmap.encode_png().ok())
+    .and_then(|pixmap| pixmap.encode_png_fast().ok())
 }
 
 /// PNG wrapper for [`paint_dom_scrolled_at_animation_time_with_surface_color_and_resources`].
@@ -7148,7 +7268,7 @@ pub fn screenshot_png_scrolled_at_animation_time_with_surface_color_and_resource
         surface_color,
         resources,
     )
-    .and_then(|pixmap| pixmap.encode_png().ok())
+    .and_then(|pixmap| pixmap.encode_png_fast().ok())
 }
 
 /// PNG convenience wrapper for a retained resource-aware layout.
@@ -7159,7 +7279,7 @@ pub fn screenshot_prepared(
     scroll: (f32, f32),
 ) -> Option<Vec<u8>> {
     paint_prepared(tree, prepared, resources, scroll)?
-        .encode_png()
+        .encode_png_fast()
         .ok()
 }
 
@@ -7170,7 +7290,7 @@ pub fn screenshot_prepared_with_scroll(
     scroll: &ResolvedScrollState,
 ) -> Option<Vec<u8>> {
     paint_prepared_with_scroll(tree, prepared, resources, scroll)?
-        .encode_png()
+        .encode_png_fast()
         .ok()
 }
 
@@ -7182,7 +7302,7 @@ pub fn screenshot_prepared_with_scroll_and_surface_color(
     surface_color: [u8; 4],
 ) -> Option<Vec<u8>> {
     paint_prepared_with_scroll_and_surface_color(tree, prepared, resources, scroll, surface_color)?
-    .encode_png()
+    .encode_png_fast()
     .ok()
 }
 
@@ -7202,7 +7322,7 @@ pub fn screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
         surface_color,
         canvas_surfaces,
     )?
-    .encode_png()
+    .encode_png_fast()
     .ok()
 }
 
@@ -7215,7 +7335,7 @@ pub fn screenshot_prepared_region_with_scroll(
     region: CaptureRegion,
 ) -> Result<Vec<u8>, CaptureError> {
     paint_prepared_region_with_scroll(tree, prepared, resources, scroll, region)?
-        .encode_png()
+        .encode_png_fast()
         .map_err(|_| CaptureError::EncodeFailed)
 }
 
@@ -7235,7 +7355,7 @@ pub fn screenshot_prepared_region_with_scroll_and_surface_color(
         region,
         surface_color,
     )?
-    .encode_png()
+    .encode_png_fast()
     .map_err(|_| CaptureError::EncodeFailed)
 }
 
@@ -7257,7 +7377,7 @@ pub fn screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfa
         surface_color,
         canvas_surfaces,
     )?
-    .encode_png()
+    .encode_png_fast()
     .map_err(|_| CaptureError::EncodeFailed)
 }
 
@@ -7303,7 +7423,7 @@ pub fn screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surface
             [255, 255, 255, 255],
             canvas_surfaces,
         )?
-        .encode_png()
+        .encode_png_fast()
         .map_err(|_| CaptureError::EncodeFailed);
     }
 
@@ -7321,7 +7441,7 @@ pub fn screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surface
         region,
         canvas_surfaces,
     )
-    .and_then(|pixmap| pixmap.encode_png().map_err(|_| CaptureError::EncodeFailed));
+    .and_then(|pixmap| pixmap.encode_png_fast().map_err(|_| CaptureError::EncodeFailed));
     for (node, snapshot) in snapshots {
         if let Some(style) = prepared.layout.styles.get_mut(&node) {
             snapshot.restore(style);
@@ -12454,6 +12574,33 @@ mod tests {
         assert!(blue.blue() > 240 && blue.red() < 20 && blue.green() < 20);
         assert!(red.red() > 240 && red.green() < 20 && red.blue() < 20);
         assert!(yellow.red() > 240 && yellow.green() > 240 && yellow.blue() < 20);
+    }
+
+    #[test]
+    fn fast_screenshot_png_preserves_translucent_pixels() {
+        let mut pixmap = Pixmap::new(2, 1).unwrap();
+        pixmap.pixels_mut()[0] = tiny_skia::PremultipliedColorU8::from_rgba(20, 60, 80, 128).unwrap();
+        pixmap.pixels_mut()[1] = tiny_skia::PremultipliedColorU8::from_rgba(20, 30, 40, 255).unwrap();
+        let reference = image::load_from_memory(&pixmap.encode_png().unwrap()).unwrap().to_rgba8();
+        let actual = image::load_from_memory(&pixmap.encode_png_fast().unwrap()).unwrap().to_rgba8();
+        assert_eq!(actual, reference);
+    }
+
+    #[test]
+    fn alpha_blur_matches_rgba_alpha_channel() {
+        let (width, height) = (41u32, 23u32);
+        for sigma in [0.5, 2.0, 7.5, 80.0] {
+            let mut pixmap = Pixmap::new(width, height).unwrap();
+            let mut alpha = Vec::new();
+            for (i, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
+                let a = ((i * 71 + i / 13) % 256) as u8;
+                *pixel = tiny_skia::PremultipliedColorU8::from_rgba(a, a, a, a).unwrap();
+                alpha.push(a);
+            }
+            gaussian_blur_pixmap(&mut pixmap, sigma);
+            gaussian_blur_alpha(&mut alpha, width as usize, height as usize, sigma);
+            assert!(pixmap.pixels().iter().zip(alpha).all(|(pixel, value)| pixel.alpha() == value));
+        }
     }
 
     #[test]

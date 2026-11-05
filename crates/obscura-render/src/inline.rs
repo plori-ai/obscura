@@ -1419,7 +1419,10 @@ fn paint_text_shadows(
     line_source_starts: &[usize],
 ) {
     let (width, height) = (pixmap.width(), pixmap.height());
-    let mut mask = if clip.is_some() || clip_mask.is_some() { tiny_skia::Mask::new(width, height) } else { None };
+    let needs_rect_mask = clip.is_some_and(|c| !(c.x <= 0.0 && c.y <= 0.0
+        && (c.x + c.width) * raster_scale >= width as f32
+        && (c.y + c.height) * raster_scale >= height as f32));
+    let mut mask = if needs_rect_mask || clip_mask.is_some() { tiny_skia::Mask::new(width, height) } else { None };
     if let Some(mask) = mask.as_mut() {
         for (i, alpha) in mask.data_mut().iter_mut().enumerate() {
             let x = (i % width as usize) as f32;
@@ -1436,6 +1439,80 @@ fn paint_text_shadows(
             let dx = px(shadow.offset_x) * raster_scale;
             let dy = px(shadow.offset_y) * raster_scale;
             if !sigma.is_finite() || !dx.is_finite() || !dy.is_finite() { continue; }
+            let fixed_color = shadow.color.or_else(|| {
+                let mut resolved = None;
+                for run in item.buffer.layout_runs() {
+                    let start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
+                    for glyph in run.glyphs {
+                        if start + glyph.start >= range.end || start + glyph.end <= range.start { continue; }
+                        let c = glyph.color_opt.unwrap_or(Color::rgba(0, 0, 0, 255));
+                        let color = [c.r(), c.g(), c.b(), c.a()];
+                        if resolved.is_some_and(|previous| previous != color) { return None; }
+                        resolved = Some(color);
+                    }
+                }
+                resolved
+            });
+            // With an opaque fixed color, an integral offset, and a blur too
+            // small to produce any box-filter pass, glyph coverage can be
+            // composed straight into the destination without an image layer.
+            if sigma <= 0.5 && dx.fract() == 0.0 && dy.fract() == 0.0
+                && f64::from(dx).abs() < f64::from(i32::MAX) && f64::from(dy).abs() < f64::from(i32::MAX) {
+                if let Some(color) = fixed_color.filter(|color| color[3] == 255) {
+                    let pixels = pixmap.pixels_mut();
+                    let mask_data = mask.as_ref().map(|mask| mask.data());
+                    for (line_index, run) in item.buffer.layout_runs().enumerate() {
+                        let line_offset = if line_index == 0 { item.first_line_offset } else { 0.0 };
+                        let start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
+                        let end = start + run.text.len();
+                        let alignment = line_edge_alignment_shift(item, start, end);
+                        for glyph in run.glyphs {
+                            if start + glyph.start >= range.end || start + glyph.end <= range.start { continue; }
+                            if item.marker.is_some_and(|marker| marker.line_index == line_index
+                                && glyph.x + line_offset + glyph.w > marker.content_end) { continue; }
+                            let mut relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                            relative.0 += alignment + line_advance_before_text(item, start + glyph.start, start, end);
+                            let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);
+                            let synthetic_bold = system_fallback_ids.contains(&glyph.font_id)
+                                && !glyph.font_is_variable && glyph.font_weight_axis_opt.unwrap_or(400.0) >= 600.0
+                                && font_system.db().face(glyph.font_id).is_some_and(|face| face.weight.0 < 600);
+                            let mut draw = |x: i32, y: i32, coverage: Color| {
+                                let px = i64::from(origin.0 as i32) + i64::from(physical.x) + i64::from(x) + i64::from(dx as i32);
+                                let py = i64::from(origin.1 as i32) + i64::from((run.line_y * raster_scale) as i32)
+                                    + i64::from(physical.y) + i64::from(y) + i64::from(dy as i32);
+                                if px < 0 || py < 0 || px >= i64::from(width) || py >= i64::from(height) { return; }
+                                let index = py as usize * width as usize + px as usize;
+                                let clip_alpha = mask_data.and_then(|m| m.get(index)).copied().unwrap_or(255);
+                                let alpha = u32::from(coverage.a()) * u32::from(clip_alpha) / 255;
+                                let dst = pixels[index];
+                                let inv = 255 - alpha;
+                                let over = |source: u8, prior: u8| (u32::from(source) * alpha / 255 + (u32::from(prior) * inv + 127) / 255) as u8;
+                                pixels[index] = tiny_skia::PremultipliedColorU8::from_rgba(
+                                    over(color[0], dst.red()), over(color[1], dst.green()), over(color[2], dst.blue()),
+                                    (alpha + (u32::from(dst.alpha()) * inv + 127) / 255) as u8,
+                                ).unwrap_or(dst);
+                            };
+                            let explicit = metadata_variation(glyph.metadata)
+                                .and_then(|index| item.variation_sets.get(index)).map(Arc::clone);
+                            let variations = glyph.font_is_variable.then(|| variable_swash.effective_variations(
+                                font_system, physical.cache_key.font_id, glyph.font_weight_axis_opt,
+                                glyph.font_optical_size_opt, glyph.font_italic_axis, explicit,
+                            )).flatten();
+                            let base = Color::rgba(color[0], color[1], color[2], 255);
+                            let mut draw_with_weight = |x, y, color| {
+                                draw(x, y, color);
+                                if synthetic_bold { draw(x + raster_scale.ceil().max(1.0) as i32, y, color); }
+                            };
+                            if let Some(variations) = variations {
+                                variable_swash.with_pixels(font_system, physical.cache_key, variations, base, &mut draw_with_weight);
+                            } else {
+                                swash.with_pixels(font_system, physical.cache_key, base, &mut draw_with_weight);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             let mut bounds = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
             for (line_index, run) in item.buffer.layout_runs().enumerate() {
                 let line_offset = if line_index == 0 { item.first_line_offset } else { 0.0 };
@@ -1449,11 +1526,26 @@ fn paint_text_shadows(
                     let physical = glyph.physical((line_offset + relative.0, relative.1), raster_scale);
                     let x = origin.0 + physical.x as f32;
                     let y = origin.1 + run.line_y * raster_scale + physical.y as f32;
-                    let guard = (glyph.font_size * raster_scale * 2.0).max(4.0) + sigma * 3.0;
-                    bounds.0 = bounds.0.min(x - guard);
-                    bounds.1 = bounds.1.min(y - guard);
-                    bounds.2 = bounds.2.max(x + glyph.w * raster_scale + guard);
-                    bounds.3 = bounds.3.max(y + guard);
+                    if !glyph.font_is_variable {
+                        if let Some(image) = swash.get_image(font_system, physical.cache_key) {
+                            let guard = (sigma * 3.0).ceil() + raster_scale.ceil().max(1.0) + 1.0;
+                            let left = origin.0 as i32 as f32 + physical.x as f32 + image.placement.left as f32;
+                            let top = origin.1 as i32 as f32 + (run.line_y * raster_scale) as i32 as f32
+                                + physical.y as f32 - image.placement.top as f32;
+                            bounds.0 = bounds.0.min(left - guard);
+                            bounds.1 = bounds.1.min(top - guard);
+                            bounds.2 = bounds.2.max(left + image.placement.width as f32 + guard);
+                            bounds.3 = bounds.3.max(top + image.placement.height as f32 + guard);
+                        }
+                    } else {
+                        // Variable instances can have different outline bounds
+                        // from the default face; keep their conservative guard.
+                        let guard = (glyph.font_size * raster_scale * 2.0).max(4.0) + sigma * 3.0;
+                        bounds.0 = bounds.0.min(x - guard);
+                        bounds.1 = bounds.1.min(y - guard);
+                        bounds.2 = bounds.2.max(x + glyph.w * raster_scale + guard);
+                        bounds.3 = bounds.3.max(y + guard);
+                    }
                 }
             }
             if !bounds.0.is_finite() { continue; }
@@ -1468,6 +1560,9 @@ fn paint_text_shadows(
             let Ok(layer_width) = u32::try_from(i64::from(right) - i64::from(left)) else { continue };
             let Ok(layer_height) = u32::try_from(i64::from(bottom) - i64::from(top)) else { continue };
             let Some(mut layer) = tiny_skia::Pixmap::new(layer_width, layer_height) else { return };
+            // A fixed-color shadow only needs its coverage blurred. Keep the
+            // full-color path when currentColor varies between spans.
+            let mut alpha = fixed_color.map(|_| vec![0u8; layer_width as usize * layer_height as usize]);
             for (line_index, run) in item.buffer.layout_runs().enumerate() {
                 let line_offset = if line_index == 0 { item.first_line_offset } else { 0.0 };
                 let start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
@@ -1487,6 +1582,7 @@ fn paint_text_shadows(
                         && !glyph.font_is_variable && glyph.font_weight_axis_opt.unwrap_or(400.0) >= 600.0
                         && font_system.db().face(glyph.font_id).is_some_and(|face| face.weight.0 < 600);
                     let pixels = layer.pixels_mut();
+                    let alpha_layer = &mut alpha;
                     let mut draw = |x: i32, y: i32, coverage: Color| {
                         let px = i64::from(origin.0 as i32) + i64::from(physical.x) + i64::from(x) - i64::from(left);
                         let py = i64::from(origin.1 as i32) + i64::from((run.line_y * raster_scale) as i32)
@@ -1494,6 +1590,11 @@ fn paint_text_shadows(
                         if px < 0 || py < 0 || px >= i64::from(layer_width) || py >= i64::from(layer_height) { return; }
                         let index = py as usize * layer_width as usize + px as usize;
                         let alpha = u32::from(coverage.a()) * u32::from(color[3]) / 255;
+                        if let Some(mask) = alpha_layer.as_deref_mut() {
+                            let dst = u32::from(mask[index]);
+                            mask[index] = (alpha + dst * (255 - alpha) / 255) as u8;
+                            return;
+                        }
                         let dst = pixels[index];
                         let inv = 255 - alpha;
                         let over = |source: u8, prior: u8| (u32::from(source) * alpha / 255 + u32::from(prior) * inv / 255) as u8;
@@ -1520,7 +1621,20 @@ fn paint_text_shadows(
                     }
                 }
             }
-            crate::paint::gaussian_blur_pixmap(&mut layer, sigma);
+            if let (Some(mut coverage), Some(color)) = (alpha, fixed_color) {
+                crate::paint::gaussian_blur_alpha(&mut coverage, layer_width as usize, layer_height as usize, sigma);
+                for (pixel, coverage) in layer.pixels_mut().iter_mut().zip(coverage) {
+                    let a = u32::from(coverage);
+                    *pixel = tiny_skia::PremultipliedColorU8::from_rgba(
+                        (u32::from(color[0]) * a / 255) as u8,
+                        (u32::from(color[1]) * a / 255) as u8,
+                        (u32::from(color[2]) * a / 255) as u8,
+                        coverage,
+                    ).unwrap_or(*pixel);
+                }
+            } else {
+                crate::paint::gaussian_blur_pixmap(&mut layer, sigma);
+            }
             pixmap.draw_pixmap(left, top, layer.as_ref(), &tiny_skia::PixmapPaint::default(),
                 tiny_skia::Transform::from_translate(dx, dy),
                 mask.as_ref());
