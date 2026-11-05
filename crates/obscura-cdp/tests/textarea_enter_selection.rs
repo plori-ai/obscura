@@ -61,7 +61,7 @@ async fn enter_splices_at_the_caret_or_replaces_the_selected_range() {
     for (value, start, end, expected, caret, event_type) in [
         ("ab", 1, 1, "a\nb", 2, "keyDown"),
         ("abcd", 1, 3, "a\nd", 2, "keyDown"),
-        ("ab", 0, 0, "\nab", 1, "rawKeyDown"),
+        ("ab", 0, 0, "\nab", 1, "keyDown"),
         ("ab", 2, 2, "ab\n", 3, "keyDown"),
         ("a😀b", 1, 3, "a\nb", 2, "keyDown"),
         ("", 0, 0, "\n", 1, "keyDown"),
@@ -135,7 +135,7 @@ async fn readonly_fields_reject_deletion_and_newlines_but_keep_keyboard_events()
                 let expected = match (readonly, key) {
                     (true, "Enter") => json!({"value":"abCD", "start":1, "end":3, "changes":["keydown","keypress","keyup"]}),
                     (true, _) => json!({"value":"abCD", "start":1, "end":3, "changes":["keydown","keyup"]}),
-                    (false, "Enter") => json!({"value":"a\nD", "start":2, "end":2, "changes":["keydown","keypress","input","keyup"]}),
+                    (false, "Enter") => json!({"value":"a\nD", "start":2, "end":2, "changes":["keydown","keypress","beforeinput","input","keyup"]}),
                     (false, _) => json!({"value":"aD", "start":1, "end":1, "changes":["keydown","input","keyup"]}),
                 };
                 assert_eq!(state(&mut ctx).await, expected, "{tag} {key} readonly={readonly}");

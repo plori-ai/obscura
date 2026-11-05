@@ -1116,8 +1116,28 @@ async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, Str
         r#"(function(){{
             var el = document.querySelector({sel});
             if (!el) return "error:element not found";
-            globalThis.__obscura_setFieldValue(el, "value", (el.value || "") + {txt});
-            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
+            el.focus();
+            for (var ch of {txt}) {{
+                var vk = ch.toUpperCase().charCodeAt(0);
+                var init = {{key:ch, bubbles:true, cancelable:true, composed:true, keyCode:vk, which:vk}};
+                if (!el.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', init)))) {{
+                    el.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', init)));
+                    continue;
+                }}
+                var cp = ch.codePointAt(0);
+                var press = {{key:ch, bubbles:true, cancelable:true, composed:true, keyCode:cp, which:cp, charCode:cp}};
+                if (el.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', press)))) {{
+                    var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ch,inputType:'insertText'}}));
+                    if (!globalThis.__obscura_isDisabled(el) && !el.hasAttribute('readonly') && el.dispatchEvent(before)) {{
+                        var v = el.value || '', start = el.selectionStart, end = el.selectionEnd;
+                        if (start == null) start = end = v.length;
+                        globalThis.__obscura_setFieldValue(el, 'value', v.slice(0,start) + ch + v.slice(end));
+                        if (el.setSelectionRange && el.selectionStart != null) el.setSelectionRange(start + ch.length, start + ch.length);
+                        el.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:ch,inputType:'insertText'}})));
+                    }}
+                }}
+                el.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', init)));
+            }}
             return "ok";
         }})()"#,
         sel = serde_json::to_string(&selector).unwrap(),
@@ -1140,15 +1160,40 @@ async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String
 
     let target = match selector {
         Some(sel) => format!("document.querySelector({})", serde_json::to_string(sel).unwrap()),
-        None => "document".to_string(),
+        None => "document.activeElement || document.body".to_string(),
     };
 
     let js = format!(
         r#"(function(){{
-            var t = {target};
+            var t = {target}, key = {key};
             if (!t) return "error:element not found";
-            t.dispatchEvent(new KeyboardEvent("keydown", {{key:{key},bubbles:true}}));
-            t.dispatchEvent(new KeyboardEvent("keyup", {{key:{key},bubbles:true}}));
+            if (t.focus) t.focus();
+            if (key === 'Space' || key === 'Spacebar') key = ' ';
+            var vk = key === 'Enter' ? 13 : key === ' ' ? 32 : key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0;
+            var init = {{key:key,bubbles:true,cancelable:true,composed:true,keyCode:vk,which:vk}};
+            if (key === ' ') globalThis.__obscura_spaceActivation = null;
+            var allowed = t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', init)));
+            var isLink = key === 'Enter' && t.localName === 'a' && t.hasAttribute('href');
+            if (allowed && (isLink || key === ' ')) globalThis.__obscura_keyDefault(t, key, 'down');
+            if (allowed && !isLink && (key === 'Enter' || key.length === 1)) {{
+                var cp = key === 'Enter' ? 13 : key.codePointAt(0);
+                allowed = t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {{key:key,bubbles:true,cancelable:true,composed:true,keyCode:cp,which:cp,charCode:cp}})));
+            }}
+            if (allowed && key === 'Enter' && !isLink) globalThis.__obscura_keyDefault(t, key, 'down');
+            if (allowed && key.length === 1 && (t.localName === 'textarea' || (t.localName === 'input' && ['text','search','tel','url','email','password','number'].includes(globalThis.__obscura_inputType(t)))) && !t.hasAttribute('readonly') && !globalThis.__obscura_isDisabled(t)) {{
+                var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:key,inputType:'insertText'}}));
+                if (t.dispatchEvent(before)) {{
+                    var value = t.value || '', start = t.selectionStart, end = t.selectionEnd;
+                    if (start == null) start = end = value.length;
+                    globalThis.__obscura_setFieldValue(t, 'value', value.slice(0,start) + key + value.slice(end));
+                    if (t.setSelectionRange && t.selectionStart != null) t.setSelectionRange(start + key.length, start + key.length);
+                    t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:key,inputType:'insertText'}})));
+                }}
+            }}
+            t = document.activeElement || t;
+            var up = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', init));
+            if (t.dispatchEvent(up)) globalThis.__obscura_keyDefault(t, key, 'up');
+            else globalThis.__obscura_spaceActivation = null;
             return "ok";
         }})()"#,
         target = target,
@@ -2991,6 +3036,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn type_and_enter_dispatch_trusted_keyboard_events_and_submit() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<form><input id=q><button id=b>Go</button></form>").await.unwrap();
+        evaluate_tool_script(state.page_mut(), "window.events=[]; window.submittedValue=null; for (const type of ['keydown','keypress','beforeinput','input','click','submit','keyup']) document.addEventListener(type, e => { events.push(e.type+':'+(e.target.id||e.target.localName)+(e.isTrusted?'':'!')); if(e.type==='submit') { e.preventDefault(); submittedValue=e.target[0].value; } }, true); true").unwrap();
+        tool_type(&json!({"selector":"#q", "text":"a"}), &mut state).await.unwrap();
+        tool_press_key(&json!({"selector":"#q", "key":"Enter"}), &mut state).await.unwrap();
+        assert_eq!(evaluate_tool_script(state.page_mut(), "events.join(', ')").unwrap(), json!("keydown:q, keypress:q, beforeinput:q, input:q, keyup:q, keydown:q, keypress:q, beforeinput:q, click:b, submit:form, keyup:q"));
+        assert_eq!(evaluate_tool_script(state.page_mut(), "submittedValue").unwrap(), json!("a"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn function_wait_advances_fetch_response_callbacks() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
@@ -3164,7 +3220,7 @@ mod tests {
         );
         assert_eq!(
             actual,
-            json!(r#"{"domValue":"form-filled","controlledState":"form-filled","controlledUpdates":3,"lastInputTarget":"field","lastInputTrusted":true}"#),
+            json!(r#"{"domValue":"form-filled","controlledState":"form-filled","controlledUpdates":8,"lastInputTarget":"field","lastInputTrusted":true}"#),
         );
     }
 

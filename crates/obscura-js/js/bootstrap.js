@@ -3775,6 +3775,72 @@ function _isSubmitButton(el) {
   return false;
 }
 
+function _inputType(el) {
+  const type = ((el.getAttribute && el.getAttribute('type')) || '').toLowerCase();
+  return ['hidden','text','search','tel','url','email','password','date','month','week','time',
+          'datetime-local','number','range','color','checkbox','radio','file','submit','image',
+          'reset','button'].includes(type) ? type : 'text';
+}
+globalThis.__obscura_inputType = _inputType;
+Object.defineProperty(globalThis, '__obscura_inputType', {writable:false, configurable:false});
+
+// Keyboard activation is shared by the CDP and MCP input paths. It is kept
+// separate from dispatchEvent: synthetic events from page scripts have no
+// browser default action.
+globalThis.__obscura_keyDefault = function(target, key, phase) {
+  if (!target || _isActuallyDisabled(target)) return;
+  const tag = target.localName;
+  const type = tag === 'input' ? _inputType(target) : ((target.getAttribute && target.getAttribute('type')) || '').toLowerCase();
+  const button = tag === 'button' || (tag === 'input' && ['button','submit','reset','image'].includes(type));
+  const checkable = tag === 'input' && (type === 'checkbox' || type === 'radio');
+  if (phase === 'up') {
+    const pending = globalThis.__obscura_spaceActivation;
+    globalThis.__obscura_spaceActivation = null;
+    if (key === ' ' && pending === target && (button || checkable)) target.click(_TRUSTED_ACTIVATION);
+    return;
+  }
+  if (key === ' ' && (button || checkable)) {
+    globalThis.__obscura_spaceActivation = target;
+    return;
+  }
+  if (key !== 'Enter') return;
+  if (button || (tag === 'a' && target.hasAttribute('href'))) {
+    target.click(_TRUSTED_ACTIVATION);
+    return;
+  }
+  if (tag === 'textarea') {
+    if (target.hasAttribute('readonly')) return;
+    const before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {bubbles:true,composed:true,cancelable:true,inputType:'insertLineBreak',data:null}));
+    if (!target.dispatchEvent(before)) return;
+    const value = target.value || '';
+    let start = target.selectionStart, end = target.selectionEnd;
+    start = start == null ? value.length : Math.max(0, Math.min(start, value.length));
+    end = end == null ? start : Math.max(0, Math.min(end, value.length));
+    const lower = Math.min(start, end), upper = Math.max(start, end);
+    globalThis.__obscura_setFieldValue(target, 'value', value.slice(0, lower) + '\n' + value.slice(upper));
+    target.setSelectionRange(lower + 1, lower + 1);
+    target.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {bubbles:true,composed:true,inputType:'insertLineBreak',data:null})));
+    return;
+  }
+  if (tag !== 'input' || !['','text','search','tel','url','email','password','date','month','week','time','datetime-local','number'].includes(type)) return;
+  if (!target.hasAttribute('readonly')) {
+    const before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {bubbles:true,composed:true,cancelable:true,inputType:'insertLineBreak',data:null}));
+    if (!target.dispatchEvent(before)) return;
+  }
+  const form = target.form;
+  if (!form) return;
+  const controls = (target.ownerDocument || document).querySelectorAll('button,input');
+  let submitter = null, blocking = 0;
+  for (const control of controls) {
+    if (control.form !== form) continue;
+    if (!submitter && _isSubmitButton(control)) submitter = control;
+    if (control.localName === 'input' && ['text','search','tel','url','email','password','date','month','week','time','datetime-local','number'].includes(_inputType(control))) blocking++;
+  }
+  if (submitter) submitter.click(_TRUSTED_ACTIVATION);
+  else if (blocking <= 1) form.requestSubmit(undefined, _TRUSTED_ACTIVATION);
+};
+Object.defineProperty(globalThis, '__obscura_keyDefault', {writable:false, configurable:false});
+
 // The HTML labelable-elements list (hidden inputs excluded), shared by the
 // Element.labels and HTMLLabelElement.control getters.
 function _isLabelable(el) {
@@ -4815,7 +4881,7 @@ class Element extends Node {
         _setInputIndeterminate(this, false);
       }
     }
-    const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
+    const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true, composed: true});
     if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
@@ -4859,11 +4925,11 @@ class Element extends Node {
       // click path in input.rs, which already treats <input type=image> as a
       // submit button.
       if (_isSubmitButton(this)) {
-        const form = this.closest ? this.closest('form') : null;
+        const form = this.form;
         // A real submit-button click fires the cancelable submit event, so use
         // requestSubmit() (not the plain submit() method, which now bypasses it).
         if (form && typeof form.requestSubmit === 'function') {
-          form.requestSubmit(this);
+          form.requestSubmit(this, _trusted ? _TRUSTED_ACTIVATION : undefined);
         } else if (form && typeof form.submit === 'function') {
           form.submit(this);
         }
@@ -5602,7 +5668,9 @@ class Element extends Node {
         );
       }
     }
-    const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    const event = new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter || null });
+    if (arguments[1] === _TRUSTED_ACTIVATION) globalThis.__obscura_markTrusted(event);
+    const cancelled = !this.dispatchEvent(event);
     if (cancelled) return;
     this._navigateSubmit(submitter);
   }
@@ -12388,7 +12456,12 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
   }
 };
 globalThis.ClipboardEvent = class extends Event {};
-globalThis.SubmitEvent = class extends Event {};
+globalThis.SubmitEvent = class extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.submitter = init.submitter || null;
+  }
+};
 
 // ToggleEvent backs the popover beforetoggle/toggle events. oldState and
 // newState are "open"/"closed". These events do not bubble; beforetoggle is
@@ -14625,7 +14698,23 @@ Object.defineProperties(HTMLInputElement.prototype, {
   checked: Object.getOwnPropertyDescriptor(Element.prototype, 'checked'),
 });
 globalThis.HTMLButtonElement = Element;
+// Forms expose their current controls through indexed properties. Resolve the
+// index on demand so insertion and removal never leave stale entries.
+const _formIndexProxy = {
+  get(target, key, receiver) {
+    if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) {
+      const controls = target.elements, index = Number(key);
+      return index < controls.length ? controls[index] : undefined;
+    }
+    return Reflect.get(target, key, receiver);
+  },
+  has(target, key) {
+    if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) return Number(key) < target.elements.length;
+    return Reflect.has(target, key);
+  },
+};
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
+  constructor(nid) { super(nid); return new Proxy(this, _formIndexProxy); }
   get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable

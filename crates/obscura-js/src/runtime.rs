@@ -19587,6 +19587,21 @@ mod tests {
         assert_eq!(is_form, serde_json::json!(true));
     }
 
+    #[test]
+    fn form_indexed_controls_follow_mutations_and_work_in_submit_handlers() {
+        let mut rt = setup_runtime(r#"<form id="f"><input name="42" value="first"><input value="second"></form>"#);
+        let result = rt.evaluate(r#"
+            const f = document.getElementById('f');
+            const before = [f[0].value, f[1].value, 0 in f, f[2] === undefined, f[42] === undefined];
+            f.removeChild(f[0]);
+            let submitted;
+            f.addEventListener('submit', event => { event.preventDefault(); submitted = event.target[0].value; });
+            __obscura_keyDefault(f[0], 'Enter', 'down');
+            return [before, f[0].value, f[1] === undefined, submitted];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([["first", "second", true, true, true], "second", true, "second"]));
+    }
+
     /// Regression for #105: `Element.prepend` must actually insert at the
     /// start, not silently no-op.
     #[test]
@@ -20142,6 +20157,21 @@ mod tests {
                 "".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn keyboard_implicit_submit_uses_default_button_and_submitter() {
+        let mut rt = setup_runtime(r#"<form id="f"><input id="q"><button id="b">Go</button></form>"#);
+        let result = rt.evaluate(r#"
+            const form = document.getElementById('f');
+            const events = [];
+            form.addEventListener('click', e => events.push(['click', e.target.id, e.isTrusted]));
+            form.addEventListener('submit', e => { events.push(['submit', e.submitter.id, e.isTrusted, e instanceof SubmitEvent]); e.preventDefault(); });
+            __obscura_keyDefault(document.getElementById('q'), 'Enter', 'down');
+            return events;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([["click", "b", true], ["submit", "b", true, true]]));
+        assert_eq!(rt.take_pending_navigation(), None);
     }
 
     #[test]

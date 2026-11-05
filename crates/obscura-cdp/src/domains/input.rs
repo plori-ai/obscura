@@ -10,6 +10,14 @@ fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+fn keypress_js(key: &str, code: &str, text: &str, alt_key: bool, ctrl_key: bool, meta_key: bool, shift_key: bool) -> String {
+    let char_code = text.chars().next().unwrap_or('\0') as u32;
+    format!(
+        "(function() {{ var target = document.activeElement || document.body; var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {{bubbles:true,cancelable:true,composed:true,key:{key},code:{code},keyCode:{char_code},which:{char_code},charCode:{char_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}})); return target.dispatchEvent(evt); }})()",
+        key = js_str(key), code = js_str(code),
+    )
+}
+
 // Insert `text` at the caret, replacing any non-collapsed selection the way a
 // real browser does when you type over selected text (for example after a
 // triple-click select-all). selectionStart is null during ordinary typing, so
@@ -27,6 +35,7 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
         "(function() {{\
             var t = document.activeElement;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            if (t.localName === 'input' && !['text','search','tel','url','email','password','number'].includes(globalThis.__obscura_inputType(t))) return;\
             if (globalThis.__obscura_isDisabled(t)) return;\
             if (!{ime_commit} && t.hasAttribute('readonly')) return;\
             var ins = {text};\
@@ -431,8 +440,10 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                return target.dispatchEvent(evt);\
+                                if ({key} === ' ') globalThis.__obscura_spaceActivation = null;\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,composed:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                globalThis.__obscura_keyCanceled = !target.dispatchEvent(evt);\
+                                return !globalThis.__obscura_keyCanceled;\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -446,36 +457,31 @@ pub async fn handle(
                             return Ok(json!({}));
                         }
 
+                        let is_link_enter = key == "Enter" && page.evaluate("!!(document.activeElement && document.activeElement.localName === 'a' && document.activeElement.hasAttribute('href'))").as_bool() == Some(true);
+                        // Link Enter and the Space pressed state are keydown
+                        // defaults, including for rawKeyDown.
+                        if is_link_enter {
+                            page.evaluate("globalThis.__obscura_keyDefault(document.activeElement, 'Enter', 'down')");
+                        } else if key == " " {
+                            page.evaluate("globalThis.__obscura_keyDefault(document.activeElement, ' ', 'down')");
+                        }
+                        if event_type == "rawKeyDown" {
+                            if key == "Backspace" { page.evaluate(BACKSPACE_JS); }
+                            if key == "Delete" { page.evaluate(DELETE_JS); }
+                            return Ok(json!({}));
+                        }
+                        let character = text;
+                        if !character.is_empty() && !is_link_enter {
+                            let js = keypress_js(key, code, character, alt_key, ctrl_key, meta_key, shift_key);
+                            if page.evaluate(&js).as_bool() == Some(false) {
+                                return Ok(json!({}));
+                            }
+                        }
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text, false));
                         }
-
-                        if key == "Enter" {
-                            // In a textarea Enter inserts a newline; in input fields
-                            // it submits the containing form. Real Chrome distinguishes
-                            // these two and we should too: previously every Enter tried
-                            // to submit the nearest form even from a textarea.
-                            let js = "(function() {\
-                                var target = document.activeElement;\
-                                if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
-                                if (target.localName === 'textarea') {\
-                                    if (target.hasAttribute('readonly')) return;\
-                                    var value = target.value || '';\
-                                    var start = target.selectionStart, end = target.selectionEnd;\
-                                    start = start == null ? value.length : Math.max(0, Math.min(start, value.length));\
-                                    end = end == null ? start : Math.max(0, Math.min(end, value.length));\
-                                    var lower = Math.min(start, end), upper = Math.max(start, end);\
-                                    globalThis.__obscura_setFieldValue(target, 'value', value.slice(0, lower) + '\\n' + value.slice(upper));\
-                                    target.setSelectionRange(lower + 1, lower + 1);\
-                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
-                                } else {\
-                                    var form = target.form || (target.closest && target.closest('form'));\
-                                    if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
-                                }\
-                            })()".replace("$VK", &virtual_key_code.to_string())
-                                .replace("$MODIFIERS", &format!("altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}"));
-                            page.evaluate(&js);
+                        if key == "Enter" && !text.is_empty() && !is_link_enter {
+                            page.evaluate("globalThis.__obscura_keyDefault(document.activeElement, 'Enter', 'down')");
                         }
 
                         if key == "Backspace" {
@@ -490,8 +496,11 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                target.dispatchEvent(evt);\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,cancelable:true,composed:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var allowed = target.dispatchEvent(evt);\
+                                if (allowed) globalThis.__obscura_keyDefault(target, {key}, 'up');\
+                                else globalThis.__obscura_spaceActivation = null;\
+                                globalThis.__obscura_keyCanceled = false;\
                             }})()",
                             key = js_str(key),
                             code = js_str(code),
@@ -500,9 +509,18 @@ pub async fn handle(
                         page.evaluate(&js);
                     }
                     "char" => {
-                        if !text.is_empty() {
-                            page.evaluate(&insert_text_js(text, false));
-                            // Pump event loop so Angular change detection picks up the input
+                        if !text.is_empty() && page.evaluate("!globalThis.__obscura_keyCanceled").as_bool() == Some(true) {
+                            let is_link_enter = (text == "\r" || text == "\n") && page.evaluate("!!(document.activeElement && document.activeElement.localName === 'a' && document.activeElement.hasAttribute('href'))").as_bool() == Some(true);
+                            if !is_link_enter {
+                                let js = keypress_js(key, code, text, alt_key, ctrl_key, meta_key, shift_key);
+                                if page.evaluate(&js).as_bool() != Some(false) {
+                                    if text == "\r" || text == "\n" {
+                                        page.evaluate("globalThis.__obscura_keyDefault(document.activeElement, 'Enter', 'down')");
+                                    } else {
+                                        page.evaluate(&insert_text_js(text, false));
+                                    }
+                                }
+                            }
                             page.settle(50).await;
                         }
                     }
