@@ -9,6 +9,7 @@ Changes in this fork, compared with upstream v0.2.6 (see the git history for eve
 - `document.readyState` changes fire `readystatechange`; CSS animations fire `animationstart`/`animationend`/`animationiteration`.
 - Canvas 2D `rect()` adds to the path; child-frame canvases work; CSS `filter` (blur and color filters) and `text-shadow` are painted, as are the brightness, contrast, grayscale and opacity filters; glyphs missing from bundled fonts fall back to installed system fonts.
 - CDP: `Fetch` interception covers every request type at request and response stage (`getResponseBody`, `continueResponse`, resource-type and glob patterns) and routes pauses to the enabling session; HTTP Basic auth challenges; `Network.getResponseBody`, `setCacheDisabled`, offline emulation; `Network` events carry request headers and response extra info.
+- Keyboard input follows Chromium: trusted keydown/keypress/keyup, Enter submits forms (implicit submission) and activates buttons and links, Space activates buttons and checkboxes; `form[0]` indexed access.
 - CSSOM keeps `!important`; `data:` and `blob:` JavaScript modules load; `SVGPathElement.getTotalLength()`/`getPointAtLength()`.
 - Stealth: one stable identity per browser context (pages, frames and workers agree); TLS and HTTP/2 match Chrome 149, and the UA and client hints claim 149.
 - Worker `MessageEvent`s, `about:blank` frame origins, `document.lastModified`, PDF plugin MIME types, `chrome.app.runningState`, WebRTC offer SDP.
