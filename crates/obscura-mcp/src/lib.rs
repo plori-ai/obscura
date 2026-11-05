@@ -1025,7 +1025,17 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     rebuild_interactive_refs(state)?;
     let page = state.page_mut();
     let url = truncate(&page.url_string(), 256);
-    let title = truncate(&page.title, 256);
+    // The navigation-time title can be stale after a client-side route or a
+    // script changes <title>. Read the current DOM, like document.title.
+    let live_title = page.with_dom(|dom| {
+        dom.query_selector("title").ok().flatten()
+            .map(|id| dom.text_content(id)
+                .split(|ch| matches!(ch, '\t' | '\n' | '\u{000C}' | '\r' | ' '))
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    }).unwrap_or_else(|| page.title.clone());
+    let title = truncate(&live_title, 256);
     if max_chars == 0 { return Ok(format!("URL: {url}\nTitle: {title}")); }
     let context = accessibility_context(page);
     let body_text = page.with_dom(|dom| {
@@ -3033,6 +3043,17 @@ mod tests {
             submitted.contains("q=hello"),
             "the submitted body must carry the filled field, got {submitted}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_uses_the_live_document_title_after_script_changes() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<title>Home</title><h1>Results</h1>").await.unwrap();
+        evaluate_tool_script(state.page_mut(), "document.title = '  Search\\n  Results  '; true").unwrap();
+        let snapshot = tool_snapshot(&json!({"max_chars": 0}), &mut state).unwrap();
+        assert!(snapshot.contains("\nTitle: Search Results"), "{snapshot}");
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        assert!(snapshot.contains("\nTitle: Search Results\n"), "{snapshot}");
     }
 
     #[tokio::test(flavor = "current_thread")]
